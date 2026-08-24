@@ -48,7 +48,7 @@ func TestBatchingDoesNotChangeOutputOnTheRealModel(t *testing.T) {
 	subject := Request{Prompt: "The engine ", MaxTokens: 120, Temperature: 0.7, Seed: 99}
 
 	// Alone.
-	solo, err := backend.NewWorker(exe, model, quiet)
+	solo, err := backend.NewWorker(exe, model, backend.WorkerOptions{}, quiet)
 	if err != nil {
 		t.Fatalf("starting the worker: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestBatchingDoesNotChangeOutputOnTheRealModel(t *testing.T) {
 	}
 
 	// In company.
-	shared, err := backend.NewWorker(exe, model, quiet)
+	shared, err := backend.NewWorker(exe, model, backend.WorkerOptions{}, quiet)
 	if err != nil {
 		t.Fatalf("starting the worker: %v", err)
 	}
@@ -111,6 +111,65 @@ func TestBatchingDoesNotChangeOutputOnTheRealModel(t *testing.T) {
 	}
 }
 
+// TestTheCPUAndGPUPathsAgree runs one request twice: once with the engine's own
+// CUDA threshold, which at this model's size keeps a batch of one entirely on
+// the host, and once with the threshold braid actually serves at, which puts the
+// same work on the card.
+//
+// The two runs are therefore not the same arithmetic. They are a CPU
+// implementation and a CUDA implementation of the same model, each sampling two
+// hundred times in sequence from logits they computed independently. One
+// disagreement anywhere in those two hundred draws diverges the text from that
+// point on, so the comparison is far stricter than comparing logits would be.
+//
+// This is the test that made lowering the threshold safe to do by default. It
+// is a measurement about one model on one card, not a promise about either.
+func TestTheCPUAndGPUPathsAgree(t *testing.T) {
+	exe := os.Getenv("BRAID_WORKER")
+	model := os.Getenv("BRAID_MODEL")
+	if exe == "" || model == "" {
+		t.Skip("set BRAID_WORKER and BRAID_MODEL to run this against the engine")
+	}
+
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	req := Request{Prompt: "The engine ", MaxTokens: 200, Temperature: 0.7, Seed: 99}
+
+	generate := func(opts backend.WorkerOptions) string {
+		t.Helper()
+		w, err := backend.NewWorker(exe, model, opts, quiet)
+		if err != nil {
+			t.Fatalf("starting the worker: %v", err)
+		}
+		s, err := New(w, Config{MaxBatch: 1, QueueDepth: 4, MaxTokensLimit: 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		text, res := run(t, s, req)
+		if res.Err != nil {
+			t.Fatalf("generation failed: %v", res.Err)
+		}
+		return text
+	}
+
+	onHost := generate(backend.WorkerOptions{MinMatmulFlops: 1 << 22, MinElements: 1 << 22})
+	onCard := generate(backend.WorkerOptions{MinMatmulFlops: 1 << 20, MinElements: 1 << 20})
+
+	if len(onHost) != req.MaxTokens {
+		t.Fatalf("expected %d characters, got %d", req.MaxTokens, len(onHost))
+	}
+	if onHost != onCard {
+		// Where they part matters: byte 3 is a different failure from byte 190.
+		at := 0
+		for at < len(onHost) && at < len(onCard) && onHost[at] == onCard[at] {
+			at++
+		}
+		t.Errorf("the two paths diverged at character %d of %d.\n host: %q\n card: %q",
+			at, req.MaxTokens, onHost, onCard)
+	}
+}
+
 // TestWorkerRoundTripsTheAlphabet checks the one thing the pipe protocol cannot
 // check for itself: that this process and the worker agree on what a token id
 // means. A disagreement here produces fluent-looking text made of the wrong
@@ -122,7 +181,7 @@ func TestWorkerRoundTripsTheAlphabet(t *testing.T) {
 		t.Skip("set BRAID_WORKER and BRAID_MODEL to run this against the engine")
 	}
 
-	w, err := backend.NewWorker(exe, model, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w, err := backend.NewWorker(exe, model, backend.WorkerOptions{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("starting the worker: %v", err)
 	}

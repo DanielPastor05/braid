@@ -176,7 +176,12 @@ int main(int argc, char** argv) {
     std::cerr << "braid_worker ready: vocab " << vocab.size() << ", cuda "
               << (engine::cuda::available() ? "yes" : "no");
     if (device) std::cerr << " (" << device->name << ")";
-    std::cerr << "\n";
+    // The thresholds decide whether an operation goes to the card at all, and
+    // at this model's size they decide it differently for a batch of one than
+    // for a batch of eight. A run that does not say which ones it used cannot
+    // be compared against another run, so every run says.
+    std::cerr << ", min_matmul_flops " << engine::cuda::min_matmul_flops()
+              << ", min_elements " << engine::cuda::min_elementwise_elements() << "\n";
     std::cerr.flush();
 
     const engine::Tensor mask = engine::nn::causal_mask(braid::kSeqLen);

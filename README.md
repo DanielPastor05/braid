@@ -13,10 +13,11 @@ real model on the GPU, not only asserted.
 |---|---|
 | **Model** | the character Transformer from `cpp-ai-engine`, 172 728 parameters, 64-id context, 120-symbol alphabet, 1.94 bits/char |
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
-| **Forward passes for the same 7 680 tokens** | 7 680 at one client, **260 at thirty-two** |
-| **Throughput** | ~200 tokens/s at one client, **5 500–6 500 at thirty-two** |
-| **Where a step goes at batch 32** | 3.86 ms model, 0.46 ms pipe, 0.07 ms sampling |
-| **Where a step goes at batch 1** | 4.81 ms model — **on the CPU, zero kernels launched** |
+| **Forward passes for the same 7 680 tokens** | 7 680 at one client, **264 at thirty-two** |
+| **Throughput** | 698 tokens/s at one client, **7 390 at thirty-two** |
+| **Where a step goes at batch 32** | 3.31 ms model, 0.46 ms pipe, 0.07 ms sampling |
+| **The engine's CUDA threshold** | lowered from 2²² to 2²⁰ after measuring: **3.5× at one client** |
+| **CPU and CUDA paths** | 200 characters identical, sampled independently |
 | **Batching invariance** | identical output alone and at mean batch 8.68, on the GPU |
 
 ---
@@ -29,49 +30,80 @@ sweep, for reasons two sections below.
 
 | clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | sample ms | pipe ms | kernels |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 7 680 | 1.00 | 200 | 8 ms | 10 ms | 4.88 | 4.81 | 0.00 | 0.06 | **0** |
-| 2 | 3 964 | 1.94 | 353 | 13 ms | 15 ms | 5.45 | 5.41 | 0.00 | 0.04 | 9 |
-| 3 | 2 660 | 2.89 | 433 | 14 ms | 17 ms | 6.58 | 6.55 | 0.01 | 0.02 | 12 |
-| 4 | 1 971 | 3.90 | 1 265 | 11 ms | 17 ms | 3.03 | 2.98 | 0.01 | 0.03 | 46 |
-| 6 | 1 342 | 5.72 | 2 363 | 10 ms | 15 ms | 2.31 | 2.22 | 0.01 | 0.08 | 57 |
-| 8 | 995 | 7.72 | 3 098 | 11 ms | 17 ms | 2.38 | 2.31 | 0.02 | 0.06 | 58 |
-| 16 | 506 | 15.18 | 4 433 | 15 ms | 25 ms | 3.32 | 3.12 | 0.03 | 0.16 | 59 |
-| 32 | 260 | 29.54 | **6 456** | 21 ms | 33 ms | 4.40 | 3.86 | 0.07 | 0.46 | 59 |
-| 64 | 244 | 31.48 | 4 615 | **367 ms** | 494 ms | 6.64 | 5.84 | 0.11 | 0.67 | 59 |
+| 1 | 7 680 | 1.00 | 698 | 4 ms | 6 ms | 1.35 | 1.31 | 0.00 | 0.04 | 48 |
+| 2 | 4 092 | 1.88 | 1 089 | 6 ms | 8 ms | 1.70 | 1.66 | 0.00 | 0.04 | 48 |
+| 3 | 2 723 | 2.82 | 1 306 | 6 ms | 8 ms | 2.13 | 2.09 | 0.01 | 0.04 | 48 |
+| 4 | 2 027 | 3.79 | 1 613 | 6 ms | 8 ms | 2.33 | 2.29 | 0.01 | 0.04 | 48 |
+| 6 | 1 385 | 5.55 | 3 934 | 6 ms | 8 ms | 1.39 | 1.35 | 0.01 | 0.04 | 58 |
+| 8 | 1 016 | 7.56 | 5 037 | 7 ms | 8 ms | 1.47 | 1.43 | 0.01 | 0.03 | 59 |
+| 16 | 506 | 15.18 | 6 614 | 11 ms | 14 ms | 2.21 | 2.10 | 0.02 | 0.08 | 60 |
+| 32 | 264 | 29.09 | **7 390** | 22 ms | 36 ms | 3.84 | 3.31 | 0.07 | 0.46 | 60 |
+| 64 | 244 | 31.48 | 7 895 | **237 ms** | 276 ms | 3.80 | 3.27 | 0.08 | 0.45 | 60 |
 
 **One client needs 7 680 forward passes to produce 7 680 tokens.** That is what
 serving requests one at a time means, and the first row confirms the accounting:
 exactly one step per token, mean batch 1.00.
 
-**Thirty-two need 260.** Same work, 29.5× fewer trips through the model.
+**Thirty-two need 264.** Same work, 29× fewer trips through the model, and
+ten times the throughput of a single client.
 
-**Sixty-four is the wall.** The median time to first token goes from 21 ms to
-367 ms. With `-max-batch 32`, half the clients are waiting for a seat at any
-moment, and waiting is all the extra concurrency buys them. On a throughput
-chart alone these last two rows look comparable. Only the tail says otherwise.
+**Sixty-four is the wall.** Throughput is still creeping up, but the median time
+to first token goes from 22 ms to 237 ms. With `-max-batch 32`, half the clients
+are waiting for a seat at any moment, and waiting is most of what the extra
+concurrency buys them. On a throughput chart alone these last two rows look like
+progress. Only the tail says otherwise.
 
-### Two and three clients are slower than one, and the reason is not batching
+### The batch of one was not using the GPU at all
 
-Throughput climbs — 200, 353, 433 — but the model itself gets *slower*: 4.81 ms
-a step at batch 1, 5.41 at batch 2, 6.55 at batch 3, and then it collapses to
-2.98 at batch 4. A larger batch cannot compute faster, so something other than
-batch size is moving.
+The first version of this table had a hole in it. Throughput climbed — 200, 353,
+433 — while the model itself got *slower*: 4.81 ms a step at batch 1, 5.41 at
+batch 2, 6.55 at batch 3, and then a collapse to 2.98 at batch 4. A larger batch
+cannot compute faster, so something other than batch size was moving, and the
+step split could not say what.
 
-The kernel column is what it is. **At batch 1 the forward launches zero CUDA
-kernels**: the whole thing runs on the CPU. The engine has a size threshold —
-`ENGINE_CUDA_MIN_FLOPS`, 2²² by default — below which an operation stays on the
-host because the transfer costs more than the arithmetic saves. This model's
-feed-forward at batch 1 is 64 × 96 × 192 × 2 ≈ 2.4 MFLOP, under the line. At
-batch 2 and 3 it straddles it: nine and twelve kernels, enough to pay for
-transfers and not enough to be worth them, which is the worst place to be and
-exactly where the measurement says the model is slowest. At batch 4 it clears
-the threshold, jumps to 46 kernels, and the forward time halves. From batch 6 it
-saturates at 57–59 and never changes again.
+So the worker started reporting how many CUDA kernels each forward launched.
+**At batch 1 the answer was zero.** The whole forward ran on the CPU. The engine
+keeps an operation on the host when it falls below `ENGINE_CUDA_MIN_FLOPS`,
+because for a training step the transfer costs more than the arithmetic saves,
+and this model's feed-forward at batch 1 is 64 × 96 × 192 × 2 ≈ 2.4 MFLOP
+against a 2²² ≈ 4.2 MFLOP default. Batches of two and three straddled the line —
+nine and twelve kernels, paying for transfers without earning them, which is the
+worst place to be and exactly where the model measured slowest.
 
-So the crossover at four is not the scheduler amortising a fixed cost. It is the
-engine's own CUDA threshold, rediscovered from the outside by a server that had
-no idea it was there. An earlier version of this file explained the dip as
-amortisation, which was a plausible story fitted to a number, and wrong.
+That threshold was set for training. Serving is not training, so it was swept
+rather than argued about. Batch 1, everything else held:
+
+| `ENGINE_CUDA_MIN_FLOPS` | kernels | forward ms | tokens/s |
+|---|---|---|---|
+| 2²² = 4 194 304 — the engine's default | **0** | 4.46 | 218 |
+| 2²⁰ = 1 048 576 | 48 | **1.20** | **760** |
+| 262 144 | 48 | 1.25 | 730 |
+| 65 536 | 48 | 1.21 | 756 |
+| 1 — everything on the card | 53 | 1.33 | 683 |
+
+The gain arrives all at once between 2²² and 2²⁰ and then stops. Going further
+does nothing, and going all the way to 1 makes it slightly *worse*: five more
+kernels for five operations that really were better off on the host. The
+threshold is not wrong, it is calibrated for a different question.
+
+**braid serves at 2²⁰**, and the table at the top of this page is measured
+there. It is worth 3.5× at one client, 3.1× at two, 2.9× at three — and it
+removes the dip entirely, leaving throughput rising monotonically from 698 to
+7 895. The engine's own default is still one flag away, and `-cuda-min-flops 0`
+defers to whatever it was built with.
+
+None of that would have been safe to turn on without knowing it did not change
+what the model writes, so `TestTheCPUAndGPUPathsAgree` generates the same 200
+characters twice — once at 2²², entirely on the host, once at 2²⁰, on the card —
+and compares them. They are identical. Two hundred sequential draws from logits
+computed by two different implementations, and not one of them lands
+differently.
+
+**The same thing is still happening one level up, smaller.** Batches of one to
+four launch 48 kernels; batch 6 launches 58, and its forward drops from 2.29 ms
+to 1.35. Some second class of operation crosses its own line between four and
+six. Lowering the threshold further does not move it, so it is a different limit
+and it has not been chased.
 
 ---
 
@@ -86,19 +118,18 @@ answer.
 
 | | batch 1 | batch 8 | batch 32 |
 |---|---|---|---|
-| model, including the copy off the device | 4.81 ms | 2.31 ms | 3.86 ms |
-| sampling, 120-way softmax per row | 0.00 ms | 0.02 ms | 0.07 ms |
+| model, including the copy off the device | 1.31 ms | 1.43 ms | 3.31 ms |
+| sampling, 120-way softmax per row | 0.00 ms | 0.01 ms | 0.07 ms |
 | filling the (n, 64) tensor | 0.00 ms | 0.00 ms | 0.01 ms |
-| **the pipe** | **0.06 ms** | **0.06 ms** | **0.46 ms** |
-| pipe as a share of the step | **1.2%** | 2.5% | **10.5%** |
+| **the pipe** | **0.04 ms** | **0.03 ms** | **0.46 ms** |
+| pipe as a share of the step | 3.0% | **2.0%** | **12%** |
 
-The pipe costs about a twentieth of a millisecond at small batches and about half
-a millisecond at thirty-two, because the frame it carries is `n × 64 × 4` bytes —
-256 bytes at batch 1, 8 KB at batch 32. As a share it grows from 1% to 10%, and
-it grows because the model's time does *not* grow with it: the forward is nearly
-flat from batch 6 up, so most of what is added past that point is transport.
+The pipe costs a twenty-fifth of a millisecond at small batches and half a
+millisecond at thirty-two, because the frame it carries is `n × 64 × 4` bytes —
+256 bytes at batch 1, 8 KB at batch 32. As a share it reaches 12%, and it gets
+there because the model's own time grows more slowly than the frame does.
 
-Ten percent is the price of not being able to link the engine into the server.
+Twelve percent is the price of not being able to link the engine into the server.
 It is worth knowing rather than assuming, and it is small enough that the
 [reason for the process boundary](#why-the-model-runs-in-another-process) still
 holds.
@@ -114,17 +145,20 @@ count is below its concurrency. Correcting it moved the mean batch at 64 clients
 from 23.4 to 31.2.
 
 **Levels are measured in order, and the card heats up.** Running the same sweep
-descending instead of ascending moves the 64-client throughput from 4 615 to
-5 792 — 25%, from nothing but being measured on a cooler card. The 32-client row
-moves the other way, 6 456 to 5 516. Every throughput figure on this page
-therefore carries something like a quarter of its value in ordering noise, and
-the only honest way to read that column is by its shape.
+descending instead of ascending is the check on that, and most of the table
+survives it: 698 against 648 at one client, 1 613 against 1 619 at four, 5 037
+against 4 987 at eight, 7 390 against 7 739 at thirty-two. The exception is the
+last row, where 7 895 becomes 5 889 — a 25% spread, on the one level whose
+requests spend most of their life queued rather than computing, and where
+sixty-four client goroutines contend with the server and the worker for the same
+host CPU. The 64-client throughput figure should be read as "about seven
+thousand, give or take a thousand", and the rest of the column as measured.
 
 **The counts do not move.** Steps, mean batch and kernels per step came out
-identical in both directions — 7 680/1.00/0 and ~260/29.5/59 either way. They
-are counts, not timings, and they are what the argument for batching actually
-rests on. That is why the table leads with forward passes rather than with
-tokens a second.
+the same in both directions — 7 680/1.00/48 at one client, ~262/29.3/60 at
+thirty-two. They are counts, not timings, and they are what the argument for
+batching actually rests on. That is why the table leads with forward passes
+rather than with tokens a second.
 
 ---
 
@@ -153,11 +187,13 @@ divergence from arithmetic rather than from a bug. **On this model and this card
 it does not happen**: 120 characters, identical, at a mean batch of 8.68 over
 121 steps.
 
-Given the section above, that comparison turns out to be sharper than it was
-designed to be: the run on its own executed on the CPU and the batched run
-executed on the card, so what it actually shows is agreement across two
-different arithmetic implementations. It remains a measurement about one model
-on one card, not a guarantee about GPUs.
+Given the section above, that comparison was sharper than it was designed to be
+when it was written: at the time, the run on its own executed on the CPU and the
+batched run executed on the card, so it was quietly comparing two arithmetic
+implementations. Lowering the threshold put both runs on the card and turned it
+back into a test of the scheduler alone — which is what it was meant to be, and
+why the CPU-versus-CUDA comparison now has a test of its own rather than
+happening by accident.
 
 Both tests also assert that the sequences really did share steps. An earlier
 version of the first one passed while batching nothing at all — the backend was
@@ -181,7 +217,7 @@ A pipe has no ABI to disagree about. `braid_worker` is a C++ process that owns
 the model and answers step requests over stdin and stdout in a fixed binary
 frame; the Go side writes `n` windows and reads `n` ids back, plus the three
 timings and the kernel count it needs to say where the step went. It costs
-[about ten percent at batch 32](#where-a-step-actually-goes).
+[about twelve percent at batch 32](#where-a-step-actually-goes).
 
 What falls out of it is the shape the next phase needs: a worker is a thing that
 can be killed.
@@ -268,7 +304,9 @@ server whose numbers end up pasted somewhere.
    the kernel counts say where it would and would not help.
 2. **A router and more than one worker**, then `kill -9` one under load and
    publish the recovery curve.
-3. **Get the small batches onto the card anyway.** One to three sequences run on
-   the CPU because each *operation* falls below the engine's threshold. Whether
-   that threshold — set for training steps — is the right one for a server is a
-   question it was never asked.
+3. **Find the second threshold.** Something still moves between batch four and
+   batch six — 48 kernels to 58, and a forward that drops by 40%. It is not
+   `ENGINE_CUDA_MIN_FLOPS`, because lowering that further does not touch it.
+4. **Make the 64-client row reproducible.** It is the only figure on this page
+   with a spread worth apologising for, and running the load generator off the
+   machine under test is the obvious first thing to try.

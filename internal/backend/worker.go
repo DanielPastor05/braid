@@ -82,10 +82,23 @@ const (
 	workerSeqLen = 64
 )
 
+// WorkerOptions tunes the engine inside the worker.
+//
+// Both thresholds are the engine's own: below them an operation stays on the
+// CPU, because for a training step the transfer costs more than the arithmetic
+// saves. Serving is not a training step -- at this model's size a batch of one
+// falls under the line and never touches the card at all -- so they are exposed
+// here rather than left at whatever the engine was tuned for. Zero means leave
+// the engine's default alone.
+type WorkerOptions struct {
+	MinMatmulFlops uint64
+	MinElements    uint64
+}
+
 // NewWorker starts the worker process and loads the alphabet the model was
 // trained on. The checkpoint prefix names two files: prefix.bin and
 // prefix.vocab, both written by braid_train.
-func NewWorker(exePath, prefix string, log *slog.Logger) (*Worker, error) {
+func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 	alphabet, err := os.ReadFile(prefix + ".vocab")
 	if err != nil {
 		return nil, fmt.Errorf("reading the alphabet: %w", err)
@@ -103,6 +116,21 @@ func NewWorker(exePath, prefix string, log *slog.Logger) (*Worker, error) {
 	}
 
 	w.cmd = exec.Command(exePath, prefix)
+
+	// The engine reads these once, when its threshold globals are initialised,
+	// so they have to be in the environment before the process starts. Passing
+	// them this way rather than adding a flag to the worker keeps one mechanism
+	// instead of two: the engine already documents these names.
+	w.cmd.Env = os.Environ()
+	if opts.MinMatmulFlops > 0 {
+		w.cmd.Env = append(w.cmd.Env,
+			fmt.Sprintf("ENGINE_CUDA_MIN_FLOPS=%d", opts.MinMatmulFlops))
+	}
+	if opts.MinElements > 0 {
+		w.cmd.Env = append(w.cmd.Env,
+			fmt.Sprintf("ENGINE_CUDA_MIN_ELEMENTS=%d", opts.MinElements))
+	}
+
 	stdin, err := w.cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("worker stdin: %w", err)

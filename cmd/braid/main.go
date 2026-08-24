@@ -31,8 +31,21 @@ func main() {
 		maxTokens = flag.Int("max-tokens", 1024, "longest generation a caller may ask for")
 		worker    = flag.String("worker", "", "path to braid_worker; empty runs the mock backend")
 		model     = flag.String("model", "models/charlm", "checkpoint prefix the worker loads")
-		stepBase  = flag.Duration("mock-step", 8*time.Millisecond, "mock backend: fixed cost of a step")
-		stepPer   = flag.Duration("mock-per-seq", 200*time.Microsecond, "mock backend: marginal cost per sequence")
+		// The engine's own default is 2^22, which keeps a batch of one entirely
+		// on the CPU at this model's size: zero kernels launched. 2^20 was
+		// measured, not guessed -- it is where the gain flattens out, and it
+		// makes single-client serving 3.5x faster. Pass 0 to defer to whatever
+		// the engine was built with.
+		minFlops = flag.Uint64("cuda-min-flops", 1<<20,
+			"engine threshold: matmuls below this many FLOPs stay on the CPU (0 keeps the engine's default)")
+		// Left alone. The engine's elementwise default is already 2^20, and the
+		// sweep that moved the matmul threshold showed nothing to gain from
+		// moving this one -- so it stays where it is rather than being set to
+		// its own value and implying a change that was never made.
+		minElems = flag.Uint64("cuda-min-elements", 0,
+			"engine threshold: elementwise ops below this many elements stay on the CPU (0 keeps the default)")
+		stepBase = flag.Duration("mock-step", 8*time.Millisecond, "mock backend: fixed cost of a step")
+		stepPer  = flag.Duration("mock-per-seq", 200*time.Microsecond, "mock backend: marginal cost per sequence")
 	)
 	flag.Parse()
 
@@ -48,7 +61,10 @@ func main() {
 		kind string
 	)
 	if *worker != "" {
-		w, err := backend.NewWorker(*worker, *model, log)
+		w, err := backend.NewWorker(*worker, *model, backend.WorkerOptions{
+			MinMatmulFlops: *minFlops,
+			MinElements:    *minElems,
+		}, log)
 		if err != nil {
 			log.Error("the worker would not start", "error", err, "worker", *worker, "model", *model)
 			os.Exit(1)
