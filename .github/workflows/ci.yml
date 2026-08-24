@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # -count=2 because the scheduler's tests are about concurrency, and a
+      # concurrency test that has only ever passed once has not passed yet.
+      # -race is the point of running this on Linux: the toolchain needs cgo
+      # for it, which a plain Windows checkout does not have.
+      - name: Test
+        run: go test -race -count=2 ./...

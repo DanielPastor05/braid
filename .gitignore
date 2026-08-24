@@ -1,0 +1,12 @@
+# Build output
+/braid
+/braidload
+*.exe
+*.test
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Coverage
+*.out
