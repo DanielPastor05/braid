@@ -13,7 +13,7 @@
 //
 // The protocol is length-free because every frame's size follows from n:
 //
-//   request   u32 magic 'B','R','D','1'
+//   request   u32 magic 'B','R','D','3'
 //             u32 n                        sequences in this batch
 //             i32 ids[n * kSeqLen]         windows, row-major, left-padded
 //             f32 temperature[n]
@@ -21,7 +21,22 @@
 //
 //   response  u32 status                   0 ok, 1 error
 //     ok      i32 next[n]
+//             u64 build_ns                 filling the (n, 64) tensor
+//             u64 forward_ns               the model, including the copy back
+//             u64 sample_ns                softmax and inverse-CDF, per row
+//             u64 kernels                  CUDA kernels the forward launched
 //     error   u32 length, then that many bytes of message
+//
+// The timings exist so that the server can subtract them from the wall time it
+// measured and be left with the cost of the pipe itself, rather than quoting a
+// round number for it. The kernel count is there because the engine falls back
+// to the CPU for work below a size threshold, silently and by design: without
+// it, a step that never touched the card is indistinguishable from one that did,
+// and a forward time that halves as the batch grows has no explanation.
+//
+// They are also why the magic carries a version. A worker built against an older
+// frame would answer a current server with something that parses as garbage
+// rather than failing, and the version makes that a clean error instead.
 //
 // A zero-length read on stdin is a clean shutdown, not a failure: it is what
 // the server closing the pipe looks like.
@@ -35,6 +50,7 @@
 #include "engine/serialize.hpp"
 #include "engine/tensor.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -53,7 +69,7 @@
 
 namespace {
 
-constexpr std::uint32_t kMagic = 0x31445242;  // 'BRD1' little-endian
+constexpr std::uint32_t kMagic = 0x33445242;  // 'BRD3' little-endian
 constexpr std::uint32_t kStatusOK = 0;
 constexpr std::uint32_t kStatusError = 1;
 
@@ -198,18 +214,31 @@ int main(int argc, char** argv) {
         }
 
         try {
-            // The one forward pass. n rows in, n rows of logits out, and the
-            // model has no way of knowing the rows belong to different callers.
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+
             engine::Tensor ids({n, braid::kSeqLen}, 0.0f, false);
             float* id_values = ids.data();
             for (std::size_t i = 0; i < ids_count; ++i) {
                 id_values[i] = static_cast<float>(windows[i]);
             }
+            const auto t1 = clock::now();
+            const std::size_t kernels_before = engine::cuda::kernels_launched();
 
+            // The one forward pass. n rows in, n rows of logits out, and the
+            // model has no way of knowing the rows belong to different callers.
             const engine::Tensor logits = model.forward(ids, mask);  // (n, S, vocab)
-            const float* data = logits.data();
-            const std::size_t vocab_size = vocab.size();
 
+            // data() is what pulls the result back off the device, and kernels
+            // launched before it are asynchronous. Reading it here, inside the
+            // timed region, is what makes forward_ns the model's cost: without
+            // it the copy and whatever kernels were still running would be
+            // charged to the sampling below, which does no GPU work at all.
+            const float* data = logits.data();
+            engine::cuda::synchronize();
+            const auto t2 = clock::now();
+
+            const std::size_t vocab_size = vocab.size();
             next.resize(n);
             for (std::uint32_t i = 0; i < n; ++i) {
                 const float* row =
@@ -217,10 +246,25 @@ int main(int argc, char** argv) {
                                vocab_size;
                 next[i] = sample_row(row, vocab_size, temperatures[i], seeds[i]);
             }
+            const auto t3 = clock::now();
+
+            const auto ns = [](clock::time_point from, clock::time_point to) {
+                return static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+            };
+            const std::uint64_t build_ns = ns(t0, t1);
+            const std::uint64_t forward_ns = ns(t1, t2);
+            const std::uint64_t sample_ns = ns(t2, t3);
+            const auto kernels =
+                static_cast<std::uint64_t>(engine::cuda::kernels_launched() - kernels_before);
 
             const std::uint32_t status = kStatusOK;
             write_all(&status, sizeof status);
             write_all(next.data(), static_cast<std::size_t>(n) * sizeof(std::int32_t));
+            write_all(&build_ns, sizeof build_ns);
+            write_all(&forward_ns, sizeof forward_ns);
+            write_all(&sample_ns, sizeof sample_ns);
+            write_all(&kernels, sizeof kernels);
             std::cout.flush();
         } catch (const std::exception& e) {
             write_error(e.what());

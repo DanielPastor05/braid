@@ -36,13 +36,45 @@ type sample struct {
 }
 
 type stats struct {
-	Steps     int64   `json:"steps"`
-	Advanced  int64   `json:"sequences_advanced"`
-	Tokens    int64   `json:"tokens"`
-	Rejected  int64   `json:"rejected_queue_full"`
-	Completed int64   `json:"completed"`
-	Failed    int64   `json:"failed"`
-	MeanBatch float64 `json:"mean_batch"`
+	Scheduler struct {
+		Steps     int64   `json:"steps"`
+		Advanced  int64   `json:"sequences_advanced"`
+		Tokens    int64   `json:"tokens"`
+		Rejected  int64   `json:"rejected_queue_full"`
+		Completed int64   `json:"completed"`
+		Failed    int64   `json:"failed"`
+		MeanBatch float64 `json:"mean_batch"`
+	} `json:"scheduler"`
+
+	// Step is absent when the backend cannot say where its time went, which is
+	// the case for the mock. The columns that need it are then left blank
+	// rather than filled with a zero that would read as a measurement.
+	Step *struct {
+		Steps     int64   `json:"steps"`
+		WallMS    float64 `json:"wall_ms_per_step"`
+		BuildMS   float64 `json:"build_ms_per_step"`
+		ForwardMS float64 `json:"forward_ms_per_step"`
+		SampleMS  float64 `json:"sample_ms_per_step"`
+		PipeMS    float64 `json:"pipe_ms_per_step"`
+		Kernels   float64 `json:"kernels_per_step"`
+
+		// Cumulative totals, so a level's own figures come from the difference
+		// between two snapshots rather than from the server's running mean.
+		WallTotal    float64 `json:"-"`
+		ForwardTotal float64 `json:"-"`
+		PipeTotal    float64 `json:"-"`
+	} `json:"step"`
+}
+
+// totals turns the per-step means the server reports back into sums, so two
+// snapshots can be subtracted to get one level in isolation.
+func (s *stats) totals() (wall, forward, build, sample, kernels float64, steps int64) {
+	if s.Step == nil {
+		return 0, 0, 0, 0, 0, 0
+	}
+	n := float64(s.Step.Steps)
+	return s.Step.WallMS * n, s.Step.ForwardMS * n, s.Step.BuildMS * n, s.Step.SampleMS * n,
+		s.Step.Kernels * n, s.Step.Steps
 }
 
 func main() {
@@ -57,8 +89,12 @@ func main() {
 
 	client := &http.Client{Timeout: 10 * time.Minute}
 
-	fmt.Printf("| clients | completed | rejected | steps | mean batch | tokens/s | TTFT p50 | TTFT p95 | TTFT p99 | total p50 |\n")
-	fmt.Printf("|---|---|---|---|---|---|---|---|---|---|\n")
+	// The last four columns decompose one step: build fills the (n, 64) tensor,
+	// forward is the model including the copy off the device, sample is the
+	// softmax and the draw, and pipe is what is left of the wall clock once
+	// those are taken off -- two writes, two reads and the serialising.
+	fmt.Printf("| clients | completed | steps | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | build ms | forward ms | sample ms | pipe ms |\n")
+	fmt.Printf("|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 
 	for _, field := range strings.Split(*levels, ",") {
 		n, err := strconv.Atoi(strings.TrimSpace(field))
@@ -180,7 +216,6 @@ func generate(client *http.Client, addr string, maxTokens int, temp float32, see
 
 func report(clients int, samples []sample, before, after stats, elapsed time.Duration) {
 	ttfts := make([]time.Duration, 0, len(samples))
-	totals := make([]time.Duration, 0, len(samples))
 	var okCount, tokens int
 	for _, s := range samples {
 		if s.err != nil || s.toks == 0 {
@@ -189,20 +224,44 @@ func report(clients int, samples []sample, before, after stats, elapsed time.Dur
 		okCount++
 		tokens += s.toks
 		ttfts = append(ttfts, s.ttft)
-		totals = append(totals, s.total)
 	}
 
-	steps := after.Steps - before.Steps
-	advanced := after.Advanced - before.Advanced
+	steps := after.Scheduler.Steps - before.Scheduler.Steps
+	advanced := after.Scheduler.Advanced - before.Scheduler.Advanced
 	meanBatch := 0.0
 	if steps > 0 {
 		meanBatch = float64(advanced) / float64(steps)
 	}
 	rate := float64(tokens) / elapsed.Seconds()
 
-	fmt.Printf("| %d | %d | %d | %d | %.2f | %.0f | %s | %s | %s | %s |\n",
-		clients, okCount, after.Rejected-before.Rejected, steps, meanBatch, rate,
-		pct(ttfts, 50), pct(ttfts, 95), pct(ttfts, 99), pct(totals, 50))
+	// The split for this level alone: the difference between two cumulative
+	// snapshots, divided by the steps between them. Reading the server's own
+	// running mean instead would fold every earlier level into every later one.
+	wall, forward, build, sample := "-", "-", "-", "-"
+	pipe, kernels := "-", "-"
+	wallA, fwdA, buildA, sampA, kernA, stepsA := after.totals()
+	wallB, fwdB, buildB, sampB, kernB, stepsB := before.totals()
+	if n := stepsA - stepsB; n > 0 {
+		each := func(a, b float64) string {
+			return fmt.Sprintf("%.2f", (a-b)/float64(n))
+		}
+		wall = each(wallA, wallB)
+		forward = each(fwdA, fwdB)
+		build = each(buildA, buildB)
+		sample = each(sampA, sampB)
+		pipe = each((wallA - fwdA - buildA - sampA), (wallB - fwdB - buildB - sampB))
+		kernels = fmt.Sprintf("%.0f", (kernA-kernB)/float64(n))
+	}
+
+	fmt.Printf("| %d | %d | %d | %.2f | %.0f | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+		clients, okCount, steps, meanBatch, rate,
+		pct(ttfts, 50), pct(ttfts, 95), wall, build, forward, sample, pipe, kernels)
+
+	// Rejections do not get a column of zeros. They get a line, on stderr, on
+	// the runs where they actually happened.
+	if r := after.Scheduler.Rejected - before.Scheduler.Rejected; r > 0 {
+		fmt.Fprintf(os.Stderr, "  %d requests rejected at %d clients: the queue filled\n", r, clients)
+	}
 }
 
 // pct is the nearest-rank percentile: the smallest observation at or above the

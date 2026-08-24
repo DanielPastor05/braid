@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // Worker is a Backend backed by a braid_worker process holding the model.
@@ -35,10 +36,42 @@ type Worker struct {
 	frame  []byte
 	result []byte
 	closed bool
+
+	timing Timings
+}
+
+// Timings is where a step's wall time went, summed over every step so far.
+//
+// Inside is what the worker measured of itself; Wall is what this side measured
+// around the whole call. Everything between the two is the pipe: two writes,
+// two reads, and the serialising at each end. Reporting it as a subtraction
+// rather than as its own measurement is deliberate -- it means nothing can hide
+// in the gap, because the gap is the answer.
+type Timings struct {
+	Steps     int64         `json:"steps"`
+	Sequences int64         `json:"sequences"`
+	Wall      time.Duration `json:"-"`
+	Build     time.Duration `json:"-"`
+	Forward   time.Duration `json:"-"`
+	Sample    time.Duration `json:"-"`
+	Kernels   int64         `json:"-"`
+
+	WallMS    float64 `json:"wall_ms_per_step"`
+	BuildMS   float64 `json:"build_ms_per_step"`
+	ForwardMS float64 `json:"forward_ms_per_step"`
+	SampleMS  float64 `json:"sample_ms_per_step"`
+	PipeMS    float64 `json:"pipe_ms_per_step"`
+	PipeShare float64 `json:"pipe_share"`
+
+	// KernelsPerStep is how many CUDA kernels a forward launched, on average.
+	// Zero means the work fell below the engine's size threshold and ran on the
+	// CPU -- which the engine does silently and on purpose, and which is
+	// otherwise invisible in a timing that only got slower.
+	KernelsPerStep float64 `json:"kernels_per_step"`
 }
 
 const (
-	frameMagic  uint32 = 0x31445242 // 'BRD1'
+	frameMagic  uint32 = 0x33445242 // 'BRD3'
 	statusOK    uint32 = 0
 	statusError uint32 = 1
 
@@ -148,6 +181,11 @@ func (w *Worker) Step(windows [][]int32, temperatures []float32, seeds []uint64)
 		return nil, fmt.Errorf("backend: the worker is closed")
 	}
 
+	// Started here rather than at the top of the function: what the scheduler
+	// pays for a step is the serialising, the pipe and the parsing, and the
+	// argument checks above are not part of that.
+	started := time.Now()
+
 	n := len(windows)
 	size := 4 + 4 + n*w.seqLen*4 + n*4 + n*8
 	if cap(w.frame) < size {
@@ -196,10 +234,14 @@ func (w *Worker) Step(windows [][]int32, temperatures []float32, seeds []uint64)
 		return nil, fmt.Errorf("backend: the worker sent status %d, which is not a status", status)
 	}
 
-	if cap(w.result) < n*4 {
-		w.result = make([]byte, n*4)
+	// n ids, the three timings the worker measured of itself, and the count
+	// of kernels its forward launched.
+	const timingBytes = 4 * 8
+	need := n*4 + timingBytes
+	if cap(w.result) < need {
+		w.result = make([]byte, need)
 	}
-	result := w.result[:n*4]
+	result := w.result[:need]
 	if _, err := io.ReadFull(w.stdout, result); err != nil {
 		return nil, fmt.Errorf("backend: reading %d ids from the worker: %w", n, err)
 	}
@@ -208,7 +250,48 @@ func (w *Worker) Step(windows [][]int32, temperatures []float32, seeds []uint64)
 	for i := range out {
 		out[i] = int32(binary.LittleEndian.Uint32(result[i*4:]))
 	}
+
+	at = n * 4
+	w.timing.Steps++
+	w.timing.Sequences += int64(n)
+	w.timing.Wall += time.Since(started)
+	w.timing.Build += time.Duration(binary.LittleEndian.Uint64(result[at:]))
+	w.timing.Forward += time.Duration(binary.LittleEndian.Uint64(result[at+8:]))
+	w.timing.Sample += time.Duration(binary.LittleEndian.Uint64(result[at+16:]))
+	w.timing.Kernels += int64(binary.LittleEndian.Uint64(result[at+24:]))
+
 	return out, nil
+}
+
+// Timings reports where the steps taken so far spent their time.
+func (w *Worker) Timings() Timings {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	t := w.timing
+	if t.Steps == 0 {
+		return t
+	}
+
+	per := func(d time.Duration) float64 {
+		return float64(d.Microseconds()) / 1000 / float64(t.Steps)
+	}
+	t.WallMS = per(t.Wall)
+	t.BuildMS = per(t.Build)
+	t.ForwardMS = per(t.Forward)
+	t.SampleMS = per(t.Sample)
+	t.KernelsPerStep = float64(t.Kernels) / float64(t.Steps)
+
+	// What is left when the worker's own accounting is taken off the wall
+	// clock. It can come out slightly negative on a machine whose two clocks
+	// disagree at the microsecond, and it is reported as measured rather than
+	// clamped, because a negative here means the measurement is wrong and that
+	// is worth seeing.
+	t.PipeMS = t.WallMS - t.BuildMS - t.ForwardMS - t.SampleMS
+	if t.WallMS > 0 {
+		t.PipeShare = t.PipeMS / t.WallMS
+	}
+	return t
 }
 
 // Close shuts the worker down by closing its stdin, which the protocol defines

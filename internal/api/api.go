@@ -16,17 +16,19 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/DanielPastor05/braid/internal/backend"
 	"github.com/DanielPastor05/braid/internal/sched"
 )
 
 // Server is the HTTP front of one scheduler.
 type Server struct {
-	sched *sched.Scheduler
-	log   *slog.Logger
+	sched   *sched.Scheduler
+	backend backend.Backend
+	log     *slog.Logger
 }
 
-func New(s *sched.Scheduler, log *slog.Logger) *Server {
-	return &Server{sched: s, log: log}
+func New(s *sched.Scheduler, be backend.Backend, log *slog.Logger) *Server {
+	return &Server{sched: s, backend: be, log: log}
 }
 
 // Routes returns the mux. Kept separate from any listener so tests can drive it
@@ -137,8 +139,19 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
+// timed is what a backend implements when it can say where a step's time went.
+// It is an optional interface rather than part of Backend, because the mock has
+// nothing honest to report and the scheduler does not care either way.
+type timed interface {
+	Timings() backend.Timings
+}
+
 func (s *Server) stats(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.sched.Stats())
+	payload := map[string]any{"scheduler": s.sched.Stats()}
+	if t, ok := s.backend.(timed); ok {
+		payload["step"] = t.Timings()
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func ms(d time.Duration) float64 {

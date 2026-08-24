@@ -74,7 +74,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: api.New(scheduler, log).Routes(),
+		Handler: api.New(scheduler, be, log).Routes(),
 		// No WriteTimeout: a generation is a long-lived stream and a deadline
 		// on the whole response would cut it off mid-sentence. The request
 		// context, MaxTokens and MaxWait are what bound a request here.
