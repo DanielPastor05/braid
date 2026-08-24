@@ -29,6 +29,8 @@ func main() {
 		maxBatch  = flag.Int("max-batch", 32, "most sequences in one forward pass")
 		queue     = flag.Int("queue", 256, "how many requests may wait for admission")
 		maxTokens = flag.Int("max-tokens", 1024, "longest generation a caller may ask for")
+		worker    = flag.String("worker", "", "path to braid_worker; empty runs the mock backend")
+		model     = flag.String("model", "models/charlm", "checkpoint prefix the worker loads")
 		stepBase  = flag.Duration("mock-step", 8*time.Millisecond, "mock backend: fixed cost of a step")
 		stepPer   = flag.Duration("mock-per-seq", 200*time.Microsecond, "mock backend: marginal cost per sequence")
 	)
@@ -36,9 +38,29 @@ func main() {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	be := backend.NewMock()
-	be.Base = *stepBase
-	be.PerSeq = *stepPer
+	// No silent fallback. A server that quietly runs the mock when the worker
+	// fails to start would answer every request with plausible nonsense and
+	// report perfectly good latencies for it, and somebody would eventually
+	// paste those numbers somewhere. If a worker was asked for and cannot be
+	// had, that is a startup failure.
+	var (
+		be   backend.Backend
+		kind string
+	)
+	if *worker != "" {
+		w, err := backend.NewWorker(*worker, *model, log)
+		if err != nil {
+			log.Error("the worker would not start", "error", err, "worker", *worker, "model", *model)
+			os.Exit(1)
+		}
+		be, kind = w, "worker"
+	} else {
+		mock := backend.NewMock()
+		mock.Base = *stepBase
+		mock.PerSeq = *stepPer
+		be, kind = mock, "mock"
+		log.Warn("running the mock backend: every number this produces is about the scheduler, not a model")
+	}
 
 	scheduler, err := sched.New(be, sched.Config{
 		MaxBatch:       *maxBatch,
@@ -64,7 +86,7 @@ func main() {
 
 	go func() {
 		log.Info("listening",
-			"addr", *addr, "max_batch", *maxBatch, "queue", *queue, "backend", "mock")
+			"addr", *addr, "max_batch", *maxBatch, "queue", *queue, "backend", kind)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("the listener stopped", "error", err)
 			stop()

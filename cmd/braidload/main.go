@@ -66,6 +66,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "not a concurrency level: %q\n", field)
 			os.Exit(1)
 		}
+		// With fewer requests than clients, the extra clients never get one and
+		// the level silently measures a smaller number than the one it prints.
+		// A row labelled 64 that was really 48 is worse than no row at all.
+		if *perLevel < n {
+			fmt.Fprintf(os.Stderr,
+				"concurrency %d needs at least that many requests to reach it; -requests is %d\n",
+				n, *perLevel)
+			os.Exit(1)
+		}
 
 		before, err := readStats(client, *addr)
 		if err != nil {

@@ -10,3 +10,7 @@ go.work.sum
 
 # Coverage
 *.out
+
+# Build output
+/build/
+/models/
