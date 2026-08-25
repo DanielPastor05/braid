@@ -212,9 +212,19 @@ func TestKernelsByBatchSize(t *testing.T) {
 		elements = parsed
 	}
 
+	layernorm := uint64(0)
+	if raw := os.Getenv("BRAID_MIN_LAYERNORM"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			t.Fatalf("BRAID_MIN_LAYERNORM=%q is not a number: %v", raw, err)
+		}
+		layernorm = parsed
+	}
+
 	w, err := backend.NewWorker(exe, model, backend.WorkerOptions{
-		MinMatmulFlops: threshold,
-		MinElements:    elements,
+		MinMatmulFlops:       threshold,
+		MinElements:          elements,
+		MinLayerNormElements: layernorm,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("starting the worker: %v", err)
@@ -233,7 +243,7 @@ func TestKernelsByBatchSize(t *testing.T) {
 		return windows, temps, seeds
 	}
 
-	t.Logf("min_matmul_flops %d, min_elements %d", threshold, elements)
+	t.Logf("min_matmul_flops %d, min_elements %d, min_layernorm %d", threshold, elements, layernorm)
 	t.Logf("%4s | %8s | %10s | %8s | %11s", "n", "kernels", "to_device", "to_host", "forward ms")
 	var atOne float64
 	for n := 1; n <= 12; n++ {

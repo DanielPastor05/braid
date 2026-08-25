@@ -102,6 +102,12 @@ const (
 type WorkerOptions struct {
 	MinMatmulFlops uint64
 	MinElements    uint64
+
+	// MinLayerNormElements is the third of the engine's thresholds, and the one
+	// that decides whether a small forward chains across the card or comes home
+	// at every normalisation. This model puts n*6144 elements through each
+	// LayerNorm, so the engine's 2^15 default first clears at a batch of six.
+	MinLayerNormElements uint64
 }
 
 // NewWorker starts the worker process and loads the alphabet the model was
@@ -138,6 +144,10 @@ func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*W
 	if opts.MinElements > 0 {
 		w.cmd.Env = append(w.cmd.Env,
 			fmt.Sprintf("ENGINE_CUDA_MIN_ELEMENTS=%d", opts.MinElements))
+	}
+	if opts.MinLayerNormElements > 0 {
+		w.cmd.Env = append(w.cmd.Env,
+			fmt.Sprintf("ENGINE_CUDA_MIN_LAYERNORM=%d", opts.MinLayerNormElements))
 	}
 
 	stdin, err := w.cmd.StdinPipe()

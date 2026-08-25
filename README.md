@@ -13,13 +13,13 @@ real model on the GPU, not only asserted.
 |---|---|
 | **Model** | the character Transformer from `cpp-ai-engine`, 172 728 parameters, 64-id context, 120-symbol alphabet, 1.94 bits/char |
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
-| **Forward passes for the same 7 680 tokens** | 7 680 at one client, **264 at thirty-two** |
-| **Throughput** | 698 tokens/s at one client, **7 390 at thirty-two** |
-| **Where a step goes at batch 32** | 3.31 ms model, 0.46 ms pipe, 0.07 ms sampling |
-| **The engine's CUDA threshold** | lowered from 2²² to 2²⁰ after measuring: **3.5× at one client** |
+| **Forward passes for the same 7 680 tokens** | 7 680 at one client, **273 at thirty-two** |
+| **Throughput** | 988 tokens/s at one client, **7 185 at thirty-two** |
+| **Where a step goes at batch 32** | 3.39 ms model, 0.35 ms pipe, 0.06 ms sampling |
+| **Two engine thresholds moved** | matmul 2²² → 2²⁰ (**3.5×** at one client), LayerNorm 2¹⁵ → 2 048 (**1.4–1.9×** at one to five) |
 | **CPU and CUDA paths** | 200 characters identical, sampled independently |
 | **Batching invariance** | identical output alone and at mean batch 8.68, on the GPU |
-| **Found upstream** | batches under six cross PCIe five times a step, on a LayerNorm floor of 2¹⁵ |
+| **Landed upstream** | three PRs on the engine: the residency clause, the correction to it, and the floor becoming a threshold |
 
 ---
 
@@ -31,25 +31,28 @@ sweep, for reasons two sections below.
 
 | clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | sample ms | pipe ms | kernels |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 7 680 | 1.00 | 698 | 4 ms | 6 ms | 1.35 | 1.31 | 0.00 | 0.04 | 48 |
-| 2 | 4 092 | 1.88 | 1 089 | 6 ms | 8 ms | 1.70 | 1.66 | 0.00 | 0.04 | 48 |
-| 3 | 2 723 | 2.82 | 1 306 | 6 ms | 8 ms | 2.13 | 2.09 | 0.01 | 0.04 | 48 |
-| 4 | 2 027 | 3.79 | 1 613 | 6 ms | 8 ms | 2.33 | 2.29 | 0.01 | 0.04 | 48 |
-| 6 | 1 385 | 5.55 | 3 934 | 6 ms | 8 ms | 1.39 | 1.35 | 0.01 | 0.04 | 58 |
-| 8 | 1 016 | 7.56 | 5 037 | 7 ms | 8 ms | 1.47 | 1.43 | 0.01 | 0.03 | 59 |
-| 16 | 506 | 15.18 | 6 614 | 11 ms | 14 ms | 2.21 | 2.10 | 0.02 | 0.08 | 60 |
-| 32 | 264 | 29.09 | **7 390** | 22 ms | 36 ms | 3.84 | 3.31 | 0.07 | 0.46 | 60 |
-| 64 | 244 | 31.48 | 7 895 | **237 ms** | 276 ms | 3.80 | 3.27 | 0.08 | 0.45 | 60 |
+| 1 | 7 680 | 1.00 | 988 | 4 ms | 6 ms | 0.93 | 0.89 | 0.00 | 0.04 | 60 |
+| 2 | 4 025 | 1.91 | 1 793 | 4 ms | 7 ms | 1.02 | 0.97 | 0.00 | 0.04 | 60 |
+| 4 | 2 094 | 3.67 | 2 896 | 6 ms | 9 ms | 1.24 | 1.19 | 0.01 | 0.05 | 60 |
+| 8 | 1 011 | 7.60 | 4 692 | 7 ms | 9 ms | 1.55 | 1.50 | 0.01 | 0.03 | 60 |
+| 16 | 512 | 15.00 | 5 442 | 13 ms | 24 ms | 2.68 | 2.42 | 0.03 | 0.23 | 60 |
+| 32 | 273 | 28.13 | **7 185** | 23 ms | 34 ms | 3.82 | 3.39 | 0.06 | 0.35 | 60 |
+| 64 | 248 | 30.97 | 7 405 | **246 ms** | 291 ms | 4.07 | 3.61 | 0.08 | 0.36 | 60 |
+
+The kernel column is flat now, and both discontinuities that used to be in this
+table are gone. Getting them out took two changes to the engine's dispatch
+thresholds and one change that turned out not to matter; the next two sections
+are what that cost and what it bought.
 
 **One client needs 7 680 forward passes to produce 7 680 tokens.** That is what
 serving requests one at a time means, and the first row confirms the accounting:
 exactly one step per token, mean batch 1.00.
 
-**Thirty-two need 264.** Same work, 29× fewer trips through the model, and
-ten times the throughput of a single client.
+**Thirty-two need 273.** Same work, 28× fewer trips through the model, and
+seven times the throughput of a single client.
 
 **Sixty-four is the wall.** Throughput is still creeping up, but the median time
-to first token goes from 22 ms to 237 ms. With `-max-batch 32`, half the clients
+to first token goes from 23 ms to 246 ms. With `-max-batch 32`, half the clients
 are waiting for a seat at any moment, and waiting is most of what the extra
 concurrency buys them. On a throughput chart alone these last two rows look like
 progress. Only the tail says otherwise.
@@ -170,30 +173,61 @@ It moved exactly there. **The floor is the lever: 2.6× at five sequences,
 ### The fix that was not the fix
 
 The obvious repair looked different, and it was wrong. Every other dispatch in
-the engine reads "big enough to be worth the transfer **or** already resident
-on the device" — `elementwise_worth_it()`, the matmul entry — and LayerNorm was
-the only one carrying a bare floor with no residency clause. So the clause was
+the engine reads "big enough to be worth the transfer **or** already resident on
+the device" — `elementwise_worth_it()`, the matmul entry — and LayerNorm was the
+only one carrying a bare floor with no residency clause. So the clause was
 added, upstream, with a test:
 [cpp-ai-engine#2](https://github.com/DanielPastor05/cpp-ai-engine/pull/2).
 
-Measured after merging and updating the submodule pin, it changes **nothing**
-here. The table is identical to the one at the top of this section: 48 kernels
-and five crossings each way below six, sixty and one above.
+Measured after merging and updating the submodule pin, it changed **nothing**.
+The table was identical: 48 kernels and five crossings each way below six.
 
-The clause only fires when the input is *already* on the card, and in this
-model it never is. The chain is broken before it reaches a LayerNorm — the
-embedding output starts on the host, and the engine's own notes place `reshape`
-and `transpose` there too. What moved the numbers in the experiment above was
-lowering the floor, which makes LayerNorm dispatch **regardless** of residency,
-paying an upload to hold the chain afterwards. Two different changes, and the
-2.6× belongs to the second.
+The clause only fires when the input is *already* on the card, and in this model
+it never is. The chain is broken before it reaches a LayerNorm — the embedding
+output starts on the host, and `reshape` and `transpose` are still there too.
+What had moved the numbers in the experiment above was lowering the **floor**,
+which makes LayerNorm dispatch regardless of residency, paying an upload to hold
+the chain afterwards. Two different changes, and the speedup belonged to the
+second.
+[cpp-ai-engine#3](https://github.com/DanielPastor05/cpp-ai-engine/pull/3)
+corrects the claim. The clause stays — it makes LayerNorm consistent with every
+other operation, and it will pay the moment the ops around it stop coming home —
+but it is latent, and an earlier version of this file credited it with a speedup
+it does not deliver.
 
-The clause is still right — it makes LayerNorm consistent with every other
-operation, and it will pay the moment the ops around it stop coming home — but
-it is latent, and an earlier version of this file credited it with a speedup it
-does not deliver. The measurement that caught that is the one that ran *after*
-the merge, which is the argument for taking it.
+### Making the floor a knob, and what it was worth
 
+The floor was the lever and it was a `constexpr`, while `ENGINE_CUDA_MIN_FLOPS`
+and `ENGINE_CUDA_MIN_ELEMENTS` were both settable and documented as sweepable
+"without recompiling". So it became the third:
+[cpp-ai-engine#4](https://github.com/DanielPastor05/cpp-ai-engine/pull/4) adds
+`ENGINE_CUDA_MIN_LAYERNORM`, `min_layernorm_elements()`, and a third argument to
+`set_thresholds`. The engine's default does not change.
+
+**braid serves at 2 048.** Any value under 6 144 puts a single sequence on the
+card; that leaves room. End to end, against the engine's default:
+
+| clients | floor 2¹⁵ | floor 2 048 | |
+|---|---|---|---|
+| 1 | 670 / 693 | 991 / 976 | **1.4×** |
+| 2 | 1 006 / 1 060 | 1 709 / 1 789 | **1.7×** |
+| 3 | 1 295 / 1 240 | 2 150 / 2 375 | **1.8×** |
+| 4 | 1 441 / 1 566 | 2 646 / 2 954 | **1.9×** |
+| 5 | 1 674 / 1 703 | 3 220 / 3 238 | **1.9×** |
+| 6 | 3 394 / 3 765 | 2 862 / 4 116 | 1.0× |
+| 8 | 3 950 / 4 528 | 3 639 / 4 803 | 1.0× |
+
+Two figures per cell because the sweep was run in both directions, for the
+[reason given below](#what-the-measurements-needed-before-they-could-be-published).
+
+**Rows six and eight are the control.** Above the default floor both
+configurations dispatch identically — 60 kernels, one crossing each way — so
+they must show no difference, and they do not. What they show instead is the
+size of the noise, ±16%, which is the band every other row has to beat. Rows one
+to five beat it in both directions.
+
+1.4× to 1.9×, then, end to end — not the 2.0× to 2.6× that the forward-time
+column alone suggested. A step is more than its forward.
 ---
 
 ## Where a step actually goes
@@ -207,18 +241,18 @@ answer.
 
 | | batch 1 | batch 8 | batch 32 |
 |---|---|---|---|
-| model, including the copy off the device | 1.31 ms | 1.43 ms | 3.31 ms |
-| sampling, 120-way softmax per row | 0.00 ms | 0.01 ms | 0.07 ms |
+| model, including the copy off the device | 0.89 ms | 1.50 ms | 3.39 ms |
+| sampling, 120-way softmax per row | 0.00 ms | 0.01 ms | 0.06 ms |
 | filling the (n, 64) tensor | 0.00 ms | 0.00 ms | 0.01 ms |
-| **the pipe** | **0.04 ms** | **0.03 ms** | **0.46 ms** |
-| pipe as a share of the step | 3.0% | **2.0%** | **12%** |
+| **the pipe** | **0.04 ms** | **0.03 ms** | **0.35 ms** |
+| pipe as a share of the step | 4.3% | **1.9%** | **9.2%** |
 
-The pipe costs a twenty-fifth of a millisecond at small batches and half a
-millisecond at thirty-two, because the frame it carries is `n × 64 × 4` bytes —
-256 bytes at batch 1, 8 KB at batch 32. As a share it reaches 12%, and it gets
-there because the model's own time grows more slowly than the frame does.
+The pipe costs a twenty-fifth of a millisecond at small batches and about a
+third at thirty-two, because the frame it carries is `n × 64 × 4` bytes — 256
+bytes at batch 1, 8 KB at batch 32. Its share peaks near 9%, and it gets there
+because the model's own time grows more slowly than the frame does.
 
-Twelve percent is the price of not being able to link the engine into the server.
+Nine percent is the price of not being able to link the engine into the server.
 It is worth knowing rather than assuming, and it is small enough that the
 [reason for the process boundary](#why-the-model-runs-in-another-process) still
 holds.
@@ -306,7 +340,7 @@ A pipe has no ABI to disagree about. `braid_worker` is a C++ process that owns
 the model and answers step requests over stdin and stdout in a fixed binary
 frame; the Go side writes `n` windows and reads `n` ids back, plus the three
 timings and the kernel count it needs to say where the step went. It costs
-[about twelve percent at batch 32](#where-a-step-actually-goes).
+[about nine percent at batch 32](#where-a-step-actually-goes).
 
 What falls out of it is the shape the next phase needs: a worker is a thing that
 can be killed.
@@ -388,18 +422,15 @@ server whose numbers end up pasted somewhere.
 
 ## Next
 
-1. **Make the LayerNorm floor settable**, the way `ENGINE_CUDA_MIN_FLOPS` and
-   `ENGINE_CUDA_MIN_ELEMENTS` already are. It is a `constexpr` today, and it is
-   the one number that actually moves serving at batches under six — worth
-   2.0× to 2.6×, [measured](#the-second-limit-layernorm-and-why-the-chain-breaks).
-2. **Keep the chain resident through `reshape` and `transpose`.** They are what
+1. **Keep the chain resident through `reshape` and `transpose`.** They are what
    break it before a LayerNorm ever sees a device tensor, which is why the
-   residency clause is currently latent.
-3. **A KV cache.** The engine recomputes the full 64-id window every step. Now
+   residency clause from #2 is still latent. Fixing them is what would make it
+   pay, and would let the floor go back up.
+2. **A KV cache.** The engine recomputes the full 64-id window every step. Now
    that a step is broken down there is something to measure a cache against, and
    the kernel and transfer counts say where it would and would not help.
-4. **A router and more than one worker**, then `kill -9` one under load and
+3. **A router and more than one worker**, then `kill -9` one under load and
    publish the recovery curve.
-5. **Make the 64-client row reproducible.** It is the only figure on this page
+4. **Make the 64-client row reproducible.** It is the only figure on this page
    with a spread worth apologising for, and running the load generator off the
    machine under test is the obvious first thing to try.
