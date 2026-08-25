@@ -19,7 +19,7 @@ real model on the GPU, not only asserted.
 | **The engine's CUDA threshold** | lowered from 2²² to 2²⁰ after measuring: **3.5× at one client** |
 | **CPU and CUDA paths** | 200 characters identical, sampled independently |
 | **Batching invariance** | identical output alone and at mean batch 8.68, on the GPU |
-| **Found upstream** | LayerNorm has no residency escape, so batches under six cross PCIe five times a step |
+| **Found upstream** | batches under six cross PCIe five times a step, on a LayerNorm floor of 2¹⁵ |
 
 ---
 
@@ -164,16 +164,35 @@ batch of two:
 | **2** | **60** | **1** | **1.04** |
 | 5 | 60 | 1 | 0.98 |
 
-It moved exactly there. That is what the fix would be worth at these batch
-sizes: 2.6× at five sequences, 2.2× at four, 2.0× at three.
+It moved exactly there. **The floor is the lever: 2.6× at five sequences,
+2.2× at four, 2.0× at three.**
 
-**braid does not carry that change.** It is one line in `cpp-ai-engine`, and it
-belongs there rather than in a patched submodule — the engine already made this
-exact fix for elementwise operations, and its own comment explains why:
-*"refusing is what costs the round trip, because the CPU path then has to pull
-the buffer down."* LayerNorm was simply not included when that reasoning was
-applied. Until it is, batches of one to five serve at about half the speed they
-could.
+### The fix that was not the fix
+
+The obvious repair looked different, and it was wrong. Every other dispatch in
+the engine reads "big enough to be worth the transfer **or** already resident
+on the device" — `elementwise_worth_it()`, the matmul entry — and LayerNorm was
+the only one carrying a bare floor with no residency clause. So the clause was
+added, upstream, with a test:
+[cpp-ai-engine#2](https://github.com/DanielPastor05/cpp-ai-engine/pull/2).
+
+Measured after merging and updating the submodule pin, it changes **nothing**
+here. The table is identical to the one at the top of this section: 48 kernels
+and five crossings each way below six, sixty and one above.
+
+The clause only fires when the input is *already* on the card, and in this
+model it never is. The chain is broken before it reaches a LayerNorm — the
+embedding output starts on the host, and the engine's own notes place `reshape`
+and `transpose` there too. What moved the numbers in the experiment above was
+lowering the floor, which makes LayerNorm dispatch **regardless** of residency,
+paying an upload to hold the chain afterwards. Two different changes, and the
+2.6× belongs to the second.
+
+The clause is still right — it makes LayerNorm consistent with every other
+operation, and it will pay the moment the ops around it stop coming home — but
+it is latent, and an earlier version of this file credited it with a speedup it
+does not deliver. The measurement that caught that is the one that ran *after*
+the merge, which is the argument for taking it.
 
 ---
 
@@ -369,14 +388,18 @@ server whose numbers end up pasted somewhere.
 
 ## Next
 
-1. **Give LayerNorm the residency clause**, in `cpp-ai-engine` rather than here.
-   One line, worth 2.6× at a batch of five, and measured
-   [above](#the-second-limit-layernorm-and-why-the-chain-breaks).
-2. **A KV cache.** The engine recomputes the full 64-id window every step. Now
+1. **Make the LayerNorm floor settable**, the way `ENGINE_CUDA_MIN_FLOPS` and
+   `ENGINE_CUDA_MIN_ELEMENTS` already are. It is a `constexpr` today, and it is
+   the one number that actually moves serving at batches under six — worth
+   2.0× to 2.6×, [measured](#the-second-limit-layernorm-and-why-the-chain-breaks).
+2. **Keep the chain resident through `reshape` and `transpose`.** They are what
+   break it before a LayerNorm ever sees a device tensor, which is why the
+   residency clause is currently latent.
+3. **A KV cache.** The engine recomputes the full 64-id window every step. Now
    that a step is broken down there is something to measure a cache against, and
    the kernel and transfer counts say where it would and would not help.
-3. **A router and more than one worker**, then `kill -9` one under load and
+4. **A router and more than one worker**, then `kill -9` one under load and
    publish the recovery curve.
-4. **Make the 64-client row reproducible.** It is the only figure on this page
+5. **Make the 64-client row reproducible.** It is the only figure on this page
    with a spread worth apologising for, and running the load generator off the
    machine under test is the obvious first thing to try.
