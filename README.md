@@ -167,8 +167,11 @@ batch of two:
 | **2** | **60** | **1** | **1.04** |
 | 5 | 60 | 1 | 0.98 |
 
-It moved exactly there. **The floor is the lever: 2.6× at five sequences,
-2.2× at four, 2.0× at three.**
+It moved exactly there. **The floor is the lever** — 2.6× at five sequences,
+2.2× at four, 2.0× at three, on the forward time in this table. What that
+becomes once the rest of a step is counted is
+[two sections down](#making-the-floor-a-knob-and-what-it-was-worth), and it is
+smaller.
 
 ### The fix that was not the fix
 
