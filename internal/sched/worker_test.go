@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -167,6 +168,105 @@ func TestTheCPUAndGPUPathsAgree(t *testing.T) {
 		}
 		t.Errorf("the two paths diverged at character %d of %d.\n host: %q\n card: %q",
 			at, req.MaxTokens, onHost, onCard)
+	}
+}
+
+// TestKernelsByBatchSize drives the worker at exact batch sizes and reports what
+// each one costs.
+//
+// The load sweep cannot answer this. Its rows are labelled by client count, and
+// the batch a step actually gets is whatever had arrived by then -- "four
+// clients" measured a mean batch of 3.79 over steps ranging from one to four, so
+// its kernel count is an average over sizes and cannot say which size the jump
+// belongs to. Here n is exactly n, fifty times in a row.
+//
+// The assertion is a regression guard on the threshold braid serves at: if a
+// batch of one ever stops launching kernels again, the default has drifted back
+// to the engine's and single-client serving is three and a half times slower
+// than it should be. The table is the point, and it goes to the log.
+func TestKernelsByBatchSize(t *testing.T) {
+	exe := os.Getenv("BRAID_WORKER")
+	model := os.Getenv("BRAID_MODEL")
+	if exe == "" || model == "" {
+		t.Skip("set BRAID_WORKER and BRAID_MODEL to run this against the engine")
+	}
+
+	// Overridable so the same table can be taken at several thresholds, which is
+	// how the jump between five and six was located: if it is a threshold being
+	// crossed, moving the threshold moves the jump.
+	threshold := uint64(1 << 20)
+	if raw := os.Getenv("BRAID_MIN_FLOPS"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			t.Fatalf("BRAID_MIN_FLOPS=%q is not a number: %v", raw, err)
+		}
+		threshold = parsed
+	}
+
+	elements := uint64(0)
+	if raw := os.Getenv("BRAID_MIN_ELEMENTS"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			t.Fatalf("BRAID_MIN_ELEMENTS=%q is not a number: %v", raw, err)
+		}
+		elements = parsed
+	}
+
+	w, err := backend.NewWorker(exe, model, backend.WorkerOptions{
+		MinMatmulFlops: threshold,
+		MinElements:    elements,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("starting the worker: %v", err)
+	}
+	defer w.Close()
+
+	const repeats = 50
+	batch := func(n int) (windows [][]int32, temps []float32, seeds []uint64) {
+		for i := range n {
+			window := make([]int32, w.SeqLen())
+			copy(window[w.SeqLen()-5:], w.Encode("The e"))
+			windows = append(windows, window)
+			temps = append(temps, 0.7)
+			seeds = append(seeds, uint64(i))
+		}
+		return windows, temps, seeds
+	}
+
+	t.Logf("min_matmul_flops %d, min_elements %d", threshold, elements)
+	t.Logf("%4s | %8s | %10s | %8s | %11s", "n", "kernels", "to_device", "to_host", "forward ms")
+	var atOne float64
+	for n := 1; n <= 12; n++ {
+		windows, temps, seeds := batch(n)
+
+		// Warm, so the first call's allocations are not charged to the sample.
+		for range 5 {
+			if _, err := w.Step(windows, temps, seeds); err != nil {
+				t.Fatalf("step at n=%d: %v", n, err)
+			}
+		}
+
+		before := w.Timings()
+		for range repeats {
+			if _, err := w.Step(windows, temps, seeds); err != nil {
+				t.Fatalf("step at n=%d: %v", n, err)
+			}
+		}
+		after := w.Timings()
+
+		kernels := float64(after.Kernels-before.Kernels) / repeats
+		toDevice := float64(after.ToDevice-before.ToDevice) / repeats
+		toHost := float64(after.ToHost-before.ToHost) / repeats
+		forward := (after.Forward - before.Forward).Seconds() * 1000 / repeats
+		if n == 1 {
+			atOne = kernels
+		}
+		t.Logf("%4d | %8.0f | %10.0f | %8.0f | %11.3f", n, kernels, toDevice, toHost, forward)
+	}
+
+	if atOne == 0 && threshold <= 1<<20 {
+		t.Error("a batch of one launched no kernels: the CUDA threshold has drifted back " +
+			"to the engine's training default, and single-client serving is 3.5x slower for it")
 	}
 }
 

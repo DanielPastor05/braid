@@ -19,6 +19,7 @@ real model on the GPU, not only asserted.
 | **The engine's CUDA threshold** | lowered from 2²² to 2²⁰ after measuring: **3.5× at one client** |
 | **CPU and CUDA paths** | 200 characters identical, sampled independently |
 | **Batching invariance** | identical output alone and at mean batch 8.68, on the GPU |
+| **Found upstream** | LayerNorm has no residency escape, so batches under six cross PCIe five times a step |
 
 ---
 
@@ -99,11 +100,80 @@ and compares them. They are identical. Two hundred sequential draws from logits
 computed by two different implementations, and not one of them lands
 differently.
 
-**The same thing is still happening one level up, smaller.** Batches of one to
-four launch 48 kernels; batch 6 launches 58, and its forward drops from 2.29 ms
-to 1.35. Some second class of operation crosses its own line between four and
-six. Lowering the threshold further does not move it, so it is a different limit
-and it has not been chased.
+---
+
+## The second limit: LayerNorm, and why the chain breaks
+
+Lowering the threshold did not flatten the curve. A second discontinuity
+remained, and driving the worker at *exact* batch sizes — rather than at client
+counts, whose steps are a mixture of sizes — put it between five and six:
+
+| n | kernels | host→device | device→host | forward ms |
+|---|---|---|---|---|
+| 1 | 48 | 5 | 5 | 1.58 |
+| 2 | 48 | 5 | 5 | 1.52 |
+| 3 | 48 | 5 | 5 | 1.95 |
+| 4 | 48 | 5 | 5 | 2.03 |
+| 5 | 48 | 5 | 5 | 2.53 |
+| **6** | **60** | **1** | **1** | **1.14** |
+| 8 | 60 | 1 | 1 | 1.11 |
+| 12 | 60 | 1 | 1 | 1.47 |
+
+Four things it is not, each ruled out by measurement rather than by reading:
+`ENGINE_CUDA_MIN_FLOPS`, swept from 2²² down to 98 304 — the jump does not move.
+`ENGINE_CUDA_MIN_ELEMENTS`, swept from 2²⁰ down to 1 024 — it changes the kernel
+count either side but not where the jump is. And the matmul kernel itself,
+pinned in turn to tiled, register-tiled and vectorised — the jump survives all
+three.
+
+**The transfer columns are the answer, and the kernel count is only its
+shadow.** Below six, a step crosses PCIe five times in each direction. At six
+and above, once. The extra kernels are not extra work; they are the same work
+staying on the card instead of coming home between operations.
+
+The engine dispatches an operation when it is big enough to be worth the
+transfer *or* when its input is already on the device — the second clause being
+the one that lets a forward pass chain across the card without touching the
+host. `elementwise_worth_it` has it. The matmul entry has it. Every operation
+in this model's forward has it except one:
+
+```cpp
+// src/cuda/kernels.cu
+constexpr size_t kMinLayerNormElements = 1u << 15;
+
+bool layernorm(...) {
+    if (!enabled() || x.size() < kMinLayerNormElements) return false;
+```
+
+A hard floor, with no residency clause. LayerNorm's input here is
+`n × 64 × 96` = `n × 6 144` elements, so it clears 32 768 at
+`n = 32 768 / 6 144 = 5.33`, and the first whole batch that clears it is six.
+Below that, all four LayerNorms in the model — two blocks, two each — refuse.
+Each refusal pulls the activations off the card and the next operation puts them
+back: four breaks plus the initial upload is the five crossings in the table.
+The constant is a `constexpr`, which is why neither environment variable could
+move it.
+
+Then tested rather than left as a good story. Rebuilding the engine with the
+floor at 2¹³ = 8 192 predicts a crossover at `8 192 / 6 144 = 1.33`, so at a
+batch of two:
+
+| n | kernels | host→device | forward ms |
+|---|---|---|---|
+| 1 | 48 | 5 | 1.26 |
+| **2** | **60** | **1** | **1.04** |
+| 5 | 60 | 1 | 0.98 |
+
+It moved exactly there. That is what the fix would be worth at these batch
+sizes: 2.6× at five sequences, 2.2× at four, 2.0× at three.
+
+**braid does not carry that change.** It is one line in `cpp-ai-engine`, and it
+belongs there rather than in a patched submodule — the engine already made this
+exact fix for elementwise operations, and its own comment explains why:
+*"refusing is what costs the round trip, because the CPU path then has to pull
+the buffer down."* LayerNorm was simply not included when that reasoning was
+applied. Until it is, batches of one to five serve at about half the speed they
+could.
 
 ---
 
@@ -299,14 +369,14 @@ server whose numbers end up pasted somewhere.
 
 ## Next
 
-1. **A KV cache.** The engine recomputes the full 64-id window every step. Now
+1. **Give LayerNorm the residency clause**, in `cpp-ai-engine` rather than here.
+   One line, worth 2.6× at a batch of five, and measured
+   [above](#the-second-limit-layernorm-and-why-the-chain-breaks).
+2. **A KV cache.** The engine recomputes the full 64-id window every step. Now
    that a step is broken down there is something to measure a cache against, and
-   the kernel counts say where it would and would not help.
-2. **A router and more than one worker**, then `kill -9` one under load and
+   the kernel and transfer counts say where it would and would not help.
+3. **A router and more than one worker**, then `kill -9` one under load and
    publish the recovery curve.
-3. **Find the second threshold.** Something still moves between batch four and
-   batch six — 48 kernels to 58, and a forward that drops by 40%. It is not
-   `ENGINE_CUDA_MIN_FLOPS`, because lowering that further does not touch it.
 4. **Make the 64-client row reproducible.** It is the only figure on this page
    with a spread worth apologising for, and running the load generator off the
    machine under test is the obvious first thing to try.

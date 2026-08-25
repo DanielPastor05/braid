@@ -55,6 +55,8 @@ type Timings struct {
 	Forward   time.Duration `json:"-"`
 	Sample    time.Duration `json:"-"`
 	Kernels   int64         `json:"-"`
+	ToDevice  int64         `json:"-"`
+	ToHost    int64         `json:"-"`
 
 	WallMS    float64 `json:"wall_ms_per_step"`
 	BuildMS   float64 `json:"build_ms_per_step"`
@@ -68,10 +70,17 @@ type Timings struct {
 	// CPU -- which the engine does silently and on purpose, and which is
 	// otherwise invisible in a timing that only got slower.
 	KernelsPerStep float64 `json:"kernels_per_step"`
+
+	// PCIe crossings per step. An operation the engine keeps on the host still
+	// has to get its inputs there and its result back, so these rise as the
+	// kernel count falls -- which is how a drop in kernels is told apart from a
+	// change in how the same work is launched.
+	ToDevicePerStep float64 `json:"to_device_per_step"`
+	ToHostPerStep   float64 `json:"to_host_per_step"`
 }
 
 const (
-	frameMagic  uint32 = 0x33445242 // 'BRD3'
+	frameMagic  uint32 = 0x34445242 // 'BRD4'
 	statusOK    uint32 = 0
 	statusError uint32 = 1
 
@@ -264,7 +273,7 @@ func (w *Worker) Step(windows [][]int32, temperatures []float32, seeds []uint64)
 
 	// n ids, the three timings the worker measured of itself, and the count
 	// of kernels its forward launched.
-	const timingBytes = 4 * 8
+	const timingBytes = 6 * 8
 	need := n*4 + timingBytes
 	if cap(w.result) < need {
 		w.result = make([]byte, need)
@@ -287,6 +296,8 @@ func (w *Worker) Step(windows [][]int32, temperatures []float32, seeds []uint64)
 	w.timing.Forward += time.Duration(binary.LittleEndian.Uint64(result[at+8:]))
 	w.timing.Sample += time.Duration(binary.LittleEndian.Uint64(result[at+16:]))
 	w.timing.Kernels += int64(binary.LittleEndian.Uint64(result[at+24:]))
+	w.timing.ToDevice += int64(binary.LittleEndian.Uint64(result[at+32:]))
+	w.timing.ToHost += int64(binary.LittleEndian.Uint64(result[at+40:]))
 
 	return out, nil
 }
@@ -309,6 +320,8 @@ func (w *Worker) Timings() Timings {
 	t.ForwardMS = per(t.Forward)
 	t.SampleMS = per(t.Sample)
 	t.KernelsPerStep = float64(t.Kernels) / float64(t.Steps)
+	t.ToDevicePerStep = float64(t.ToDevice) / float64(t.Steps)
+	t.ToHostPerStep = float64(t.ToHost) / float64(t.Steps)
 
 	// What is left when the worker's own accounting is taken off the wall
 	// clock. It can come out slightly negative on a machine whose two clocks

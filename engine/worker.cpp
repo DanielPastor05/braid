@@ -13,7 +13,7 @@
 //
 // The protocol is length-free because every frame's size follows from n:
 //
-//   request   u32 magic 'B','R','D','3'
+//   request   u32 magic 'B','R','D','4'
 //             u32 n                        sequences in this batch
 //             i32 ids[n * kSeqLen]         windows, row-major, left-padded
 //             f32 temperature[n]
@@ -25,6 +25,8 @@
 //             u64 forward_ns               the model, including the copy back
 //             u64 sample_ns                softmax and inverse-CDF, per row
 //             u64 kernels                  CUDA kernels the forward launched
+//             u64 to_device                 host->device copies (PCIe crossings)
+//             u64 to_host                   device->host copies
 //     error   u32 length, then that many bytes of message
 //
 // The timings exist so that the server can subtract them from the wall time it
@@ -54,6 +56,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -69,7 +72,7 @@
 
 namespace {
 
-constexpr std::uint32_t kMagic = 0x33445242;  // 'BRD3' little-endian
+constexpr std::uint32_t kMagic = 0x34445242;  // 'BRD4' little-endian
 constexpr std::uint32_t kStatusOK = 0;
 constexpr std::uint32_t kStatusError = 1;
 
@@ -167,11 +170,34 @@ int main(int argc, char** argv) {
     }
     model.train(false);
 
+    // A diagnostic hook, not a serving knob. Forcing one matmul variant is how
+    // the discontinuity at a batch of six was traced: if pinning the kernel
+    // flattens it, the cause is which kernel Auto picks and not how much work
+    // there is. Auto is what braid actually serves with.
+    if (const char* forced = std::getenv("BRAID_MATMUL_KERNEL")) {
+        const std::string want = forced;
+        engine::cuda::MatmulKernel kernel = engine::cuda::MatmulKernel::Auto;
+        if (want == "naive") {
+            kernel = engine::cuda::MatmulKernel::Naive;
+        } else if (want == "tiled") {
+            kernel = engine::cuda::MatmulKernel::Tiled;
+        } else if (want == "register") {
+            kernel = engine::cuda::MatmulKernel::RegisterTiled;
+        } else if (want == "vectorized") {
+            kernel = engine::cuda::MatmulKernel::Vectorized;
+        } else if (want != "auto") {
+            std::cerr << "BRAID_MATMUL_KERNEL=" << want << " is not a kernel name\n";
+            return 2;
+        }
+        engine::cuda::set_matmul_kernel(kernel);
+    }
+
     // Announced on stderr, which the server logs. available() says whether the
     // binary has a usable device at all; the kernel counter at shutdown says
     // whether it was ever actually used, because the engine falls back to the
     // CPU silently and a GPU that was never touched should not be reported as
     // one that was.
+
     const auto device = engine::cuda::device_info();
     std::cerr << "braid_worker ready: vocab " << vocab.size() << ", cuda "
               << (engine::cuda::available() ? "yes" : "no");
@@ -229,6 +255,11 @@ int main(int argc, char** argv) {
             }
             const auto t1 = clock::now();
             const std::size_t kernels_before = engine::cuda::kernels_launched();
+            // An operation the engine keeps on the host still has to get its
+            // inputs there and its result back, so a step that launches fewer
+            // kernels crosses PCIe more often. Counting both says which of the
+            // two a change in kernel count actually was.
+            const auto transfers_before = engine::cuda::transfer_stats();
 
             // The one forward pass. n rows in, n rows of logits out, and the
             // model has no way of knowing the rows belong to different callers.
@@ -262,6 +293,11 @@ int main(int argc, char** argv) {
             const std::uint64_t sample_ns = ns(t2, t3);
             const auto kernels =
                 static_cast<std::uint64_t>(engine::cuda::kernels_launched() - kernels_before);
+            const auto transfers_after = engine::cuda::transfer_stats();
+            const auto to_device = static_cast<std::uint64_t>(transfers_after.to_device_count -
+                                                              transfers_before.to_device_count);
+            const auto to_host = static_cast<std::uint64_t>(transfers_after.to_host_count -
+                                                            transfers_before.to_host_count);
 
             const std::uint32_t status = kStatusOK;
             write_all(&status, sizeof status);
@@ -270,6 +306,8 @@ int main(int argc, char** argv) {
             write_all(&forward_ns, sizeof forward_ns);
             write_all(&sample_ns, sizeof sample_ns);
             write_all(&kernels, sizeof kernels);
+            write_all(&to_device, sizeof to_device);
+            write_all(&to_host, sizeof to_host);
             std::cout.flush();
         } catch (const std::exception& e) {
             write_error(e.what());
