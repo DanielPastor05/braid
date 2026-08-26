@@ -1,5 +1,10 @@
 # braid
 
+[![CI](https://github.com/DanielPastor05/braid/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielPastor05/braid/actions/workflows/ci.yml)
+![Go 1.27](https://img.shields.io/badge/Go-1.27-00ADD8)
+![CUDA 13.3](https://img.shields.io/badge/CUDA-13.3-76B900)
+![license](https://img.shields.io/badge/license-MIT-blue)
+
 A continuously batched inference server for
 [cpp-ai-engine](https://github.com/DanielPastor05/cpp-ai-engine), written in Go.
 
