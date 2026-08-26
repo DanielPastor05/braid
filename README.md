@@ -49,10 +49,19 @@ of three sweeps, with the throughput range beside it.
 | 16 | 187 | 15.40 | **353** (353-354) | 60 ms | 74 ms | 43.10 | 42.45 | 0.81 |
 | 32 | 94 | 30.64 | 354 (352-362) | **130 ms** | 146 ms | 85.93 | 81.77 | 1.87 |
 
-**Batching is worth 2.5x here, and it is finished by sixteen clients.** Going
-from sixteen to thirty-two buys 0.3% more throughput - the two ranges overlap -
-and costs 2.2x the time to first token. Sixteen is where this server should be
-configured to stop.
+**Batching is worth 2.5x here, and it is finished by sixteen clients.** Those two
+rows were re-run on their own at five repeats in both sweep directions, because
+a three-repeat pass once put them 8% apart with the ranges not overlapping and
+that would have been the wrong conclusion:
+
+| | 16 clients | 32 clients |
+|---|---|---|
+| ascending | 350 (344-354) | 357 (351-370) |
+| descending | 364 (347-365) | 363 (352-373) |
+
+They overlap in both directions. Thirty-two buys nothing measurable over sixteen
+and costs **1.9x the time to first token** (56-58 ms to 103-110 ms at p50).
+Sixteen is where this server should be configured to stop.
 
 **One client needs 2 880 forward passes for 2 880 tokens, sixteen need 187.**
 Thirty times fewer trips through the model for two and a half times the
