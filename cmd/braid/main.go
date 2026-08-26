@@ -51,13 +51,11 @@ func main() {
 		// its own value and implying a change that was never made.
 		minElems = flag.Uint64("cuda-min-elements", 0,
 			"engine threshold: elementwise ops below this many elements stay on the CPU (0 keeps the default)")
-		// The engine's default is 2^15, which this model's LayerNorms -- n*6144
-		// elements -- do not clear until a batch of six. Below that all four of
-		// them refuse and the forward comes home at each one. Any value under
-		// 6 144 puts a single sequence on the card; 2 048 leaves room and is
-		// what the numbers on this repo were measured at. Pass 0 to defer to
-		// whatever the engine was built with.
-		minLayerNorm = flag.Uint64("cuda-min-layernorm", 2048,
+		// Inert at this model's size and kept for the smaller one. The engine's
+		// floor is 2^15 elements; a LayerNorm here sees n*98304 and clears it at
+		// a batch of one. It mattered enormously when the model was 96 wide over
+		// a 64-id context -- that is the story in the README, and it is history.
+		minLayerNorm = flag.Uint64("cuda-min-layernorm", 0,
 			"engine threshold: LayerNorms below this many elements stay on the CPU (0 keeps the default)")
 		stepBase = flag.Duration("mock-step", 8*time.Millisecond, "mock backend: fixed cost of a step")
 		stepPer  = flag.Duration("mock-per-seq", 200*time.Microsecond, "mock backend: marginal cost per sequence")

@@ -22,11 +22,23 @@
 
 namespace braid {
 
-constexpr std::size_t kSeqLen = 64;
-constexpr std::size_t kDModel = 96;
-constexpr std::size_t kHeads = 4;
-constexpr std::size_t kFeedForward = 192;
-constexpr std::size_t kBlocks = 2;
+// The geometry, chosen so that the GPU is the thing being measured.
+//
+// The first version of this model was 172 728 parameters over a 64-id context,
+// and every serving number taken from it was really a number about launch
+// overhead: the forward went from 0.77 ms at a batch of one to 2.32 ms at
+// thirty-two, which is a fixed cost amortising rather than arithmetic scaling.
+// Nothing measured there transferred to anything larger.
+//
+// At these sizes a step is roughly 20 MFLOP per token over 256 positions and
+// thirty-two sequences -- about 164 GFLOP -- against a 3060 Ti's ~16 TFLOPS.
+// That is tens of milliseconds of real work, and the profile stops being a
+// story about overhead.
+constexpr std::size_t kSeqLen = 256;
+constexpr std::size_t kDModel = 384;
+constexpr std::size_t kHeads = 6;  // 64 per head
+constexpr std::size_t kFeedForward = 1536;
+constexpr std::size_t kBlocks = 6;
 
 // Assembled by hand rather than through nn::Sequential, because a Transformer
 // block takes a mask as a second argument and Sequential::forward(input) has

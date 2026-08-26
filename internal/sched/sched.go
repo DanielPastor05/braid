@@ -1,13 +1,13 @@
 // Package sched merges independent requests into shared batches.
 //
 // The engine behind this server generates one token per forward pass over a
-// fixed 64-id window. Serving one request at a time means one forward pass per
+// fixed 256-id window. Serving one request at a time means one forward pass per
 // token per client, and a GPU that spends most of its time waiting for the next
 // HTTP request rather than computing. Serving them in a static batch means
 // everybody waits for the slowest member to finish before anybody new can start.
 //
 // This is the third option. There is one loop, it holds a set of sequences, and
-// on every pass it stacks their windows into a single (n, 64) tensor and
+// on every pass it stacks their windows into a single (n, 256) tensor and
 // advances all of them by exactly one token. A request that arrives mid-flight
 // joins at the next step; a request that finishes leaves at the next step; the
 // others do not notice either event. That last clause is the correctness

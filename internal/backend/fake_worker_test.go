@@ -164,7 +164,9 @@ func startFake(t *testing.T, mode string) (exe, prefix string) {
 	dir := t.TempDir()
 	prefix = filepath.Join(dir, "fake")
 
-	// The 120 symbols the real checkpoint carries, as distinct ascending bytes.
+	// As many symbols as the real checkpoint carries, as distinct ascending
+	// bytes. The value only has to be self-consistent: the fake writes this file
+	// and then reads its own ids back.
 	alphabet := make([]byte, 120)
 	for i := range alphabet {
 		alphabet[i] = byte(i + 8)

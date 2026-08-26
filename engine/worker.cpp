@@ -21,7 +21,7 @@
 //
 //   response  u32 status                   0 ok, 1 error
 //     ok      i32 next[n]
-//             u64 build_ns                 filling the (n, 64) tensor
+//             u64 build_ns                 filling the (n, 256) tensor
 //             u64 forward_ns               the model's own kernels
 //             u64 copy_ns                  pulling the result off the device
 //             u64 sample_ns                softmax and inverse-CDF, per row

@@ -96,7 +96,12 @@ const (
 	// negotiated over the pipe because a disagreement would show up as garbled
 	// text rather than an error, and a constant in two files that must match is
 	// at least greppable.
-	workerSeqLen = 64
+	//
+	// TestTheWorkerAgreesAboutTheWindow is what makes the greppability
+	// unnecessary: it asks a real worker and fails if the two ever part. Growing
+	// the model from a 64-id context to 256 is exactly the change that would
+	// have broken this quietly.
+	workerSeqLen = 256
 
 	// defaultStepTimeout is four orders of magnitude above a real step, so it
 	// fires only for a process that has stopped answering rather than one
@@ -128,9 +133,15 @@ type WorkerOptions struct {
 	StepTimeout time.Duration
 
 	// MinLayerNormElements is the third of the engine's thresholds, and the one
-	// that decides whether a small forward chains across the card or comes home
-	// at every normalisation. This model puts n*6144 elements through each
-	// LayerNorm, so the engine's 2^15 default first clears at a batch of six.
+	// that decided whether a small forward chained across the card or came home
+	// at every normalisation.
+	//
+	// It mattered enormously to the 172 728-parameter model, whose LayerNorm saw
+	// n*6144 elements and so did not clear the engine's 2^15 floor until a batch
+	// of six. At 384 wide over a 256-id context that is n*98304, which clears it
+	// at a batch of one -- so the knob is inert here and kept only because a
+	// smaller model would want it again. What the README says about it is
+	// history, and labelled as such.
 	MinLayerNormElements uint64
 }
 

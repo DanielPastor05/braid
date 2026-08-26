@@ -31,8 +31,8 @@ type Mock struct {
 	sequence atomic.Int64 // sequences advanced, summed over steps
 }
 
-// NewMock returns a mock with the character model's geometry: a 64-id window
-// over a 121-symbol alphabet, and a cost curve where a step is mostly fixed.
+// NewMock returns a mock with the character model's geometry -- a 256-id window
+// over a 145-symbol alphabet -- and a cost curve where a step is mostly fixed.
 //
 // The default timings are not measured from anything -- they are round numbers
 // chosen so a load test against the mock produces the shape of the real curve
@@ -42,8 +42,8 @@ func NewMock() *Mock {
 	return &Mock{
 		Base:   8 * time.Millisecond,
 		PerSeq: 200 * time.Microsecond,
-		seqLen: 64,
-		vocab:  121,
+		seqLen: workerSeqLen,
+		vocab:  145,
 	}
 }
 

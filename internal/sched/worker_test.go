@@ -329,3 +329,50 @@ func TestWorkerRoundTripsTheAlphabet(t *testing.T) {
 	}
 
 }
+
+// TestTheWorkerAgreesAboutTheWindow closes the one gap the protocol leaves
+// open on purpose.
+//
+// The window width is a constant in two places -- braid::kSeqLen in
+// engine/charmodel.hpp and workerSeqLen in internal/backend/worker.go -- and it
+// is not negotiated over the pipe. A disagreement is not an error: the frame
+// still parses, the model still runs, and the text that comes out is made of
+// the wrong ids. Nothing in the server could notice.
+//
+// Growing the model from a 64-id context to 256 is precisely the change that
+// would have broken it, which is why this exists now and did not before.
+func TestTheWorkerAgreesAboutTheWindow(t *testing.T) {
+	exe := os.Getenv("BRAID_WORKER")
+	model := os.Getenv("BRAID_MODEL")
+	if exe == "" || model == "" {
+		t.Skip("set BRAID_WORKER and BRAID_MODEL to run this against the engine")
+	}
+
+	w, err := backend.NewWorker(exe, model, backend.WorkerOptions{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("starting the worker: %v", err)
+	}
+	defer w.Close()
+
+	// A window one id narrower than this side believes is either rejected here
+	// or misread there. Either way it must not come back looking like a success.
+	narrow := make([][]int32, 1)
+	narrow[0] = make([]int32, w.SeqLen()-1)
+	if _, err := w.Step(context.Background(), narrow, []float32{0.7}, []uint64{1}); err == nil {
+		t.Error("a window of the wrong width was accepted")
+	}
+
+	// And one of the agreed width has to work, which is the half that catches
+	// the two constants drifting apart rather than this side being strict.
+	right := make([][]int32, 1)
+	right[0] = make([]int32, w.SeqLen())
+	out, err := w.Step(context.Background(), right, []float32{0.7}, []uint64{1})
+	if err != nil {
+		t.Fatalf("a window of %d ids was refused by the worker, so the two constants "+
+			"disagree: %v", w.SeqLen(), err)
+	}
+	if out[0] < 0 || int(out[0]) >= w.VocabSize() {
+		t.Errorf("id %d is outside a %d-symbol alphabet", out[0], w.VocabSize())
+	}
+}
