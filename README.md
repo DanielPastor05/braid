@@ -24,12 +24,12 @@ answer, and this page tries hard not to blur the two.
 |---|---|
 | **Model** | the character Transformer from `cpp-ai-engine`, 172 728 parameters, 64-id context, 120-symbol alphabet, 1.94 bits/char |
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
-| **Forward passes for the same 7 680 tokens** | 7 680 at one client, **273 at thirty-two** |
-| **Throughput** | 988 tokens/s at one client, **7 185 at thirty-two** |
-| **Where a step goes at batch 32** | 3.39 ms model, 0.35 ms pipe, 0.06 ms sampling |
+| **Forward passes for the same 7 680 tokens** | 7 680 at one client, **278 at thirty-two** |
+| **Throughput** | 1 079 tokens/s at one client, **8 135 at thirty-two** — median of three |
+| **Where a step goes at batch 32** | 2.32 ms model, 0.27 ms copy back, 0.68 ms pipe |
 | **Two engine thresholds moved** | matmul 2²² → 2²⁰ (**3.5×** at one client), LayerNorm 2¹⁵ → 2 048 (**1.4–1.9×** at one to five) |
 | **CPU and CUDA paths** | 200 characters identical, sampled independently |
-| **Batching invariance** | measured identical alone and at mean batch 8.68 — a property, not a guarantee |
+| **Batching invariance** | **0 divergences in 100 000 draws** across five batch sizes — a rate, not a guarantee |
 | **A worker killed mid-load** | 512 requests, **0 failed**, tail unmoved — workers hold no state |
 | **A worker hung mid-step** | killed on a deadline and failed over; before that it stopped the server for good |
 | **Landed upstream** | three PRs on the engine: the residency clause, the correction to it, and the floor becoming a threshold |
@@ -42,33 +42,41 @@ answer, and this page tries hard not to blur the two.
 so the step column is directly comparable down the page. Measured after a warm-up
 sweep, for reasons two sections below.
 
-| clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | copy ms | sample ms | pipe ms | kernels |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 7 680 | 1.00 | 905 | 4 ms | 7 ms | 1.01 | 0.92 | 0.04 | 0.00 | 0.05 | 60 |
-| 2 | 4 161 | 1.85 | 1 806 | 5 ms | 7 ms | 0.99 | 0.89 | 0.04 | 0.00 | 0.05 | 60 |
-| 4 | 2 095 | 3.67 | 3 146 | 5 ms | 7 ms | 1.14 | 1.03 | 0.06 | 0.01 | 0.05 | 60 |
-| 8 | 1 030 | 7.46 | 4 852 | 7 ms | 9 ms | 1.51 | 1.35 | 0.09 | 0.01 | 0.05 | 60 |
-| 16 | 516 | 14.88 | 6 133 | 12 ms | 18 ms | 2.37 | 2.00 | 0.15 | 0.03 | 0.19 | 60 |
-| 32 | 258 | 29.77 | **7 181** | 19 ms | 27 ms | 4.01 | 3.14 | 0.33 | 0.07 | 0.47 | 60 |
-| 64 | 245 | 31.35 | 6 917 | **286 ms** | 314 ms | 4.32 | 3.06 | 0.47 | 0.11 | 0.68 | 60 |
+| clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | copy ms | sample ms | pipe ms |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 7 680 | 1.00 | 1 079 (1 069–1 093) | 4 ms | 5 ms | 0.84 | 0.77 | 0.03 | 0.00 | 0.04 |
+| 2 | 3 976 | 1.93 | 2 013 (1 822–2 035) | 4 ms | 6 ms | 0.90 | 0.81 | 0.04 | 0.00 | 0.04 |
+| 4 | 2 072 | 3.71 | 3 289 (3 222–3 387) | 5 ms | 7 ms | 1.10 | 0.99 | 0.06 | 0.01 | 0.05 |
+| 8 | 1 029 | 7.46 | 5 193 (5 110–5 234) | 7 ms | 10 ms | 1.40 | 1.25 | 0.09 | 0.01 | 0.05 |
+| 16 | 532 | 14.44 | 7 026 (6 802–7 169) | 12 ms | 17 ms | 1.99 | 1.67 | 0.14 | 0.03 | 0.15 |
+| 32 | 278 | 27.63 | **8 135** (7 137–8 141) | 24 ms | 40 ms | 3.34 | 2.32 | 0.27 | 0.06 | 0.68 |
+| 64 | 253 | 30.36 | 7 766 (7 704–7 899) | **237 ms** | 290 ms | 3.70 | 2.45 | 0.29 | 0.06 | 0.89 |
 
-The kernel column is flat now, and both discontinuities that used to be in this
-table are gone. Getting them out took two changes to the engine's dispatch
-thresholds and one change that turned out not to matter; the next two sections
-are what that cost and what it bought.
+Every row is the **median of three sweeps**, with the throughput range beside
+it. One reading of a timing has no error bar, and this machine has already been
+caught moving its busiest row by a quarter depending on which direction the
+sweep ran; `-repeat` exists because of that.
+
+Sixty kernels a step at every batch size, which is not in the table any more
+because it is now a constant. It used to be the column with the
+discontinuities, and getting them out took two changes to the engine's dispatch
+thresholds and one that turned out not to matter — the next two sections are
+what that cost and what it bought.
 
 **One client needs 7 680 forward passes to produce 7 680 tokens.** That is what
 serving requests one at a time means, and the first row confirms the accounting:
 exactly one step per token, mean batch 1.00.
 
-**Thirty-two need 258.** Same work, 30× fewer trips through the model, and
-eight times the throughput of a single client.
+**Thirty-two need 278.** Same work, 28× fewer trips through the model, and
+seven and a half times the throughput of a single client.
 
-**Sixty-four is the wall.** Throughput stops rising — 7 181 to 6 917, inside the
-noise — while the median time to first token goes from 19 ms to 286 ms. With `-max-batch 32`, half the clients
-are waiting for a seat at any moment, and waiting is most of what the extra
-concurrency buys them. On a throughput chart alone these last two rows look like
-progress. Only the tail says otherwise.
+**Sixty-four is the wall.** Throughput stops rising — 8 135 to 7 766, and the
+two ranges overlap, which is the point of printing them — while the median time
+to first token goes from 24 ms to 237 ms. Ten times the wait for nothing
+measurable. With `-max-batch 32`, half the clients are waiting for a seat at any
+moment, and waiting is most of what the extra concurrency buys them. On a
+throughput chart alone these last two rows look like progress; only the tail
+says otherwise.
 
 ### The batch of one was not using the GPU at all
 
@@ -409,16 +417,43 @@ and catches every scheduler bug — a crossed row, a window padded from the wron
 end, the wrong sequence advanced.
 
 `TestBatchingDoesNotChangeOutputOnTheRealModel` runs the same shape against the
-engine. **On this model and this card it comes out identical**: 120 characters,
-at a mean batch of 8.68 over 121 steps. One model, one card, one seed, 120
-draws. That is a strong empirical result and it is not a proof, and an earlier
-version of this page opened by calling it one.
+engine and comes out identical: 120 characters at a mean batch of 8.68. One
+model, one card, one seed, 120 draws — a single sample of a stochastic property,
+which is why it is not the number this section leads with any more.
 
-What would make it a guarantee is padding every batch to a fixed width so the
-kernel and the reduction order never change — at the cost of computing rows
-nobody asked for. What would make the measurement honest at scale is a
-divergence *rate* over 10⁵ draws across batch sizes rather than one comparison.
-The second is the more interesting number and neither is done.
+### The divergence rate
+
+`TestBatchInvarianceDivergenceRate` asks how often instead of whether. The same
+window and the same seed, sampled alone and then as one row of a batch of *n*,
+with the row's position and its neighbours redrawn every trial so that what is
+measured is the batch rather than one arrangement of it.
+
+| batch | trials | diverged | rate |
+|---|---|---|---|
+| 2 | 20 000 | 0 | 0% |
+| 4 | 20 000 | 0 | 0% |
+| 8 | 20 000 | 0 | 0% |
+| 16 | 20 000 | 0 | 0% |
+| 32 | 20 000 | 0 | 0% |
+
+**Zero in 100 000 draws**, including the batch of two, which is where the engine
+changes matmul kernel and therefore the most likely place for it to happen.
+
+Zero observations is not a rate of zero. By the rule of three, 0 in 100 000
+puts the 95% upper bound at **3 × 10⁻⁵** — about one flipped token in thirty
+thousand, at worst, and possibly none at all. That is the honest ceiling, and it
+is a far better sentence than the bold claim this page used to open with.
+
+The test asserts a ceiling of 1% rather than zero, deliberately: nothing in the
+engine promises the same reduction order at two batch sizes, so a test demanding
+identity would assert a property the code does not have and would eventually
+fail for being right. What it catches is the rate *climbing*, which is what a
+regression here would look like.
+
+What would make it a guarantee rather than a bound is padding every batch to a
+fixed width so the kernel and the reduction order never change, at the cost of
+computing rows nobody asked for. Not done, and now there is a number to weigh
+it against.
 
 `TestTheCPUAndGPUPathsAgree` is the sharper version of the same idea, and it
 exists because lowering the matmul threshold had to be safe before it could be a
@@ -620,33 +655,41 @@ server whose numbers end up pasted somewhere.
 
 ## Next
 
-Ordered by what a measurement says, not by what sounds impressive.
+Ordered by what a measurement says. One item that was on this list has been
+removed rather than done, and the reason is below.
 
-1. **A device-side slice, in the engine.** The worker pulls `(n, 64, vocab)` off
-   the card and reads one row of each. Worth
-   [4% to 8% of a step](#the-copy-is-mostly-waste-and-less-waste-than-it-looked),
-   and it cannot be done from here: `Tensor::slice` goes through `data()`.
-2. **Serve a model that is not a toy.** 172 728 parameters, a 64-id context and
-   a 120-character vocabulary mean the GPU is never the constraint and none of
-   these numbers transfer to anything larger. Everything else on this list is
-   worth less than this one.
-3. **A KV cache**, and publishing what it costs: the stateless worker is what
-   makes failover a retry, and a cache is state. That trade, measured, is more
-   interesting than the speedup.
-4. **A divergence rate for the batching invariant**, over 10⁵ draws across batch
-   sizes, instead of one 120-character comparison. Turns a strong empirical
-   claim into a number.
+1. **Serve a model that is not a toy.** 172 728 parameters, a 64-id context and
+   a 120-character vocabulary mean the GPU is never the constraint and no number
+   on this page transfers to anything larger. Every other item is worth less
+   than this one, and several of them are only interesting once it is done.
+2. **A KV cache**, and publishing what it costs. The engine recomputes the full
+   64-id window every step. The interesting part is not the speedup: a cache is
+   per-sequence state, and the stateless worker is exactly what makes failover a
+   retry with the same bytes. That trade, measured, is the thing worth writing
+   down.
+3. **A device-side slice, in the engine.** The worker pulls `(n, 64, vocab)` off
+   the card and reads one row of each, so 63/64 of the transfer is waste. Worth
+   [4% to 8% of a step](#the-copy-is-mostly-waste-and-less-waste-than-it-looked)
+   — measured before being described, and smaller than it looks in the source.
+4. **Run the load generator off this machine.** The 64-client row is the only
+   figure here whose spread needs apologising for, and its sixty-four goroutines
+   share a CPU with the server and the worker. Repetitions and ranges made the
+   noise visible; they cannot remove its cause.
 5. **Split a batch across workers.** Today a pool is redundancy and not
-   capacity; splitting is worth doing across GPUs and pointless on one, so it
+   capacity. Splitting is worth doing across GPUs and pointless on one, so it
    wants a second card before it wants code.
-6. **Move the load generator off the machine under test.** The 64-client row is
-   the only figure here with a spread worth apologising for, and its sixty-four
-   goroutines share a CPU with the server and the worker.
-7. **Get the embedding and the positional add onto the card.** They are what
+6. **Get the embedding and the positional add onto the card.** They are what
    leaves the first LayerNorm's input on the host, which is why the residency
    clause upstream is still latent and the floor has to be lowered instead.
 
-Not on this list, deliberately: authentication, TLS and rate limiting. This
-serves a character model on a desk, and adding them would be theatre — the
-honest version is that it should not be exposed to anything, and that is a
-sentence rather than a feature.
+**Removed: CUDA streams and compute/transfer overlap.** It was on this list and
+it does not fit. Decoding is autoregressive — step *n+1* takes step *n*'s token
+as input — so within one batch there is no independent work to overlap with. A
+second stream needs a second batch, which needs a second card, which is item 5.
+Recommending it anyway would have been listing a technique rather than solving a
+problem.
+
+Also not here, deliberately: authentication, TLS, rate limiting, Kubernetes,
+Prometheus. This serves a character model on a desk. The honest version is that
+it should not be exposed to anything, and that is a sentence rather than a
+feature.

@@ -106,6 +106,8 @@ func main() {
 		perLevel    = flag.Int("requests", 64, "completed generations to collect at each level")
 		maxTokens   = flag.Int("max-tokens", 100, "tokens per generation")
 		temperature = flag.Float64("temperature", 0.8, "sampling temperature")
+		repeat      = flag.Int("repeat", 1,
+			"how many times to measure each level; above one the table reports a median and a range")
 	)
 	flag.Parse()
 
@@ -144,24 +146,51 @@ func main() {
 			os.Exit(1)
 		}
 
-		before, err := readStats(client, *addr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "reading stats: %v\n", err)
-			os.Exit(1)
+		// Repetitions, because one reading of a timing has no error bar and this
+		// machine is demonstrably noisy: the same sweep run in the other
+		// direction moves the busiest row by a quarter. A median with the range
+		// beside it says what a single number cannot.
+		reps := make([]level, 0, *repeat)
+		for range *repeat {
+			before, err := readStats(client, *addr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "reading stats: %v\n", err)
+				os.Exit(1)
+			}
+
+			start := time.Now()
+			samples := sweep(client, *addr, n, *perLevel, *maxTokens, float32(*temperature))
+			elapsed := time.Since(start)
+
+			after, err := readStats(client, *addr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "reading stats: %v\n", err)
+				os.Exit(1)
+			}
+			reps = append(reps, summarise(samples, before, after, elapsed))
 		}
-
-		start := time.Now()
-		samples := sweep(client, *addr, n, *perLevel, *maxTokens, float32(*temperature))
-		elapsed := time.Since(start)
-
-		after, err := readStats(client, *addr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "reading stats: %v\n", err)
-			os.Exit(1)
-		}
-
-		report(n, samples, before, after, elapsed)
+		report(n, reps)
 	}
+}
+
+// level is one measurement of one concurrency level: the scalars a row is made
+// of, kept per repetition so the table can show a median and a spread rather
+// than whichever run happened to be last.
+type level struct {
+	completed int
+	rejected  int64
+	steps     int64
+	meanBatch float64
+	rate      float64
+	ttft50    float64
+	ttft95    float64
+	wall      float64
+	forward   float64
+	copyBack  float64
+	sample    float64
+	pipe      float64
+	kernels   float64
+	hasStep   bool
 }
 
 // sweep keeps n requests in flight until count of them have finished.
@@ -246,62 +275,109 @@ func generate(client *http.Client, addr string, maxTokens int, temp float32, see
 	return s
 }
 
-func report(clients int, samples []sample, before, after stats, elapsed time.Duration) {
+func summarise(samples []sample, before, after stats, elapsed time.Duration) level {
 	ttfts := make([]time.Duration, 0, len(samples))
-	var okCount, tokens int
+	var out level
+	var tokens int
 	for _, s := range samples {
 		if s.err != nil || s.toks == 0 {
 			continue
 		}
-		okCount++
+		out.completed++
 		tokens += s.toks
 		ttfts = append(ttfts, s.ttft)
 	}
 
-	steps := after.Scheduler.Steps - before.Scheduler.Steps
-	advanced := after.Scheduler.Advanced - before.Scheduler.Advanced
-	meanBatch := 0.0
-	if steps > 0 {
-		meanBatch = float64(advanced) / float64(steps)
+	out.steps = after.Scheduler.Steps - before.Scheduler.Steps
+	if out.steps > 0 {
+		out.meanBatch = float64(after.Scheduler.Advanced-before.Scheduler.Advanced) /
+			float64(out.steps)
 	}
-	rate := float64(tokens) / elapsed.Seconds()
+	out.rate = float64(tokens) / elapsed.Seconds()
+	out.rejected = after.Scheduler.Rejected - before.Scheduler.Rejected
+	out.ttft50 = pctMS(ttfts, 50)
+	out.ttft95 = pctMS(ttfts, 95)
 
-	// The split for this level alone: the difference between two cumulative
-	// snapshots, divided by the steps between them. Reading the server's own
-	// running mean instead would fold every earlier level into every later one.
-	wall, forward, copyBack, sample := "-", "-", "-", "-"
-	pipe, kernels := "-", "-"
 	wallA, fwdA, copyA, sampA, kernA, stepsA := after.totals()
 	wallB, fwdB, copyB, sampB, kernB, stepsB := before.totals()
 	if n := stepsA - stepsB; n > 0 {
-		each := func(a, b float64) string {
-			return fmt.Sprintf("%.2f", (a-b)/float64(n))
+		d := float64(n)
+		out.hasStep = true
+		out.wall = (wallA - wallB) / d
+		out.forward = (fwdA - fwdB) / d
+		out.copyBack = (copyA - copyB) / d
+		out.sample = (sampA - sampB) / d
+		out.pipe = ((wallA - fwdA - copyA - sampA) - (wallB - fwdB - copyB - sampB)) / d
+		out.kernels = (kernA - kernB) / d
+	}
+	return out
+}
+
+// report prints one row out of however many repetitions there were: the median
+// of each column, and for throughput the range as well, because that is the
+// column this machine is worst at holding still.
+func report(clients int, reps []level) {
+	if len(reps) == 0 {
+		return
+	}
+	med := func(pick func(level) float64) float64 {
+		xs := make([]float64, len(reps))
+		for i, r := range reps {
+			xs[i] = pick(r)
 		}
-		wall = each(wallA, wallB)
-		forward = each(fwdA, fwdB)
-		copyBack = each(copyA, copyB)
-		sample = each(sampA, sampB)
-		pipe = each((wallA - fwdA - copyA - sampA), (wallB - fwdB - copyB - sampB))
-		kernels = fmt.Sprintf("%.0f", (kernA-kernB)/float64(n))
+		sort.Float64s(xs)
+		return xs[len(xs)/2]
 	}
 
-	fmt.Printf("| %d | %d | %d | %.2f | %.0f | %s | %s | %s | %s | %s | %s | %s | %s |\n",
-		clients, okCount, steps, meanBatch, rate,
-		pct(ttfts, 50), pct(ttfts, 95), wall, forward, copyBack, sample, pipe, kernels)
+	rateText := fmt.Sprintf("%.0f", med(func(r level) float64 { return r.rate }))
+	if len(reps) > 1 {
+		lo, hi := reps[0].rate, reps[0].rate
+		for _, r := range reps[1:] {
+			lo, hi = min(lo, r.rate), max(hi, r.rate)
+		}
+		rateText = fmt.Sprintf("%.0f (%.0f-%.0f)", med(func(r level) float64 { return r.rate }), lo, hi)
+	}
 
-	// Rejections do not get a column of zeros. They get a line, on stderr, on
-	// the runs where they actually happened.
-	if r := after.Scheduler.Rejected - before.Scheduler.Rejected; r > 0 {
-		fmt.Fprintf(os.Stderr, "  %d requests rejected at %d clients: the queue filled\n", r, clients)
+	// A backend that cannot break a step down leaves those columns empty rather
+	// than filled with a zero somebody would read as a measurement.
+	cell := func(pick func(level) float64) string {
+		if !reps[0].hasStep {
+			return "-"
+		}
+		return fmt.Sprintf("%.2f", med(pick))
+	}
+
+	fmt.Printf("| %d | %d | %.0f | %.2f | %s | %.0f ms | %.0f ms | %s | %s | %s | %s | %s | %s |\n",
+		clients, reps[0].completed,
+		med(func(r level) float64 { return float64(r.steps) }),
+		med(func(r level) float64 { return r.meanBatch }),
+		rateText,
+		med(func(r level) float64 { return r.ttft50 }),
+		med(func(r level) float64 { return r.ttft95 }),
+		cell(func(r level) float64 { return r.wall }),
+		cell(func(r level) float64 { return r.forward }),
+		cell(func(r level) float64 { return r.copyBack }),
+		cell(func(r level) float64 { return r.sample }),
+		cell(func(r level) float64 { return r.pipe }),
+		cell(func(r level) float64 { return r.kernels }))
+
+	var rejected int64
+	for _, r := range reps {
+		rejected += r.rejected
+	}
+	if rejected > 0 {
+		fmt.Fprintf(os.Stderr, "  %d requests rejected at %d clients: the queue filled\n",
+			rejected, clients)
 	}
 }
 
-// pct is the nearest-rank percentile: the smallest observation at or above the
-// given share of the sorted sample. No interpolation, because interpolating
-// between two measurements invents a third that nobody observed.
-func pct(ds []time.Duration, p int) string {
+// pctMS is the nearest-rank percentile in milliseconds: the smallest
+// observation at or above the given share of the sorted sample. No
+// interpolation, because interpolating between two measurements invents a third
+// that nobody observed.
+func pctMS(ds []time.Duration, p int) float64 {
 	if len(ds) == 0 {
-		return "-"
+		return 0
 	}
 	sorted := append([]time.Duration(nil), ds...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
@@ -310,8 +386,7 @@ func pct(ds []time.Duration, p int) string {
 	if rank < 1 {
 		rank = 1
 	}
-	d := sorted[rank-1]
-	return fmt.Sprintf("%.0f ms", float64(d.Microseconds())/1000)
+	return float64(sorted[rank-1].Microseconds()) / 1000
 }
 
 func readStats(client *http.Client, addr string) (stats, error) {
