@@ -27,6 +27,7 @@ func (s *Scheduler) loop() {
 	// nothing beyond the slice headers.
 	flat := make([]int32, s.cfg.MaxBatch*s.seqLen)
 	windows := make([][]int32, 0, s.cfg.MaxBatch)
+	lengths := make([]int32, 0, s.cfg.MaxBatch)
 	temps := make([]float32, 0, s.cfg.MaxBatch)
 	seeds := make([]uint64, 0, s.cfg.MaxBatch)
 
@@ -55,11 +56,12 @@ func (s *Scheduler) loop() {
 		}
 
 		windows = windows[:0]
+		lengths = lengths[:0]
 		temps = temps[:0]
 		seeds = seeds[:0]
 		for i, seq := range active {
 			w := flat[i*s.seqLen : (i+1)*s.seqLen]
-			seq.window(w)
+			lengths = append(lengths, int32(seq.window(w)))
 			windows = append(windows, w)
 			temps = append(temps, seq.req.Temperature)
 			// The seed advances with the sequence, so a sequence is
@@ -68,7 +70,7 @@ func (s *Scheduler) loop() {
 			seeds = append(seeds, seq.req.Seed+uint64(seq.generated))
 		}
 
-		ids, err := s.backend.Step(stepCtx, windows, temps, seeds)
+		ids, err := s.backend.Step(stepCtx, windows, lengths, temps, seeds)
 		if err != nil {
 			s.stats.stepErrors.Add(1)
 			s.failAll(active, err)

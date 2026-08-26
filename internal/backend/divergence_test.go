@@ -70,16 +70,27 @@ func TestBatchInvarianceDivergenceRate(t *testing.T) {
 		// same size draws the same windows and the number is comparable.
 		rng := rand.New(rand.NewPCG(uint64(n), 0x9E3779B97F4A7C15))
 
-		var diverged int
-		for trial := range trials {
+		// A row of random ids, right-padded past its length the way the
+		// scheduler pads. The length is drawn too: rows of different lengths in
+		// one batch sample at different positions, which is the arrangement
+		// that did not exist before the padding moved.
+		row := func() ([]int32, int32) {
+			length := 1 + rng.IntN(w.SeqLen())
 			window := make([]int32, w.SeqLen())
-			for i := range window {
+			for i := range length {
 				window[i] = int32(rng.IntN(int(vocab)))
 			}
+			return window, int32(length)
+		}
+
+		var diverged int
+		for trial := range trials {
+			window, length := row()
 			seed := rng.Uint64()
 			temp := float32(0.5 + rng.Float64())
 
-			alone, err := w.Step(ctx, [][]int32{window}, []float32{temp}, []uint64{seed})
+			alone, err := w.Step(ctx, [][]int32{window}, []int32{length},
+				[]float32{temp}, []uint64{seed})
 			if err != nil {
 				t.Fatalf("batch 1, trial %d: %v", trial, err)
 			}
@@ -89,23 +100,21 @@ func TestBatchInvarianceDivergenceRate(t *testing.T) {
 			// one arrangement of the batch rather than the batch.
 			at := rng.IntN(n)
 			windows := make([][]int32, n)
+			lengths := make([]int32, n)
 			temps := make([]float32, n)
 			seeds := make([]uint64, n)
 			for i := range windows {
 				if i == at {
-					windows[i], temps[i], seeds[i] = window, temp, seed
+					windows[i], lengths[i] = window, length
+					temps[i], seeds[i] = temp, seed
 					continue
 				}
-				filler := make([]int32, w.SeqLen())
-				for j := range filler {
-					filler[j] = int32(rng.IntN(int(vocab)))
-				}
-				windows[i] = filler
+				windows[i], lengths[i] = row()
 				temps[i] = float32(0.5 + rng.Float64())
 				seeds[i] = rng.Uint64()
 			}
 
-			together, err := w.Step(ctx, windows, temps, seeds)
+			together, err := w.Step(ctx, windows, lengths, temps, seeds)
 			if err != nil {
 				t.Fatalf("batch %d, trial %d: %v", n, trial, err)
 			}

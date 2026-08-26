@@ -322,11 +322,25 @@ func TestStalledCallerDoesNotStallTheBatch(t *testing.T) {
 	}
 }
 
-func TestWindowIsLeftPadded(t *testing.T) {
+// TestWindowIsRightPadded holds the window to the shape the causal mask makes
+// safe, and to the length that says where the real ids stop.
+//
+// It was left-padded until 2026-08-26, which was wrong in a way nothing caught:
+// the mask hides the future and not the padding, so the position being sampled
+// attended to every pad id in front of it. Id 0 in the model's alphabet is a
+// tab, so a five-character prompt reached the model as 251 tabs and the model,
+// correctly, answered with tabs. Every test in this package went on passing --
+// the output was deterministic, invariant to batch size and the right shape, and
+// none of those properties has anything to say about whether it means
+// something.
+func TestWindowIsRightPadded(t *testing.T) {
 	seq := &sequence{history: []int32{7, 8, 9}}
 	got := make([]int32, 5)
-	seq.window(got)
-	want := []int32{0, 0, 7, 8, 9}
+
+	if n := seq.window(got); n != 3 {
+		t.Errorf("a history of 3 reported length %d", n)
+	}
+	want := []int32{7, 8, 9, 0, 0}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("short history: got %v, want %v", got, want)
@@ -334,14 +348,39 @@ func TestWindowIsLeftPadded(t *testing.T) {
 	}
 
 	// A history longer than the window keeps the tail, because the model's
-	// context is the most recent ids and not the first ones.
+	// context is the most recent ids and not the first ones. At the full width
+	// there is no padding and the length is the width.
 	seq = &sequence{history: []int32{1, 2, 3, 4, 5, 6, 7}}
-	seq.window(got)
+	if n := seq.window(got); n != 5 {
+		t.Errorf("a full window reported length %d", n)
+	}
 	want = []int32{3, 4, 5, 6, 7}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("long history: got %v, want %v", got, want)
 		}
+	}
+
+	// The loop reuses one backing array across steps, and with the padding at
+	// the back it is exactly where a previous longer sequence's ids would still
+	// be sitting. A backend that ignored the length would read them as context.
+	seq = &sequence{history: []int32{4}}
+	if n := seq.window(got); n != 1 {
+		t.Errorf("a history of 1 reported length %d", n)
+	}
+	want = []int32{4, 0, 0, 0, 0}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("reused buffer: got %v, want %v -- the last sequence is still in it",
+				got, want)
+		}
+	}
+
+	// An empty prompt has no last real position to sample, so it borrows the
+	// pad id and generates what follows it. Length 0 would sample at index -1.
+	seq = &sequence{}
+	if n := seq.window(got); n != 1 {
+		t.Errorf("an empty history reported length %d, which is not a position", n)
 	}
 }
 

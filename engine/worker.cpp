@@ -13,9 +13,10 @@
 //
 // The protocol is length-free because every frame's size follows from n:
 //
-//   request   u32 magic 'B','R','D','5'
+//   request   u32 magic 'B','R','D','6'
 //             u32 n                        sequences in this batch
-//             i32 ids[n * kSeqLen]         windows, row-major, left-padded
+//             i32 ids[n * kSeqLen]         windows, row-major, right-padded
+//             i32 length[n]                real ids in each row, 1..kSeqLen
 //             f32 temperature[n]
 //             u64 seed[n]
 //
@@ -40,6 +41,15 @@
 // They are also why the magic carries a version. A worker built against an older
 // frame would answer a current server with something that parses as garbage
 // rather than failing, and the version makes that a clean error instead.
+//
+// The lengths are why the padding can be on the right. The causal mask hides
+// the future and nothing else, so with padding at the front the row being
+// sampled attends to every pad id before it -- and id 0 in this alphabet is a
+// tab, which is how an eleven-character prompt used to reach the model as two
+// hundred and forty-five tabs. Padding on the right is unreachable from
+// position length-1, but only if the caller says where that is, which is what
+// this field is for and why the version went up rather than the field being
+// inferred.
 //
 // A zero-length read on stdin is a clean shutdown, not a failure: it is what
 // the server closing the pipe looks like.
@@ -73,7 +83,7 @@
 
 namespace {
 
-constexpr std::uint32_t kMagic = 0x35445242;  // 'BRD5' little-endian
+constexpr std::uint32_t kMagic = 0x36445242;  // 'BRD6' little-endian
 constexpr std::uint32_t kStatusOK = 0;
 constexpr std::uint32_t kStatusError = 1;
 
@@ -215,6 +225,7 @@ int main(int argc, char** argv) {
     engine::autograd::NoGradGuard no_grad;
 
     std::vector<std::int32_t> windows;
+    std::vector<std::int32_t> lengths;
     std::vector<float> temperatures;
     std::vector<std::uint64_t> seeds;
     std::vector<std::int32_t> next;
@@ -236,13 +247,25 @@ int main(int argc, char** argv) {
 
         const std::size_t ids_count = static_cast<std::size_t>(n) * braid::kSeqLen;
         windows.resize(ids_count);
+        lengths.resize(n);
         temperatures.resize(n);
         seeds.resize(n);
         if (!read_exact(windows.data(), ids_count * sizeof(std::int32_t)) ||
+            !read_exact(lengths.data(), n * sizeof(std::int32_t)) ||
             !read_exact(temperatures.data(), n * sizeof(float)) ||
             !read_exact(seeds.data(), n * sizeof(std::uint64_t))) {
             std::cerr << "truncated frame\n";
             return 1;
+        }
+
+        // Checked rather than clamped: a length outside the window means the
+        // two sides disagree about the frame, and sampling some other row would
+        // answer the wrong question convincingly.
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (lengths[i] < 1 || static_cast<std::size_t>(lengths[i]) > braid::kSeqLen) {
+                write_error("a row claims a length outside the window");
+                return 1;
+            }
         }
 
         try {
@@ -274,20 +297,23 @@ int main(int argc, char** argv) {
             engine::cuda::synchronize();
             const auto t_compute = clock::now();
 
-            // This pulls (n, 64, vocab) to the host when the sampling below
-            // reads one row of it per sequence: the last position of each. The
-            // other 63 come across for nothing, every step. Measured rather
-            // than assumed, because a device-side slice is an engine change and
-            // "it must be slow" is not a reason to make one.
+            // This pulls (n, kSeqLen, vocab) to the host when the sampling
+            // below reads one row of it per sequence: the last real position of
+            // each. The other 255 come across for nothing, every step. Measured
+            // rather than assumed, because a device-side slice is an engine
+            // change and "it must be slow" is not a reason to make one.
             const float* data = logits.data();
             const auto t2 = clock::now();
 
             const std::size_t vocab_size = vocab.size();
             next.resize(n);
             for (std::uint32_t i = 0; i < n; ++i) {
+                // The last *real* position of this row, not the last position
+                // of the window. Everything past it is padding, which the
+                // causal mask makes unreachable from here.
+                const std::size_t last = static_cast<std::size_t>(lengths[i]) - 1;
                 const float* row =
-                    data + (static_cast<std::size_t>(i) * braid::kSeqLen + braid::kSeqLen - 1) *
-                               vocab_size;
+                    data + (static_cast<std::size_t>(i) * braid::kSeqLen + last) * vocab_size;
                 next[i] = sample_row(row, vocab_size, temperatures[i], seeds[i]);
             }
             const auto t3 = clock::now();

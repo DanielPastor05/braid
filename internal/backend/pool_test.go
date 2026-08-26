@@ -11,14 +11,16 @@ import (
 // step drives one sequence through the pool and checks the answer is the one
 // that window should produce, whichever worker happened to produce it. That is
 // the whole claim: a caller cannot tell which process served it.
-func step(t *testing.T, p *Pool, window []int32) error {
+func step(t *testing.T, p *Pool, ids ...int32) error {
 	t.Helper()
 
-	out, err := p.Step(context.Background(), [][]int32{window}, []float32{0.7}, []uint64{1})
+	window := oneWindow(ids...)
+	out, err := p.Step(context.Background(), [][]int32{window},
+		[]int32{int32(len(ids))}, []float32{0.7}, []uint64{1})
 	if err != nil {
 		return err
 	}
-	if want := fakeNextID(fakeWindowBytes(window)); out[0] != want {
+	if want := fakeNextID(fakeWindowBytes(window), uint32(len(ids))); out[0] != want {
 		t.Fatalf("the pool answered %d where this window means %d: a failover returned "+
 			"somebody else's work", out[0], want)
 	}
@@ -58,7 +60,7 @@ func TestPoolFailsOverWhenAWorkerIsKilled(t *testing.T) {
 
 	// Enough steps that the round robin has visited all three.
 	for i := range 6 {
-		if err := step(t, pool, oneWindow(int32(i))); err != nil {
+		if err := step(t, pool, int32(i)); err != nil {
 			t.Fatalf("step %d before the kill: %v", i, err)
 		}
 	}
@@ -79,7 +81,7 @@ func TestPoolFailsOverWhenAWorkerIsKilled(t *testing.T) {
 	// Every one of these has to answer correctly. One of them will be handed to
 	// a process that is no longer there.
 	for i := range 12 {
-		if err := step(t, pool, oneWindow(int32(100+i))); err != nil {
+		if err := step(t, pool, int32(100+i)); err != nil {
 			t.Fatalf("step %d after the kill was not served at all: %v", i, err)
 		}
 	}
@@ -115,7 +117,7 @@ func TestPoolWithEveryWorkerDeadReturnsAnError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := pool.Step(context.Background(), [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+		_, err := pool.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
 		done <- err
 	}()
 
@@ -144,7 +146,7 @@ func TestPoolOfOneHasNowhereToFailOver(t *testing.T) {
 	}
 	defer pool.Close()
 
-	_, err = pool.Step(context.Background(), [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+	_, err = pool.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
 	if err == nil {
 		t.Fatal("a pool of one reported a success while its only worker refused")
 	}
@@ -222,7 +224,7 @@ func TestAHungWorkerIsKilledRatherThanWaitedFor(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := w.Step(context.Background(), [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+		_, err := w.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
 		done <- err
 	}()
 
@@ -282,14 +284,14 @@ func TestAPoolRecoversWhenEveryWorkerHangsAtOnce(t *testing.T) {
 	defer pool.Close()
 
 	for i := range 3 {
-		if err := step(t, pool, oneWindow(int32(i))); err != nil {
+		if err := step(t, pool, int32(i)); err != nil {
 			t.Fatalf("step %d, before anything hangs: %v", i, err)
 		}
 	}
 
 	// This one meets all three hung, waits out three timeouts, and fails. That
 	// is correct: there is nobody left to ask.
-	if err := step(t, pool, oneWindow(42)); err == nil {
+	if err := step(t, pool, 42); err == nil {
 		t.Fatal("a step served while every worker was hung")
 	}
 	if stats := pool.PoolStats(); stats.Deaths < 3 {
@@ -300,7 +302,7 @@ func TestAPoolRecoversWhenEveryWorkerHangsAtOnce(t *testing.T) {
 	// that survives the failure and never serves again has not recovered.
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := step(t, pool, oneWindow(7)); err == nil {
+		if err := step(t, pool, 7); err == nil {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -327,7 +329,7 @@ func TestClosingAHungWorkerDoesNotBlockTheCloser(t *testing.T) {
 	// than by waiting out an hour.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, _ = w.Step(ctx, [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+	_, _ = w.Step(ctx, [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
 
 	closed := make(chan error, 1)
 	go func() { closed <- w.Close() }()

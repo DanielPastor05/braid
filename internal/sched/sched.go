@@ -110,10 +110,18 @@ type sequence struct {
 	generated int
 }
 
-// window returns the model's fixed-width view of the sequence: the last SeqLen
-// ids, left-padded with zeros when the history is shorter. It writes into dst
-// so the loop can reuse one backing array across steps.
-func (s *sequence) window(dst []int32) {
+// window writes the model's fixed-width view of the sequence into dst -- the
+// last SeqLen ids, at the *front*, padded to width with zeros -- and returns how
+// many of them are real.
+//
+// The padding is on the right because the causal mask only hides the future,
+// not the padding. Left-padded, the position being sampled attends to every pad
+// id before it; right-padded, position take-1 attends to 0..take-1 and the pad
+// beyond it can never be reached. The difference is not academic: id 0 in this
+// alphabet is a tab, so an eleven-character prompt used to arrive at the model
+// as two hundred and forty-five tabs followed by the prompt, and the model
+// answered the tabs.
+func (s *sequence) window(dst []int32) int {
 	for i := range dst {
 		dst[i] = 0
 	}
@@ -121,7 +129,16 @@ func (s *sequence) window(dst []int32) {
 	if take > len(dst) {
 		take = len(dst)
 	}
-	copy(dst[len(dst)-take:], s.history[len(s.history)-take:])
+	copy(dst, s.history[len(s.history)-take:])
+	if take == 0 {
+		// An empty prompt, or one made entirely of bytes the model was never
+		// trained on. There is no such thing as a forward pass over nothing and
+		// no such thing as sampling position -1, so the sequence starts from a
+		// single pad id and generates what follows it, which is a real answer to
+		// a real request.
+		return 1
+	}
+	return take
 }
 
 // Scheduler owns a backend and the single goroutine that drives it.

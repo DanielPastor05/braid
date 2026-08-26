@@ -81,7 +81,7 @@ func fakeWorkerMain(mode string) {
 		// The whole request has to come off the pipe before anything is decided,
 		// or a misbehaviour would leave a half-read frame behind and the next
 		// test would see a protocol bug that this file invented.
-		body := make([]byte, int(n)*workerSeqLen*4+int(n)*4+int(n)*8)
+		body := make([]byte, int(n)*workerSeqLen*4+int(n)*4+int(n)*4+int(n)*8)
 		if _, err := io.ReadFull(os.Stdin, body); err != nil {
 			os.Exit(1)
 		}
@@ -108,11 +108,13 @@ func fakeWorkerMain(mode string) {
 			time.Sleep(time.Duration(arg) * time.Millisecond)
 		}
 
+		lengths := body[int(n)*workerSeqLen*4:]
 		out := make([]byte, 0, int(n)*4+7*8)
 		out = binary.LittleEndian.AppendUint32(out, statusOK)
 		for i := range int(n) {
 			window := body[i*workerSeqLen*4 : (i+1)*workerSeqLen*4]
-			out = binary.LittleEndian.AppendUint32(out, uint32(fakeNextID(window)))
+			length := binary.LittleEndian.Uint32(lengths[i*4:])
+			out = binary.LittleEndian.AppendUint32(out, uint32(fakeNextID(window, length)))
 		}
 		for _, v := range fakeStepReport {
 			out = binary.LittleEndian.AppendUint64(out, v)
@@ -135,15 +137,19 @@ func writeFakeError(message string) {
 	_, _ = os.Stdout.Write(out)
 }
 
-// fakeNextID is the answer a fake gives, derived from every byte of the window.
-// A hash rather than, say, the last id, so that a frame assembled in the wrong
-// order or truncated produces a different answer instead of the right one.
+// fakeNextID is the answer a fake gives, derived from every byte of the window
+// and from the length that came with it. A hash rather than, say, the last id,
+// so that a frame assembled in the wrong order or truncated produces a different
+// answer instead of the right one -- and the length is in the hash because a
+// real worker samples at length-1, so a length that did not survive the pipe has
+// to change the answer here too or nothing would ever notice.
 //
 // Exported to the rest of the package's tests so they can say what they expect
 // rather than only that something came back.
-func fakeNextID(windowBytes []byte) int32 {
+func fakeNextID(windowBytes []byte, length uint32) int32 {
 	h := fnv.New32a()
 	_, _ = h.Write(windowBytes)
+	_, _ = h.Write(binary.LittleEndian.AppendUint32(nil, length))
 	return int32(h.Sum32() % 120)
 }
 
@@ -181,8 +187,11 @@ func startFake(t *testing.T, mode string) (exe, prefix string) {
 
 // oneWindow is a window of the width the protocol demands, with a recognisable
 // tail so a test failure says which window it was.
+// oneWindow is a window holding exactly these ids, padded to width on the right
+// the way the scheduler pads. Its length -- what a caller must pass alongside it
+// -- is len(tail).
 func oneWindow(tail ...int32) []int32 {
 	w := make([]int32, workerSeqLen)
-	copy(w[workerSeqLen-len(tail):], tail)
+	copy(w, tail)
 	return w
 }

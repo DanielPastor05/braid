@@ -27,10 +27,11 @@ answer, and this page tries hard not to blur the two.
 | **Throughput** | 144 tokens/s at one client, **354 at sixteen** - median of three |
 | **What batching buys** | **2.5x**, and it saturates at sixteen clients |
 | **Where a step goes at batch 32** | 81.8 ms model, 1.9 ms copy back, 0.06 ms sampling |
-| **Batching invariance** | 0 divergences in 5 000 draws - a bound, not a guarantee |
+| **Batching invariance** | 0 divergences in 25 000 draws - a bound, not a guarantee |
 | **A worker killed mid-load** | 0 requests failed; workers hold no state |
 | **A worker hung mid-step** | killed on a deadline and failed over; before that it stopped the server for good |
 | **Landed upstream** | three PRs on the engine, all measured, one of them a correction to another |
+| **The bug none of that caught** | every window was padded at the wrong end, and [no measurement here could have told me](#the-bug-no-number-could-have-shown-me) |
 
 ---
 
@@ -136,6 +137,95 @@ thirty-two, where the frame is 32 KB, it is 2.24 ms and real again.
 
 ---
 
+## The bug no number could have shown me
+
+Every measurement in this README was taken while the model was being fed
+garbage, and every measurement was correct.
+
+The scheduler hands the backend a fixed 256-id window per sequence. A sequence
+shorter than that has to be padded, and until 2026-08-26 the padding went at the
+**front**: real ids at the end of the row, zeros before them. That is the
+conventional choice, and with a causal mask it is wrong.
+
+A causal mask hides the *future*. Position `i` may attend to `0..i` and nothing
+beyond. It says nothing about padding, because padding is not a concept the mask
+has — so the row being sampled, the last one, attended to every pad id in front
+of it as though it were context. And id 0 in this alphabet is a **tab**.
+
+A five-character prompt therefore reached the model as 251 tabs followed by
+`func `, and the model did the only reasonable thing with that. Both samples
+below are a single line, wrapped here to fit, with newlines and tabs shown as
+escapes:
+
+```
+prompt: "func "
+int64\n\t\t\t\t}\n\t\t\t\t\t\t\t\t\t\t\t\t}()\n\t\t\t\t\t\t})\n\t\t\t\t\t}()\n\t\t\t\t\tin =
+append(io.channex, want)\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t
+```
+
+Same model, same weights, same seed, with the padding moved to the back and the
+sampling told where the sequence actually ends:
+
+```
+prompt: "func "
+index not of the output");\n    check_throws([&] { (void)A.slice(0, 0, 0); },
+"positional_enconding throws");\n\n    // The one-thread engine` no is a decision
+that is already the asserts a hang the\n
+```
+
+Still a 10 M-parameter character model trained for 24 minutes — it is not
+*right*, it was never going to be right. But it is now answering the prompt.
+
+The load harness sends `"the engine "`, eleven characters. **Every throughput
+number on this page was measured with the model reading 245 tabs.** The numbers
+are not wrong — the tensor is the same shape either way, the same 176 kernels
+run, and the padding costs nothing it would not have cost as text. They were
+simply never about generating anything.
+
+**What makes this worth writing down is that nothing in the repository could
+have caught it.** Twenty-eight tests, a measured divergence rate, percentiles, a
+kernel counter, a chaos harness that kills processes under load — and a model
+conditioned on 245 tabs satisfies every one of them. It is deterministic. It is
+invariant to batch size. It fails over cleanly. Re-running the sweep above after
+the fix gives the same counts to the digit — 2 880 forward passes at one client,
+187 at sixteen, 176 kernels a step at every size — because the tensor is the same
+shape either way and the padding costs exactly what text would have cost. The bug
+lived in the one place none of the instruments pointed: whether the output
+*meant* anything.
+
+I found it by reading generated text for an unrelated reason.
+
+The fix is the padding on the right, plus a per-row length in the frame so the
+worker samples at position `length-1` instead of at the end of the window:
+
+```
+request   u32 magic 'B','R','D','6'      was BRD5
+          u32 n
+          i32 ids[n * kSeqLen]           right-padded now
+          i32 length[n]                  new: real ids in each row
+          f32 temperature[n]
+          u64 seed[n]
+```
+
+The length cannot be inferred from the window — id 0 is a legal id — so it is a
+field, and adding a field is what the version in the magic is for. Both sides
+reject a length outside `1..kSeqLen` rather than clamping it: a length that
+disagrees between the two ends means the frame is being misread, and sampling
+some other position would answer the wrong question convincingly.
+
+`TestWindowIsRightPadded` holds the scheduler to the new shape, including the
+case that only exists now — the loop reuses one backing array across steps, so
+with the padding at the back a short sequence lands on top of a longer one's ids
+and the stale tail sits exactly where a backend that ignored `length` would read
+it as context.
+
+One consequence beyond correctness: a token's position no longer changes as the
+sequence grows, up to the full 256. That is the precondition for a KV cache,
+which is the next thing here — a cache keyed by position is worthless if every
+step renumbers every token.
+
+---
+
 ## The property that makes it correct, and how far it goes
 
 Two claims live here and they are not equally strong. Keeping them apart is the
@@ -155,22 +245,22 @@ So: **isolation is guaranteed, identity is measured.**
 
 `TestBatchInvarianceDivergenceRate` measures it. The same window and the same
 seed, sampled alone and then as one row of a batch of *n*, with the row's
-position and its neighbours redrawn every trial so that what is measured is the
-batch rather than one arrangement of it.
+position, its neighbours **and every row's length** redrawn every trial — so
+what is measured is the batch rather than one arrangement of it, and rows that
+sample at different positions are part of the arrangement.
 
 | batch | trials | diverged |
 |---|---|---|
-| 2 | 1 000 | 0 |
-| 4 | 1 000 | 0 |
-| 8 | 1 000 | 0 |
-| 16 | 1 000 | 0 |
-| 32 | 1 000 | 0 |
+| 2 | 5 000 | 0 |
+| 4 | 5 000 | 0 |
+| 8 | 5 000 | 0 |
+| 16 | 5 000 | 0 |
+| 32 | 5 000 | 0 |
 
-Zero observations is not a rate of zero. By the rule of three, 0 in 5 000 puts
-the 95% upper bound at **6 × 10⁻⁴** — about one flipped token in seventeen
-hundred at worst, and possibly none at all. Raise `BRAID_DIVERGENCE_TRIALS` and
-the bound tightens; at the previous model's speed it was 100 000 draws and
-3 × 10⁻⁵, and a step here costs ten times as much.
+Zero observations is not a rate of zero. By the rule of three, 0 in 25 000 puts
+the 95% upper bound at **1.2 × 10⁻⁴** — about one flipped token in eight
+thousand at worst, and possibly none at all. Raise `BRAID_DIVERGENCE_TRIALS` and
+the bound tightens; the run above took eighteen minutes.
 
 The test asserts a **ceiling of 1%**, not zero, deliberately. Nothing in the
 engine promises the same reduction order at two batch sizes, so a test demanding
@@ -178,9 +268,11 @@ identity would assert a property the code does not have and would eventually
 fail for being right. What it catches is the rate climbing.
 
 `TestBatchingDoesNotChangeOutput` is the same property against the mock, whose
-next token is a hash of the whole window: bit-exact by construction, and it
-catches every scheduler bug — a crossed row, a window padded from the wrong end,
-the wrong sequence advanced. Both tests also assert the sequences really did
+next token is a hash of the sequence's real ids and its length: bit-exact by
+construction, and it catches every scheduler bug — a crossed row, a window built
+from the wrong end, the wrong sequence advanced. It deliberately does *not* hash
+the padding, for the same reason the model cannot see it: a mock that hashed the
+whole row would go on passing if the length were ever threaded through wrong. Both tests also assert the sequences really did
 share steps. An earlier version of the second passed while batching nothing at
 all: the backend was fast enough that each request finished before the next
 arrived, mean batch 1.00, invariant trivially satisfied, nothing proved.
@@ -407,7 +499,12 @@ Ordered by what a measurement says.
 
 1. **A KV cache**, and publishing what it costs. The model recomputes the full
    256-id window every step, which is now most of the 6.6 ms a batch-1 step
-   takes. The interesting part is not the speedup: the stateless worker is what
+   takes. Moving the padding to the right was the precondition and is done — a
+   token's position is now fixed for the life of a sequence up to the full 256,
+   and a cache keyed by position is worthless without that. Beyond 256 the window
+   slides and every position changes again, which is the honest boundary of what
+   a cache can be here. The interesting part is not the speedup: the stateless
+   worker is what
    makes failover a retry with the same bytes, and a cache is state. The good
    answer is a cache that is not authoritative — the scheduler still holds the
    history, so a new worker can rebuild it with a prefill — and the deliverable

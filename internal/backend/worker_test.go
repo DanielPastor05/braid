@@ -29,7 +29,8 @@ func TestWorkerSpeaksTheProtocol(t *testing.T) {
 	defer w.Close()
 
 	windows := [][]int32{oneWindow(1, 2, 3), oneWindow(9, 9, 9)}
-	out, err := w.Step(context.Background(), windows, []float32{0.7, 0.9}, []uint64{1, 2})
+	lengths := []int32{3, 3}
+	out, err := w.Step(context.Background(), windows, lengths, []float32{0.7, 0.9}, []uint64{1, 2})
 	if err != nil {
 		t.Fatalf("step: %v", err)
 	}
@@ -38,7 +39,7 @@ func TestWorkerSpeaksTheProtocol(t *testing.T) {
 		t.Fatalf("sent %d windows, got %d ids back", len(windows), len(out))
 	}
 	for i, window := range windows {
-		if want := fakeNextID(fakeWindowBytes(window)); out[i] != want {
+		if want := fakeNextID(fakeWindowBytes(window), uint32(lengths[i])); out[i] != want {
 			t.Errorf("row %d came back as %d, wanted %d: the window did not survive the frame",
 				i, out[i], want)
 		}
@@ -73,7 +74,7 @@ func TestWorkerSurfacesAnErrorFrame(t *testing.T) {
 	}
 	defer w.Close()
 
-	_, err = w.Step(context.Background(), [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+	_, err = w.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
 	if err == nil {
 		t.Fatal("a refusing worker was reported as a success")
 	}
@@ -93,7 +94,7 @@ func TestWorkerRejectsAStatusThatIsNotOne(t *testing.T) {
 	}
 	defer w.Close()
 
-	_, err = w.Step(context.Background(), [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+	_, err = w.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
 	if err == nil {
 		t.Fatal("a status of 99 was accepted")
 	}
@@ -115,22 +116,31 @@ func TestWorkerChecksItsArgumentsBeforeTheWire(t *testing.T) {
 	cases := []struct {
 		name    string
 		windows [][]int32
+		lengths []int32
 		temps   []float32
 		seeds   []uint64
 	}{
-		{"no sequences", nil, nil, nil},
-		{"a window one id short", [][]int32{make([]int32, workerSeqLen-1)}, []float32{0.7}, []uint64{1}},
-		{"more windows than seeds", [][]int32{oneWindow(1), oneWindow(2)}, []float32{0.7, 0.7}, []uint64{1}},
+		{"no sequences", nil, nil, nil, nil},
+		{"a window one id short", [][]int32{make([]int32, workerSeqLen-1)},
+			[]int32{1}, []float32{0.7}, []uint64{1}},
+		{"more windows than seeds", [][]int32{oneWindow(1), oneWindow(2)},
+			[]int32{1, 1}, []float32{0.7, 0.7}, []uint64{1}},
+		{"a row with no length", [][]int32{oneWindow(1)},
+			[]int32{0}, []float32{0.7}, []uint64{1}},
+		{"a row longer than its window", [][]int32{oneWindow(1)},
+			[]int32{workerSeqLen + 1}, []float32{0.7}, []uint64{1}},
+		{"lengths missing altogether", [][]int32{oneWindow(1)},
+			nil, []float32{0.7}, []uint64{1}},
 	}
 	for _, c := range cases {
-		if _, err := w.Step(context.Background(), c.windows, c.temps, c.seeds); err == nil {
+		if _, err := w.Step(context.Background(), c.windows, c.lengths, c.temps, c.seeds); err == nil {
 			t.Errorf("%s was accepted", c.name)
 		}
 	}
 
 	// And the worker is still usable afterwards: a rejected call must not have
 	// written a partial frame.
-	if _, err := w.Step(context.Background(), [][]int32{oneWindow(5)}, []float32{0.7}, []uint64{1}); err != nil {
+	if _, err := w.Step(context.Background(), [][]int32{oneWindow(5)}, []int32{1}, []float32{0.7}, []uint64{1}); err != nil {
 		t.Errorf("a rejected call left the pipe in a bad state: %v", err)
 	}
 }

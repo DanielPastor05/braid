@@ -88,7 +88,7 @@ type Timings struct {
 }
 
 const (
-	frameMagic  uint32 = 0x35445242 // 'BRD5'
+	frameMagic  uint32 = 0x36445242 // 'BRD6'
 	statusOK    uint32 = 0
 	statusError uint32 = 1
 
@@ -259,17 +259,23 @@ func (w *Worker) Decode(ids []int32) string {
 	return string(out)
 }
 
-func (w *Worker) Step(ctx context.Context, windows [][]int32, temperatures []float32,
-	seeds []uint64) ([]int32, error) {
-	if len(windows) != len(temperatures) || len(windows) != len(seeds) {
+func (w *Worker) Step(ctx context.Context, windows [][]int32, lengths []int32,
+	temperatures []float32, seeds []uint64) ([]int32, error) {
+	if len(windows) != len(temperatures) || len(windows) != len(seeds) ||
+		len(windows) != len(lengths) {
 		return nil, errRagged
 	}
 	if len(windows) == 0 {
 		return nil, fmt.Errorf("backend: a step with no sequences in it")
 	}
-	for _, window := range windows {
+	for i, window := range windows {
 		if len(window) != w.seqLen {
 			return nil, errWindowWidth
+		}
+		// Caught here rather than in the worker, where it would be a killed
+		// process and a failover instead of an error naming the row.
+		if lengths[i] < 1 || int(lengths[i]) > w.seqLen {
+			return nil, errWindowLength
 		}
 	}
 
@@ -291,7 +297,7 @@ func (w *Worker) Step(ctx context.Context, windows [][]int32, temperatures []flo
 	started := time.Now()
 
 	n := len(windows)
-	size := 4 + 4 + n*w.seqLen*4 + n*4 + n*8
+	size := 4 + 4 + n*w.seqLen*4 + n*4 + n*4 + n*8
 	if cap(w.frame) < size {
 		w.frame = make([]byte, size)
 	}
@@ -305,6 +311,10 @@ func (w *Worker) Step(ctx context.Context, windows [][]int32, temperatures []flo
 			binary.LittleEndian.PutUint32(frame[at:], uint32(id))
 			at += 4
 		}
+	}
+	for _, length := range lengths {
+		binary.LittleEndian.PutUint32(frame[at:], uint32(length))
+		at += 4
 	}
 	for _, t := range temperatures {
 		binary.LittleEndian.PutUint32(frame[at:], math.Float32bits(t))

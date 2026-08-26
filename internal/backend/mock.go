@@ -11,12 +11,15 @@ import (
 // Mock is a backend with no model behind it, used by the scheduler's tests and
 // by the load harness when no GPU is present.
 //
-// The next token is a hash of the entire window, the temperature and the seed.
-// That is not a language model, but it has the two properties the scheduler is
-// tested against and a real model also has: the answer depends on every id in
-// the window, so a scheduler that pads wrong or crosses two rows produces
-// visibly different text; and it depends on nothing else, so the same sequence
-// must decode identically whoever it shares a batch with.
+// The next token is a hash of the sequence's real ids, its length, its
+// temperature and its seed. That is not a language model, but it has the three
+// properties the scheduler is tested against and a real model also has: the
+// answer depends on every real id, so a scheduler that crosses two rows produces
+// visibly different text; it depends on nothing else, so the same sequence must
+// decode identically whoever it shares a batch with; and it does not depend on
+// the padding, because with the padding on the right the model cannot reach it
+// either. A mock that hashed the padding too would go on passing if the length
+// were ever threaded through wrong.
 type Mock struct {
 	// Base is the cost of a step regardless of how many sequences are in it --
 	// kernel launches, the host-device round trip, the parts a batch amortises.
@@ -57,14 +60,18 @@ func (m *Mock) Close() error   { return nil }
 func (m *Mock) Steps() int64     { return m.steps.Load() }
 func (m *Mock) Sequences() int64 { return m.sequence.Load() }
 
-func (m *Mock) Step(ctx context.Context, windows [][]int32, temperatures []float32,
-	seeds []uint64) ([]int32, error) {
-	if len(windows) != len(temperatures) || len(windows) != len(seeds) {
+func (m *Mock) Step(ctx context.Context, windows [][]int32, lengths []int32,
+	temperatures []float32, seeds []uint64) ([]int32, error) {
+	if len(windows) != len(temperatures) || len(windows) != len(seeds) ||
+		len(windows) != len(lengths) {
 		return nil, errRagged
 	}
-	for _, w := range windows {
+	for i, w := range windows {
 		if len(w) != m.seqLen {
 			return nil, errWindowWidth
+		}
+		if lengths[i] < 1 || int(lengths[i]) > m.seqLen {
+			return nil, errWindowLength
 		}
 	}
 
@@ -84,10 +91,12 @@ func (m *Mock) Step(ctx context.Context, windows [][]int32, temperatures []float
 	for i, w := range windows {
 		h := fnv.New64a()
 		var buf [8]byte
-		for _, id := range w {
+		for _, id := range w[:lengths[i]] {
 			binary.LittleEndian.PutUint32(buf[:4], uint32(id))
 			_, _ = h.Write(buf[:4])
 		}
+		binary.LittleEndian.PutUint32(buf[:4], uint32(lengths[i]))
+		_, _ = h.Write(buf[:4])
 		binary.LittleEndian.PutUint64(buf[:], seeds[i])
 		_, _ = h.Write(buf[:])
 		binary.LittleEndian.PutUint32(buf[:4], uint32(temperatures[i]*1000))

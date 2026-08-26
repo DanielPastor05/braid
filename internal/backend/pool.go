@@ -126,8 +126,8 @@ func (p *Pool) Decode(ids []int32) string {
 // caller's context bounds the whole sequence of attempts rather than any single
 // one, which is why a hang is transparent when there is somebody to fail over
 // to and fatal to the batch when there is not.
-func (p *Pool) Step(ctx context.Context, windows [][]int32, temperatures []float32,
-	seeds []uint64) ([]int32, error) {
+func (p *Pool) Step(ctx context.Context, windows [][]int32, lengths []int32,
+	temperatures []float32, seeds []uint64) ([]int32, error) {
 	var first error
 
 	for range len(p.slots) {
@@ -144,13 +144,14 @@ func (p *Pool) Step(ctx context.Context, windows [][]int32, temperatures []float
 			break
 		}
 
-		out, err := w.Step(ctx, windows, temperatures, seeds)
+		out, err := w.Step(ctx, windows, lengths, temperatures, seeds)
 		if err == nil {
 			return out, nil
 		}
 
 		// The window that failed is unchanged and goes to the next worker as
-		// it stands. Nothing about this batch was consumed by the attempt.
+		// it stands, lengths and all. Nothing about this batch was consumed by
+		// the attempt, which is the property that makes failover a retry.
 		if first == nil {
 			first = err
 		}
