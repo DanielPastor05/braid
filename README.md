@@ -282,6 +282,16 @@ failover is recorded, it fails rather than reporting a clean run. An earlier
 version of the shell harness killed a stray worker left over from an earlier
 run, and produced a beautiful table of a death that never happened.
 
+**And it runs in CI**, which took a worker with no model in it. The one above
+needs a GPU, a checkpoint and MSVC, so it is skipped on every machine but one —
+which left the part of this repository that is about processes rather than
+arithmetic verified nowhere that anybody else could see. `internal/backend` now
+re-executes its own test binary as a worker that speaks the protocol and holds
+nothing, so the pool, the failover, the restart and the frame itself are checked
+on every push, on a Linux runner with no card in it. It kills the process the
+same way, with the same assertion: every step still returns the answer its
+window earns.
+
 ---
 
 ## Where a step actually goes
@@ -430,7 +440,7 @@ number doing both jobs.
 cmd/braid/          the server
 cmd/braidload/      the load harness that printed the tables
 internal/sched/     the loop: admission, batching, cancellation, stats
-internal/backend/   the seam -- Backend is six methods; Mock and Worker implement them
+internal/backend/   the seam -- Backend is six methods; Mock, Worker and Pool implement them
 internal/api/       HTTP and server-sent events
 engine/             the C++ side: the model, the trainer, the worker process
 third_party/        cpp-ai-engine, pinned as a submodule

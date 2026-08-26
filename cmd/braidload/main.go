@@ -64,6 +64,27 @@ type stats struct {
 		ForwardTotal float64 `json:"-"`
 		PipeTotal    float64 `json:"-"`
 	} `json:"step"`
+
+	// Pool is present only when the server is running more than one worker.
+	Pool *struct {
+		Workers int `json:"workers"`
+		Live    int `json:"live"`
+	} `json:"pool"`
+}
+
+// backend names what answered, from what the server is able to report about
+// itself: only a real worker can break a step down, and only a pool can lose
+// one. Printed above the table so that a table pasted somewhere else still says
+// what produced it.
+func (s *stats) backend() string {
+	switch {
+	case s.Pool != nil:
+		return fmt.Sprintf("pool of %d workers", s.Pool.Workers)
+	case s.Step != nil:
+		return "one worker"
+	default:
+		return "the MOCK backend: these numbers are about the scheduler, not a model"
+	}
 }
 
 // totals turns the per-step means the server reports back into sums, so two
@@ -88,6 +109,15 @@ func main() {
 	flag.Parse()
 
 	client := &http.Client{Timeout: 10 * time.Minute}
+
+	// Asked once, before anything is measured: a table is worth less to whoever
+	// reads it later if it does not say what produced it.
+	first, err := readStats(client, *addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "reading stats from %s: %v\n", *addr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("Answered by %s.\n\n", first.backend())
 
 	// The last four columns decompose one step: build fills the (n, 64) tensor,
 	// forward is the model including the copy off the device, sample is the
