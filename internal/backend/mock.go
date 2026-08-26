@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"encoding/binary"
 	"hash/fnv"
 	"sync/atomic"
@@ -56,7 +57,8 @@ func (m *Mock) Close() error   { return nil }
 func (m *Mock) Steps() int64     { return m.steps.Load() }
 func (m *Mock) Sequences() int64 { return m.sequence.Load() }
 
-func (m *Mock) Step(windows [][]int32, temperatures []float32, seeds []uint64) ([]int32, error) {
+func (m *Mock) Step(ctx context.Context, windows [][]int32, temperatures []float32,
+	seeds []uint64) ([]int32, error) {
 	if len(windows) != len(temperatures) || len(windows) != len(seeds) {
 		return nil, errRagged
 	}
@@ -66,8 +68,16 @@ func (m *Mock) Step(windows [][]int32, temperatures []float32, seeds []uint64) (
 		}
 	}
 
+	// Honoured rather than ignored, so that a test can cancel a slow step the
+	// way a real one would be cancelled.
 	if d := m.Base + time.Duration(len(windows))*m.PerSeq; d > 0 {
-		time.Sleep(d)
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	out := make([]int32, len(windows))

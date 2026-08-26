@@ -54,6 +54,7 @@ type stats struct {
 		WallMS    float64 `json:"wall_ms_per_step"`
 		BuildMS   float64 `json:"build_ms_per_step"`
 		ForwardMS float64 `json:"forward_ms_per_step"`
+		CopyMS    float64 `json:"copy_ms_per_step"`
 		SampleMS  float64 `json:"sample_ms_per_step"`
 		PipeMS    float64 `json:"pipe_ms_per_step"`
 		Kernels   float64 `json:"kernels_per_step"`
@@ -89,12 +90,12 @@ func (s *stats) backend() string {
 
 // totals turns the per-step means the server reports back into sums, so two
 // snapshots can be subtracted to get one level in isolation.
-func (s *stats) totals() (wall, forward, build, sample, kernels float64, steps int64) {
+func (s *stats) totals() (wall, forward, copyBack, sample, kernels float64, steps int64) {
 	if s.Step == nil {
 		return 0, 0, 0, 0, 0, 0
 	}
 	n := float64(s.Step.Steps)
-	return s.Step.WallMS * n, s.Step.ForwardMS * n, s.Step.BuildMS * n, s.Step.SampleMS * n,
+	return s.Step.WallMS * n, s.Step.ForwardMS * n, s.Step.CopyMS * n, s.Step.SampleMS * n,
 		s.Step.Kernels * n, s.Step.Steps
 }
 
@@ -119,12 +120,13 @@ func main() {
 	}
 	fmt.Printf("Answered by %s.\n\n", first.backend())
 
-	// The last four columns decompose one step: build fills the (n, 64) tensor,
-	// forward is the model including the copy off the device, sample is the
-	// softmax and the draw, and pipe is what is left of the wall clock once
-	// those are taken off -- two writes, two reads and the serialising.
-	fmt.Printf("| clients | completed | steps | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | build ms | forward ms | sample ms | pipe ms |\n")
-	fmt.Printf("|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	// The last columns decompose one step: forward is the model's kernels, copy
+	// is pulling the result off the device, sample is the softmax and the draw,
+	// and pipe is what is left of the wall clock once those are taken off --
+	// two writes, two reads and the serialising at each end.
+	fmt.Printf("| clients | completed | steps | mean batch | tokens/s | TTFT p50 | TTFT p95 " +
+		"| wall ms | forward ms | copy ms | sample ms | pipe ms | kernels |\n")
+	fmt.Printf("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 
 	for _, field := range strings.Split(*levels, ",") {
 		n, err := strconv.Atoi(strings.TrimSpace(field))
@@ -267,25 +269,25 @@ func report(clients int, samples []sample, before, after stats, elapsed time.Dur
 	// The split for this level alone: the difference between two cumulative
 	// snapshots, divided by the steps between them. Reading the server's own
 	// running mean instead would fold every earlier level into every later one.
-	wall, forward, build, sample := "-", "-", "-", "-"
+	wall, forward, copyBack, sample := "-", "-", "-", "-"
 	pipe, kernels := "-", "-"
-	wallA, fwdA, buildA, sampA, kernA, stepsA := after.totals()
-	wallB, fwdB, buildB, sampB, kernB, stepsB := before.totals()
+	wallA, fwdA, copyA, sampA, kernA, stepsA := after.totals()
+	wallB, fwdB, copyB, sampB, kernB, stepsB := before.totals()
 	if n := stepsA - stepsB; n > 0 {
 		each := func(a, b float64) string {
 			return fmt.Sprintf("%.2f", (a-b)/float64(n))
 		}
 		wall = each(wallA, wallB)
 		forward = each(fwdA, fwdB)
-		build = each(buildA, buildB)
+		copyBack = each(copyA, copyB)
 		sample = each(sampA, sampB)
-		pipe = each((wallA - fwdA - buildA - sampA), (wallB - fwdB - buildB - sampB))
+		pipe = each((wallA - fwdA - copyA - sampA), (wallB - fwdB - copyB - sampB))
 		kernels = fmt.Sprintf("%.0f", (kernA-kernB)/float64(n))
 	}
 
 	fmt.Printf("| %d | %d | %d | %.2f | %.0f | %s | %s | %s | %s | %s | %s | %s | %s |\n",
 		clients, okCount, steps, meanBatch, rate,
-		pct(ttfts, 50), pct(ttfts, 95), wall, build, forward, sample, pipe, kernels)
+		pct(ttfts, 50), pct(ttfts, 95), wall, forward, copyBack, sample, pipe, kernels)
 
 	// Rejections do not get a column of zeros. They get a line, on stderr, on
 	// the runs where they actually happened.

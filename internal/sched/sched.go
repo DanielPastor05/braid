@@ -135,7 +135,8 @@ type Scheduler struct {
 	stopped  chan struct{}
 	closeOne sync.Once
 
-	stats Stats
+	stats   Stats
+	latency *latencies
 }
 
 // New starts the loop. Close stops it.
@@ -157,6 +158,7 @@ func New(b backend.Backend, cfg Config) (*Scheduler, error) {
 		incoming: make(chan *sequence, cfg.QueueDepth),
 		stop:     make(chan struct{}),
 		stopped:  make(chan struct{}),
+		latency:  newLatencies(),
 	}
 	go s.loop()
 	return s, nil
@@ -177,10 +179,22 @@ func (s *Scheduler) Submit(ctx context.Context, req Request) (<-chan Token, <-ch
 		return nil, nil, fmt.Errorf("sched: Temperature must be above zero, got %v", req.Temperature)
 	}
 
+	// Only the last SeqLen ids of a prompt can ever be read -- window() takes
+	// the tail and the model has no other context -- so keeping the rest is a
+	// caller-controlled allocation with no purpose. At a 1 MiB body limit and a
+	// queue of 256 that was up to a gigabyte of ids nothing would ever look at.
+	//
+	// Copied rather than resliced: history[len-n:] keeps the whole backing array
+	// alive, which would have fixed the arithmetic and none of the memory.
+	history := s.backend.Encode(req.Prompt)
+	if len(history) > s.seqLen {
+		history = append([]int32(nil), history[len(history)-s.seqLen:]...)
+	}
+
 	seq := &sequence{
 		req:     req,
 		ctx:     ctx,
-		history: s.backend.Encode(req.Prompt),
+		history: history,
 		// The buffer holds every token this request could possibly produce, so
 		// the loop's send can never block and never has to decide what to do
 		// about a caller that has stopped reading. A stalled caller pays for

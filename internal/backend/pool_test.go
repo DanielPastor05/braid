@@ -1,7 +1,9 @@
 package backend
 
 import (
+	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -12,7 +14,7 @@ import (
 func step(t *testing.T, p *Pool, window []int32) error {
 	t.Helper()
 
-	out, err := p.Step([][]int32{window}, []float32{0.7}, []uint64{1})
+	out, err := p.Step(context.Background(), [][]int32{window}, []float32{0.7}, []uint64{1})
 	if err != nil {
 		return err
 	}
@@ -113,7 +115,7 @@ func TestPoolWithEveryWorkerDeadReturnsAnError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := pool.Step([][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+		_, err := pool.Step(context.Background(), [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
 		done <- err
 	}()
 
@@ -142,7 +144,7 @@ func TestPoolOfOneHasNowhereToFailOver(t *testing.T) {
 	}
 	defer pool.Close()
 
-	_, err = pool.Step([][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+	_, err = pool.Step(context.Background(), [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
 	if err == nil {
 		t.Fatal("a pool of one reported a success while its only worker refused")
 	}
@@ -197,4 +199,111 @@ func TestPoolNeedsAtLeastOneWorker(t *testing.T) {
 	if _, err := NewPool(exe, prefix, 0, WorkerOptions{}, quiet()); err == nil {
 		t.Error("a pool of zero workers was accepted")
 	}
+}
+
+// TestAHungWorkerIsKilledRatherThanWaitedFor is the one a dead process cannot
+// stand in for.
+//
+// A worker that dies closes its pipe and the very next read fails, which is the
+// easy case and the only one the chaos tests covered. A worker that is alive and
+// silent -- a GPU hang, a driver reset that leaves the process up -- holds the
+// pipe open, and a read on it has no timeout of its own. Before Step took a
+// context this blocked the scheduler's only goroutine forever: every request
+// behind it stalled, and the health check went on answering that the server was
+// fine.
+func TestAHungWorkerIsKilledRatherThanWaitedFor(t *testing.T) {
+	exe, prefix := startFake(t, "hang:0")
+	w, err := NewWorker(exe, prefix, WorkerOptions{StepTimeout: 300 * time.Millisecond}, quiet())
+	if err != nil {
+		t.Fatalf("starting the fake: %v", err)
+	}
+	pid := w.Pid()
+	started := time.Now()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.Step(context.Background(), [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a worker that never answered was reported as a success")
+		}
+		if !strings.Contains(err.Error(), "did not answer") {
+			t.Errorf("the error does not say what happened: %v", err)
+		}
+		if waited := time.Since(started); waited > 5*time.Second {
+			t.Errorf("Step took %v to give up on a 300ms timeout", waited)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Step never returned: the deadline is not being enforced")
+	}
+
+	// And the process has to be gone. Leaving it alive would leak it, and worse:
+	// a late answer would be read as the *next* step's reply, since the protocol
+	// carries no request identifier to notice with.
+	//
+	// Checked by closing rather than by asking the operating system, which has
+	// no portable "is this pid alive". The fake is parked in select{} and never
+	// reads its stdin, so closing the pipe tells it nothing: if it had not been
+	// killed, Close's Wait would block here for as long as the test is allowed
+	// to run. Returning promptly is the assertion.
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Errorf("Close hung, so worker %d survived its own step timeout", pid)
+	}
+}
+
+// TestAPoolRecoversWhenEveryWorkerHangsAtOnce is the correlated failure, which
+// is the one that actually happens: workers on the same card wedge for the same
+// reason at the same moment, so a driver reset takes all of them, not one.
+//
+// The fake's mode comes from an environment variable the whole pool shares, so
+// hanging one process and not its siblings is not something this harness can
+// arrange portably -- there is no SIGSTOP on Windows. That turns out to be the
+// more useful test anyway: it asserts the server digs itself out of total
+// backend failure rather than staying dead, which is the property a single
+// transparent failover does not demonstrate.
+func TestAPoolRecoversWhenEveryWorkerHangsAtOnce(t *testing.T) {
+	// Every worker hangs on its second step, so the first pass round the ring
+	// succeeds and the second finds all three silent.
+	exe, prefix := startFake(t, "hang:1")
+	pool, err := NewPool(exe, prefix, 3, WorkerOptions{
+		StepTimeout: 200 * time.Millisecond,
+	}, quiet())
+	if err != nil {
+		t.Fatalf("starting the pool: %v", err)
+	}
+	defer pool.Close()
+
+	for i := range 3 {
+		if err := step(t, pool, oneWindow(int32(i))); err != nil {
+			t.Fatalf("step %d, before anything hangs: %v", i, err)
+		}
+	}
+
+	// This one meets all three hung, waits out three timeouts, and fails. That
+	// is correct: there is nobody left to ask.
+	if err := step(t, pool, oneWindow(42)); err == nil {
+		t.Fatal("a step served while every worker was hung")
+	}
+	if stats := pool.PoolStats(); stats.Deaths < 3 {
+		t.Fatalf("expected all three hangs to count as deaths, got %+v", stats)
+	}
+
+	// And then it has to come back on its own, with the right answers. A server
+	// that survives the failure and never serves again has not recovered.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := step(t, pool, oneWindow(7)); err == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Errorf("the pool never served again after every worker hung: %+v", pool.PoolStats())
 }

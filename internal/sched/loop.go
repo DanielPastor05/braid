@@ -1,6 +1,7 @@
 package sched
 
 import (
+	"context"
 	"time"
 )
 
@@ -10,6 +11,16 @@ func (s *Scheduler) loop() {
 	defer close(s.stopped)
 
 	active := make([]*sequence, 0, s.cfg.MaxBatch)
+
+	// Cancelled when the scheduler is closed, so a shutdown does not wait on a
+	// backend that may never answer. The per-step deadline is the backend's
+	// own: it knows what its steps cost and this loop does not.
+	stepCtx, cancelSteps := context.WithCancel(context.Background())
+	defer cancelSteps()
+	go func() {
+		<-s.stop
+		cancelSteps()
+	}()
 
 	// One backing array for the batch, reused across steps. The rows handed to
 	// the backend are windows into it, so a step of n sequences allocates
@@ -57,7 +68,7 @@ func (s *Scheduler) loop() {
 			seeds = append(seeds, seq.req.Seed+uint64(seq.generated))
 		}
 
-		ids, err := s.backend.Step(windows, temps, seeds)
+		ids, err := s.backend.Step(stepCtx, windows, temps, seeds)
 		if err != nil {
 			s.stats.stepErrors.Add(1)
 			s.failAll(active, err)
@@ -165,6 +176,7 @@ func (s *Scheduler) finish(seq *sequence, err error) {
 	} else {
 		s.stats.completed.Add(1)
 	}
+	s.latency.record(res)
 	seq.done <- res
 	close(seq.done)
 }

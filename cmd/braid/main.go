@@ -125,6 +125,19 @@ func main() {
 		// on the whole response would cut it off mid-sentence. The request
 		// context, MaxTokens and MaxWait are what bound a request here.
 		ReadHeaderTimeout: 5 * time.Second,
+
+		// A connection that opens and then says nothing costs a goroutine and a
+		// file descriptor for as long as it likes. With no WriteTimeout, this
+		// and ReadHeaderTimeout are the whole defence.
+		//
+		// ReadTimeout is deliberately not set, and it is the tempting one to
+		// add. It would bound the body as well as the headers, but net/http
+		// keeps a background read on the connection to notice a client going
+		// away, and that read shares the deadline: once it expires the server
+		// treats the connection as gone and cancels the request. A generation
+		// still streaming happily would be cut off for the crime of lasting
+		// longer than a timeout meant for a request nobody was sending.
+		IdleTimeout: 60 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

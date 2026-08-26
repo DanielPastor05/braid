@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -119,16 +120,31 @@ func (p *Pool) Decode(ids []int32) string {
 
 // Step asks one worker, and on failure asks the next, until a worker answers or
 // there is none left to ask.
-func (p *Pool) Step(windows [][]int32, temperatures []float32, seeds []uint64) ([]int32, error) {
+//
+// Each worker enforces its own step timeout, so a hung one costs that timeout
+// and then becomes a death like any other: killed, failed over, restarted. The
+// caller's context bounds the whole sequence of attempts rather than any single
+// one, which is why a hang is transparent when there is somebody to fail over
+// to and fatal to the batch when there is not.
+func (p *Pool) Step(ctx context.Context, windows [][]int32, temperatures []float32,
+	seeds []uint64) ([]int32, error) {
 	var first error
 
 	for range len(p.slots) {
+		// A caller that has given up takes the whole pool with it: retrying a
+		// step nobody is waiting for only costs the workers still alive.
+		if err := ctx.Err(); err != nil {
+			if first == nil {
+				first = err
+			}
+			break
+		}
 		w, slot := p.pick()
 		if w == nil {
 			break
 		}
 
-		out, err := w.Step(windows, temperatures, seeds)
+		out, err := w.Step(ctx, windows, temperatures, seeds)
 		if err == nil {
 			return out, nil
 		}
@@ -181,6 +197,7 @@ func (p *Pool) retire(slot int, w *Worker, cause error) {
 	p.retired.Wall += t.Wall
 	p.retired.Build += t.Build
 	p.retired.Forward += t.Forward
+	p.retired.Copy += t.Copy
 	p.retired.Sample += t.Sample
 	p.retired.Kernels += t.Kernels
 	p.retired.ToDevice += t.ToDevice
@@ -273,6 +290,7 @@ func (p *Pool) Timings() Timings {
 		t.Wall += u.Wall
 		t.Build += u.Build
 		t.Forward += u.Forward
+		t.Copy += u.Copy
 		t.Sample += u.Sample
 		t.Kernels += u.Kernels
 		t.ToDevice += u.ToDevice
@@ -289,8 +307,9 @@ func (p *Pool) Timings() Timings {
 	t.WallMS = per(t.Wall)
 	t.BuildMS = per(t.Build)
 	t.ForwardMS = per(t.Forward)
+	t.CopyMS = per(t.Copy)
 	t.SampleMS = per(t.Sample)
-	t.PipeMS = t.WallMS - t.BuildMS - t.ForwardMS - t.SampleMS
+	t.PipeMS = t.WallMS - t.BuildMS - t.ForwardMS - t.CopyMS - t.SampleMS
 	if t.WallMS > 0 {
 		t.PipeShare = t.PipeMS / t.WallMS
 	}

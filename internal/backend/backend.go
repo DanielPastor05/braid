@@ -9,6 +9,8 @@
 // getting right, and it is testable to the last branch against Mock.
 package backend
 
+import "context"
+
 // Backend advances sequences by one token each.
 //
 // Implementations are not required to be safe for concurrent use. The scheduler
@@ -18,10 +20,18 @@ type Backend interface {
 	// token id for each, in the same order. Every window is exactly SeqLen
 	// ids long, left-padded with id 0 when the sequence is shorter.
 	//
+	// The context bounds how long the caller will wait. It matters because the
+	// interesting failure is not a backend that dies -- a dead process closes
+	// its pipe and the read fails at once -- but one that is alive and silent:
+	// a GPU hang, a driver reset that leaves the process up. Without a deadline
+	// that stops the scheduler for good, with every request behind it, while
+	// the health check goes on saying the server is fine.
+	//
 	// A batch of n sequences must produce the same n results as n batches of
 	// one -- the sequences share a tensor, not a computation. The scheduler's
 	// tests hold implementations to that.
-	Step(windows [][]int32, temperatures []float32, seeds []uint64) ([]int32, error)
+	Step(ctx context.Context, windows [][]int32, temperatures []float32,
+		seeds []uint64) ([]int32, error)
 
 	// SeqLen is the fixed context width the model was built with. The engine's
 	// character model uses 64.

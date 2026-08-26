@@ -2,9 +2,13 @@ package sched
 
 import "sync/atomic"
 
-// Stats counts what the loop did. Every field is a total since start; rates and
-// percentiles are the caller's business, because a server that computes its own
-// averages is a server that hides its tail.
+// Stats counts what the loop did. Every counter is a total since start; rates
+// are the caller's business, because a rate needs two readings and this has one.
+//
+// Percentiles are not the caller's business, and an earlier version of this
+// comment said they were. They lived only in the load harness, which meant the
+// server could describe its own tail only while somebody was benchmarking it --
+// precisely when the tail matters least. See latency.go.
 type Stats struct {
 	steps      atomic.Int64
 	advanced   atomic.Int64
@@ -28,6 +32,11 @@ type Snapshot struct {
 	Completed  int64 `json:"completed"`
 	Failed     int64 `json:"failed"`
 	StepErrors int64 `json:"step_errors"`
+
+	// Latency over a recent window, not since boot. A p99 measured over every
+	// request a long-lived process ever served is a number an hour of good
+	// service cannot move.
+	Latency LatencySnapshot `json:"latency"`
 
 	// MeanBatch is sequences advanced per step. It is the one number that says
 	// whether any of this worked: at 1.0 the server is doing exactly what
@@ -54,5 +63,6 @@ func (s *Scheduler) Stats() Snapshot {
 	if snap.Steps > 0 {
 		snap.MeanBatch = float64(snap.Advanced) / float64(snap.Steps)
 	}
+	snap.Latency = s.latency.snapshot()
 	return snap
 }

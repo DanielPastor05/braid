@@ -362,3 +362,73 @@ func TestSubmitRejectsNonsense(t *testing.T) {
 		}
 	}
 }
+
+// TestTheServerReportsItsOwnTail covers what the load harness cannot: a server
+// that can only describe its latency while somebody is benchmarking it is a
+// server with no latency observability at all.
+func TestTheServerReportsItsOwnTail(t *testing.T) {
+	m := backend.NewMock()
+	m.Base = time.Millisecond
+	m.PerSeq = 0
+
+	s, err := New(m, Config{MaxBatch: 4, QueueDepth: 32, MaxTokensLimit: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if empty := s.Stats().Latency; empty.Samples != 0 {
+		t.Errorf("a server that has served nothing reported %d samples", empty.Samples)
+	}
+
+	for i := range 20 {
+		run(t, s, Request{Prompt: "x", MaxTokens: 5, Temperature: 1, Seed: uint64(i)})
+	}
+
+	got := s.Stats().Latency
+	if got.Samples != 20 {
+		t.Fatalf("twenty requests produced %d samples", got.Samples)
+	}
+	// Percentiles have to be ordered, non-zero, and inside the total. A p99 that
+	// came back as zero would look like a very fast server.
+	if !(got.TTFTP50MS > 0 && got.TTFTP50MS <= got.TTFTP95MS && got.TTFTP95MS <= got.TTFTP99MS) {
+		t.Errorf("time to first token is not a distribution: p50 %.3f, p95 %.3f, p99 %.3f",
+			got.TTFTP50MS, got.TTFTP95MS, got.TTFTP99MS)
+	}
+	if got.TotalP50MS < got.TTFTP50MS {
+		t.Errorf("a request finished before its first token: total p50 %.3f, ttft p50 %.3f",
+			got.TotalP50MS, got.TTFTP50MS)
+	}
+}
+
+// TestRejectionsStayOutOfTheLatencyWindow guards the number against the mistake
+// that would flatter it most. A rejected request has no time to first token,
+// and counting it as zero would drag every percentile down exactly when the
+// server is overloaded and the tail is the only thing worth looking at.
+func TestRejectionsStayOutOfTheLatencyWindow(t *testing.T) {
+	m := backend.NewMock()
+	m.Base = 20 * time.Millisecond
+	m.PerSeq = 0
+
+	s, err := New(m, Config{MaxBatch: 1, QueueDepth: 1, MaxTokensLimit: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var rejected int
+	for range 30 {
+		if _, _, err := s.Submit(context.Background(), Request{
+			Prompt: "x", MaxTokens: 40, Temperature: 1,
+		}); errors.Is(err, ErrQueueFull) {
+			rejected++
+		}
+	}
+	if rejected == 0 {
+		t.Fatal("nothing was rejected, so this test measured nothing")
+	}
+
+	if got := s.Stats().Latency; got.Samples > 0 && got.TTFTP50MS == 0 {
+		t.Error("a percentile of zero: rejections are being counted as instant successes")
+	}
+}

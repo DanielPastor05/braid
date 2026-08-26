@@ -40,6 +40,10 @@ const fakeWorkerEnv = "BRAID_FAKE_WORKER"
 //	            worker.cpp is followed by `return 1`
 //	garbage:N   answer N steps, then send a status that is not a status
 //	slow:MS     answer every step, MS milliseconds late
+//	hang:N      answer N steps, then read the next frame and never reply --
+//	            alive, holding the pipe open, silent. The failure a dead
+//	            process cannot simulate, because a dead process closes its
+//	            pipe and the read fails immediately.
 func TestMain(m *testing.M) {
 	if mode := os.Getenv(fakeWorkerEnv); mode != "" {
 		fakeWorkerMain(mode)
@@ -92,13 +96,19 @@ func fakeWorkerMain(mode string) {
 			case "garbage":
 				_ = binary.Write(os.Stdout, binary.LittleEndian, uint32(99))
 				continue
+			case "hang":
+				// Not select{}: with no other goroutine runnable the Go
+				// runtime calls that a deadlock and kills the process, which
+				// produces the EOF this mode exists to avoid. Sleeping is
+				// indistinguishable from a wedged GPU call and stays alive.
+				time.Sleep(365 * 24 * time.Hour)
 			}
 		}
 		if kind == "slow" {
 			time.Sleep(time.Duration(arg) * time.Millisecond)
 		}
 
-		out := make([]byte, 0, int(n)*4+6*8)
+		out := make([]byte, 0, int(n)*4+7*8)
 		out = binary.LittleEndian.AppendUint32(out, statusOK)
 		for i := range int(n) {
 			window := body[i*workerSeqLen*4 : (i+1)*workerSeqLen*4]
@@ -114,9 +124,9 @@ func fakeWorkerMain(mode string) {
 }
 
 // fakeStepReport is what every fake step claims about itself: build, forward,
-// sample, kernels, to_device, to_host. Fixed so a test can assert the numbers
-// arrived rather than assert they are plausible.
-var fakeStepReport = [6]uint64{1000, 2000, 500, 60, 1, 1}
+// copy, sample, kernels, to_device, to_host. Fixed so a test can assert the
+// numbers arrived rather than assert they are plausible.
+var fakeStepReport = [7]uint64{1000, 2000, 250, 500, 60, 1, 1}
 
 func writeFakeError(message string) {
 	out := binary.LittleEndian.AppendUint32(nil, statusError)

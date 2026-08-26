@@ -1,6 +1,7 @@
 package sched
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -251,14 +252,14 @@ func TestKernelsByBatchSize(t *testing.T) {
 
 		// Warm, so the first call's allocations are not charged to the sample.
 		for range 5 {
-			if _, err := w.Step(windows, temps, seeds); err != nil {
+			if _, err := w.Step(context.Background(), windows, temps, seeds); err != nil {
 				t.Fatalf("step at n=%d: %v", n, err)
 			}
 		}
 
 		before := w.Timings()
 		for range repeats {
-			if _, err := w.Step(windows, temps, seeds); err != nil {
+			if _, err := w.Step(context.Background(), windows, temps, seeds); err != nil {
 				t.Fatalf("step at n=%d: %v", n, err)
 			}
 		}
@@ -306,7 +307,7 @@ func TestWorkerRoundTripsTheAlphabet(t *testing.T) {
 	window := make([]int32, w.SeqLen())
 	copy(window[w.SeqLen()-4:], w.Encode("The "))
 
-	out, err := w.Step([][]int32{window}, []float32{0.7}, []uint64{1})
+	out, err := w.Step(context.Background(), [][]int32{window}, []float32{0.7}, []uint64{1})
 	if err != nil {
 		t.Fatalf("step: %v", err)
 	}
@@ -319,7 +320,7 @@ func TestWorkerRoundTripsTheAlphabet(t *testing.T) {
 
 	// And the same window twice must give the same id: sampling is seeded per
 	// sequence, so a repeat is not a coin flip.
-	again, err := w.Step([][]int32{window}, []float32{0.7}, []uint64{1})
+	again, err := w.Step(context.Background(), [][]int32{window}, []float32{0.7}, []uint64{1})
 	if err != nil {
 		t.Fatalf("step: %v", err)
 	}

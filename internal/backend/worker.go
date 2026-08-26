@@ -2,6 +2,7 @@ package backend
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -37,7 +38,8 @@ type Worker struct {
 	result []byte
 	closed bool
 
-	timing Timings
+	stepTimeout time.Duration
+	timing      Timings
 }
 
 // Timings is where a step's wall time went, summed over every step so far.
@@ -53,6 +55,7 @@ type Timings struct {
 	Wall      time.Duration `json:"-"`
 	Build     time.Duration `json:"-"`
 	Forward   time.Duration `json:"-"`
+	Copy      time.Duration `json:"-"`
 	Sample    time.Duration `json:"-"`
 	Kernels   int64         `json:"-"`
 	ToDevice  int64         `json:"-"`
@@ -61,6 +64,11 @@ type Timings struct {
 	WallMS    float64 `json:"wall_ms_per_step"`
 	BuildMS   float64 `json:"build_ms_per_step"`
 	ForwardMS float64 `json:"forward_ms_per_step"`
+
+	// CopyMS is the device-to-host transfer of the logits, separated from the
+	// model's own time because the worker pulls back every position of the
+	// window when the sampling reads only the last one of each sequence.
+	CopyMS    float64 `json:"copy_ms_per_step"`
 	SampleMS  float64 `json:"sample_ms_per_step"`
 	PipeMS    float64 `json:"pipe_ms_per_step"`
 	PipeShare float64 `json:"pipe_share"`
@@ -80,7 +88,7 @@ type Timings struct {
 }
 
 const (
-	frameMagic  uint32 = 0x34445242 // 'BRD4'
+	frameMagic  uint32 = 0x35445242 // 'BRD5'
 	statusOK    uint32 = 0
 	statusError uint32 = 1
 
@@ -89,6 +97,11 @@ const (
 	// text rather than an error, and a constant in two files that must match is
 	// at least greppable.
 	workerSeqLen = 64
+
+	// defaultStepTimeout is four orders of magnitude above a real step, so it
+	// fires only for a process that has stopped answering rather than one
+	// having a bad day.
+	defaultStepTimeout = 30 * time.Second
 )
 
 // WorkerOptions tunes the engine inside the worker.
@@ -102,6 +115,11 @@ const (
 type WorkerOptions struct {
 	MinMatmulFlops uint64
 	MinElements    uint64
+
+	// StepTimeout is how long one step may take before the worker is presumed
+	// hung and killed. Zero means defaultStepTimeout. A step is milliseconds;
+	// this is not a latency budget, it is the line between slow and gone.
+	StepTimeout time.Duration
 
 	// MinLayerNormElements is the third of the engine's thresholds, and the one
 	// that decides whether a small forward chains across the card or comes home
@@ -122,7 +140,11 @@ func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*W
 		return nil, fmt.Errorf("the alphabet in %s.vocab is empty", prefix)
 	}
 
-	w := &Worker{alphabet: alphabet, seqLen: workerSeqLen}
+	timeout := opts.StepTimeout
+	if timeout <= 0 {
+		timeout = defaultStepTimeout
+	}
+	w := &Worker{alphabet: alphabet, seqLen: workerSeqLen, stepTimeout: timeout}
 	for i := range w.index {
 		w.index[i] = -1
 	}
@@ -220,7 +242,8 @@ func (w *Worker) Decode(ids []int32) string {
 	return string(out)
 }
 
-func (w *Worker) Step(windows [][]int32, temperatures []float32, seeds []uint64) ([]int32, error) {
+func (w *Worker) Step(ctx context.Context, windows [][]int32, temperatures []float32,
+	seeds []uint64) ([]int32, error) {
 	if len(windows) != len(temperatures) || len(windows) != len(seeds) {
 		return nil, errRagged
 	}
@@ -238,6 +261,12 @@ func (w *Worker) Step(windows [][]int32, temperatures []float32, seeds []uint64)
 	if w.closed {
 		return nil, fmt.Errorf("backend: the worker is closed")
 	}
+
+	// The worker's own ceiling, applied whether or not the caller brought one.
+	// A step is milliseconds; anything approaching this is a process that has
+	// stopped answering rather than one that is being slow.
+	ctx, cancel := context.WithTimeout(ctx, w.stepTimeout)
+	defer cancel()
 
 	// Started here rather than at the top of the function: what the scheduler
 	// pays for a step is the serialising, the pipe and the parsing, and the
@@ -269,58 +298,108 @@ func (w *Worker) Step(windows [][]int32, temperatures []float32, seeds []uint64)
 		at += 8
 	}
 
+	// The exchange runs on another goroutine so that the deadline can be
+	// enforced at all: a pipe read has no timeout of its own, and the process
+	// at the other end may be alive and simply not answering.
+	type answer struct {
+		ids     []int32
+		timings [7]uint64
+		err     error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		ids, timings, err := w.exchange(frame, n)
+		done <- answer{ids, timings, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			return nil, got.err
+		}
+		w.timing.Steps++
+		w.timing.Sequences += int64(n)
+		w.timing.Wall += time.Since(started)
+		w.timing.Build += time.Duration(got.timings[0])
+		w.timing.Forward += time.Duration(got.timings[1])
+		w.timing.Copy += time.Duration(got.timings[2])
+		w.timing.Sample += time.Duration(got.timings[3])
+		w.timing.Kernels += int64(got.timings[4])
+		w.timing.ToDevice += int64(got.timings[5])
+		w.timing.ToHost += int64(got.timings[6])
+		return got.ids, nil
+
+	case <-ctx.Done():
+		// Killing it is not a choice. The read is blocked in the kernel with no
+		// message that means "never mind", and a worker that answered late
+		// would answer the *next* step with this step's ids -- the protocol has
+		// no request identifier and no way to notice. So the process goes, the
+		// goroutine unblocks on the broken pipe, and a pool treats it as the
+		// death it now is.
+		w.killLocked()
+		<-done // reaped, so nothing is left writing to w.frame
+		return nil, fmt.Errorf("backend: the worker did not answer within %v: %w",
+			w.stepTimeout, ctx.Err())
+	}
+}
+
+// exchange writes one frame and reads its answer, blocking for as long as the
+// worker takes. Bounding that is Step's business, not this function's.
+func (w *Worker) exchange(frame []byte, n int) ([]int32, [7]uint64, error) {
+	var timings [7]uint64
+
 	if _, err := w.stdin.Write(frame); err != nil {
-		return nil, fmt.Errorf("backend: writing a step to the worker: %w", err)
+		return nil, timings, fmt.Errorf("backend: writing a step to the worker: %w", err)
 	}
 
 	var status uint32
 	if err := binary.Read(w.stdout, binary.LittleEndian, &status); err != nil {
-		return nil, fmt.Errorf("backend: reading the worker's status: %w", err)
+		return nil, timings, fmt.Errorf("backend: reading the worker's status: %w", err)
 	}
 	if status == statusError {
 		var length uint32
 		if err := binary.Read(w.stdout, binary.LittleEndian, &length); err != nil {
-			return nil, fmt.Errorf("backend: reading the worker's error length: %w", err)
+			return nil, timings, fmt.Errorf("backend: reading the worker's error length: %w", err)
 		}
 		message := make([]byte, length)
 		if _, err := io.ReadFull(w.stdout, message); err != nil {
-			return nil, fmt.Errorf("backend: reading the worker's error: %w", err)
+			return nil, timings, fmt.Errorf("backend: reading the worker's error: %w", err)
 		}
-		return nil, fmt.Errorf("backend: the worker refused the step: %s", message)
+		return nil, timings, fmt.Errorf("backend: the worker refused the step: %s", message)
 	}
 	if status != statusOK {
-		return nil, fmt.Errorf("backend: the worker sent status %d, which is not a status", status)
+		return nil, timings, fmt.Errorf(
+			"backend: the worker sent status %d, which is not a status", status)
 	}
 
 	// n ids, the three timings the worker measured of itself, and the count
 	// of kernels its forward launched.
-	const timingBytes = 6 * 8
+	const timingBytes = 7 * 8
 	need := n*4 + timingBytes
 	if cap(w.result) < need {
 		w.result = make([]byte, need)
 	}
 	result := w.result[:need]
 	if _, err := io.ReadFull(w.stdout, result); err != nil {
-		return nil, fmt.Errorf("backend: reading %d ids from the worker: %w", n, err)
+		return nil, timings, fmt.Errorf("backend: reading %d ids from the worker: %w", n, err)
 	}
 
 	out := make([]int32, n)
 	for i := range out {
 		out[i] = int32(binary.LittleEndian.Uint32(result[i*4:]))
 	}
+	for i := range timings {
+		timings[i] = binary.LittleEndian.Uint64(result[n*4+i*8:])
+	}
+	return out, timings, nil
+}
 
-	at = n * 4
-	w.timing.Steps++
-	w.timing.Sequences += int64(n)
-	w.timing.Wall += time.Since(started)
-	w.timing.Build += time.Duration(binary.LittleEndian.Uint64(result[at:]))
-	w.timing.Forward += time.Duration(binary.LittleEndian.Uint64(result[at+8:]))
-	w.timing.Sample += time.Duration(binary.LittleEndian.Uint64(result[at+16:]))
-	w.timing.Kernels += int64(binary.LittleEndian.Uint64(result[at+24:]))
-	w.timing.ToDevice += int64(binary.LittleEndian.Uint64(result[at+32:]))
-	w.timing.ToHost += int64(binary.LittleEndian.Uint64(result[at+40:]))
-
-	return out, nil
+// killLocked ends the process. The caller holds mu; closed is deliberately left
+// alone so that Close still reaps the corpse.
+func (w *Worker) killLocked() {
+	if w.cmd != nil && w.cmd.Process != nil {
+		_ = w.cmd.Process.Kill()
+	}
 }
 
 // Timings reports where the steps taken so far spent their time.
@@ -339,6 +418,7 @@ func (w *Worker) Timings() Timings {
 	t.WallMS = per(t.Wall)
 	t.BuildMS = per(t.Build)
 	t.ForwardMS = per(t.Forward)
+	t.CopyMS = per(t.Copy)
 	t.SampleMS = per(t.Sample)
 	t.KernelsPerStep = float64(t.Kernels) / float64(t.Steps)
 	t.ToDevicePerStep = float64(t.ToDevice) / float64(t.Steps)
@@ -349,7 +429,7 @@ func (w *Worker) Timings() Timings {
 	// disagree at the microsecond, and it is reported as measured rather than
 	// clamped, because a negative here means the measurement is wrong and that
 	// is worth seeing.
-	t.PipeMS = t.WallMS - t.BuildMS - t.ForwardMS - t.SampleMS
+	t.PipeMS = t.WallMS - t.BuildMS - t.ForwardMS - t.CopyMS - t.SampleMS
 	if t.WallMS > 0 {
 		t.PipeShare = t.PipeMS / t.WallMS
 	}

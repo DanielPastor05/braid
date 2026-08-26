@@ -10,9 +10,15 @@ A continuously batched inference server for
 
 Independent requests arrive whenever they arrive and are merged into a single
 forward pass. A request that shows up mid-flight joins the batch at the next
-step; a request that finishes leaves at the next step; **neither event changes
-one character of what anybody else generates** — and that is checked against the
-real model on the GPU, not only asserted.
+step; a request that finishes leaves at the next step; and **nothing about the
+batch reaches another sequence through the scheduler** — every row carries its
+own history, its own temperature and its own seeded generator.
+
+Whether the *arithmetic* keeps that promise is a separate question with a weaker
+answer, and this page tries hard not to blur the two.
+[It is measured, not guaranteed](#the-property-that-makes-it-correct).
+
+*Built with heavy AI assistance — [what that means](#how-this-was-built).*
 
 | | |
 |---|---|
@@ -23,8 +29,9 @@ real model on the GPU, not only asserted.
 | **Where a step goes at batch 32** | 3.39 ms model, 0.35 ms pipe, 0.06 ms sampling |
 | **Two engine thresholds moved** | matmul 2²² → 2²⁰ (**3.5×** at one client), LayerNorm 2¹⁵ → 2 048 (**1.4–1.9×** at one to five) |
 | **CPU and CUDA paths** | 200 characters identical, sampled independently |
-| **Batching invariance** | identical output alone and at mean batch 8.68, on the GPU |
+| **Batching invariance** | measured identical alone and at mean batch 8.68 — a property, not a guarantee |
 | **A worker killed mid-load** | 512 requests, **0 failed**, tail unmoved — workers hold no state |
+| **A worker hung mid-step** | killed on a deadline and failed over; before that it stopped the server for good |
 | **Landed upstream** | three PRs on the engine: the residency clause, the correction to it, and the floor becoming a threshold |
 
 ---
@@ -35,15 +42,15 @@ real model on the GPU, not only asserted.
 so the step column is directly comparable down the page. Measured after a warm-up
 sweep, for reasons two sections below.
 
-| clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | sample ms | pipe ms | kernels |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 7 680 | 1.00 | 988 | 4 ms | 6 ms | 0.93 | 0.89 | 0.00 | 0.04 | 60 |
-| 2 | 4 025 | 1.91 | 1 793 | 4 ms | 7 ms | 1.02 | 0.97 | 0.00 | 0.04 | 60 |
-| 4 | 2 094 | 3.67 | 2 896 | 6 ms | 9 ms | 1.24 | 1.19 | 0.01 | 0.05 | 60 |
-| 8 | 1 011 | 7.60 | 4 692 | 7 ms | 9 ms | 1.55 | 1.50 | 0.01 | 0.03 | 60 |
-| 16 | 512 | 15.00 | 5 442 | 13 ms | 24 ms | 2.68 | 2.42 | 0.03 | 0.23 | 60 |
-| 32 | 273 | 28.13 | **7 185** | 23 ms | 34 ms | 3.82 | 3.39 | 0.06 | 0.35 | 60 |
-| 64 | 248 | 30.97 | 7 405 | **246 ms** | 291 ms | 4.07 | 3.61 | 0.08 | 0.36 | 60 |
+| clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | copy ms | sample ms | pipe ms | kernels |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 7 680 | 1.00 | 905 | 4 ms | 7 ms | 1.01 | 0.92 | 0.04 | 0.00 | 0.05 | 60 |
+| 2 | 4 161 | 1.85 | 1 806 | 5 ms | 7 ms | 0.99 | 0.89 | 0.04 | 0.00 | 0.05 | 60 |
+| 4 | 2 095 | 3.67 | 3 146 | 5 ms | 7 ms | 1.14 | 1.03 | 0.06 | 0.01 | 0.05 | 60 |
+| 8 | 1 030 | 7.46 | 4 852 | 7 ms | 9 ms | 1.51 | 1.35 | 0.09 | 0.01 | 0.05 | 60 |
+| 16 | 516 | 14.88 | 6 133 | 12 ms | 18 ms | 2.37 | 2.00 | 0.15 | 0.03 | 0.19 | 60 |
+| 32 | 258 | 29.77 | **7 181** | 19 ms | 27 ms | 4.01 | 3.14 | 0.33 | 0.07 | 0.47 | 60 |
+| 64 | 245 | 31.35 | 6 917 | **286 ms** | 314 ms | 4.32 | 3.06 | 0.47 | 0.11 | 0.68 | 60 |
 
 The kernel column is flat now, and both discontinuities that used to be in this
 table are gone. Getting them out took two changes to the engine's dispatch
@@ -54,11 +61,11 @@ are what that cost and what it bought.
 serving requests one at a time means, and the first row confirms the accounting:
 exactly one step per token, mean batch 1.00.
 
-**Thirty-two need 273.** Same work, 28× fewer trips through the model, and
-seven times the throughput of a single client.
+**Thirty-two need 258.** Same work, 30× fewer trips through the model, and
+eight times the throughput of a single client.
 
-**Sixty-four is the wall.** Throughput is still creeping up, but the median time
-to first token goes from 23 ms to 246 ms. With `-max-batch 32`, half the clients
+**Sixty-four is the wall.** Throughput stops rising — 7 181 to 6 917, inside the
+noise — while the median time to first token goes from 19 ms to 286 ms. With `-max-batch 32`, half the clients
 are waiting for a seat at any moment, and waiting is most of what the extra
 concurrency buys them. On a throughput chart alone these last two rows look like
 progress. Only the tail says otherwise.
@@ -310,18 +317,38 @@ answer.
 
 | | batch 1 | batch 8 | batch 32 |
 |---|---|---|---|
-| model, including the copy off the device | 0.89 ms | 1.50 ms | 3.39 ms |
-| sampling, 120-way softmax per row | 0.00 ms | 0.01 ms | 0.06 ms |
-| filling the (n, 64) tensor | 0.00 ms | 0.00 ms | 0.01 ms |
-| **the pipe** | **0.04 ms** | **0.03 ms** | **0.35 ms** |
-| pipe as a share of the step | 4.3% | **1.9%** | **9.2%** |
+| the model's own kernels | 0.92 ms | 1.35 ms | 3.14 ms |
+| pulling the logits off the device | 0.04 ms | 0.09 ms | 0.33 ms |
+| sampling, 120-way softmax per row | 0.00 ms | 0.01 ms | 0.07 ms |
+| **the pipe** | **0.05 ms** | **0.05 ms** | **0.47 ms** |
+| pipe as a share of the step | 5.0% | **3.3%** | **12%** |
 
-The pipe costs a twenty-fifth of a millisecond at small batches and about a
-third at thirty-two, because the frame it carries is `n × 64 × 4` bytes — 256
-bytes at batch 1, 8 KB at batch 32. Its share peaks near 9%, and it gets there
-because the model's own time grows more slowly than the frame does.
+The pipe costs a twentieth of a millisecond at small batches and about half at
+thirty-two, because the frame it carries is `n × 64 × 4` bytes — 256 bytes at
+batch 1, 8 KB at batch 32. Its share reaches 12%, and it gets there because the
+model's own time grows more slowly than the frame does.
 
-Nine percent is the price of not being able to link the engine into the server.
+### The copy is mostly waste, and less waste than it looked
+
+`copy` is its own column because of what it pulls. The worker asks for the
+logits with `logits.data()`, which brings back `(n, 64, vocab)` — every position
+of every window — and then samples from one row of each: the last. **Sixty-three
+sixty-fourths of that transfer is for nothing**, on every step.
+
+Sixty-four times too much data sounds like the headline finding, which is why it
+was measured before it was described. It is 0.04 ms at batch 1 and 0.33 ms at
+batch 32: **between 4% and 8% of a step**. Real, worth removing, and not the
+biggest thing wrong with this server. A claim inspected in the source and a
+claim measured are different claims, and reading the code was enough to find it
+and not enough to size it.
+
+Removing it needs a device-side slice, which the engine does not have —
+`Tensor::slice` goes through `data()`, so slicing after the forward copies
+everything down and then throws it away. That is a change in
+`cpp-ai-engine`, listed under Next with the 8% next to it rather than an
+adjective.
+
+Twelve percent is the price of not being able to link the engine into the server.
 It is worth knowing rather than assuming, and it is small enough that the
 [reason for the process boundary](#why-the-model-runs-in-another-process) still
 holds.
@@ -354,50 +381,100 @@ rather than with tokens a second.
 
 ---
 
-## The property that makes it correct
+## The property that makes it correct, and how far it goes
 
-Continuous batching is only worth anything if a sequence cannot tell it
-happened. The window is 64 ids wide, so a batch of *n* is one `(n, 64)` tensor,
-and a scheduler bug — a window padded from the wrong end, two rows crossed, the
-wrong sequence advanced — produces text that is subtly wrong rather than an
-error that is obviously wrong. Nothing crashes. The output is just not what that
-request asked for.
+Two claims live here and they are not equally strong. Keeping them apart is the
+point of this section.
 
-So it is tested directly, twice.
+**The scheduler guarantees isolation.** Each sequence carries its own history,
+its own temperature and its own seed, and the sampler is a fresh
+`mt19937_64(seed)` per row. No row can read another's state, at any batch size,
+on any hardware. That is structural and it is what the tests below hold the code
+to.
+
+**The arithmetic does not guarantee bit-identical logits.** A batch of *n* is a
+different matrix product from a batch of one, and the engine picks its matmul
+kernel from `rows = n × 64` with a cut at 128 — so a batch of one and a batch of
+two do not even run the same kernel. Different reduction order, different last
+bit. The sampler draws by walking an inverse CDF, so a one-ULP difference near a
+boundary flips a token, and from there the sequences part.
+
+So the honest statement is: **isolation is guaranteed, identity is measured.**
 
 `TestBatchingDoesNotChangeOutput` runs against the mock, whose next token is a
 hash of the entire window: run a request alone, keep the text, run it again
 while eight neighbours join and leave around it on a backend with different
-timings, and compare character for character.
+timings, compare character for character. That one is bit-exact by construction
+and catches every scheduler bug — a crossed row, a window padded from the wrong
+end, the wrong sequence advanced.
 
 `TestBatchingDoesNotChangeOutputOnTheRealModel` runs the same shape against the
-engine, and it exists because the mock cannot fail the way the GPU can. A matrix
-product tiled for a batch of one need not reduce in the same order as the same
-product tiled for a batch of thirty-two, and two logits within a float of each
-other could then land on different sides of the sampling threshold — a
-divergence from arithmetic rather than from a bug. **On this model and this card
-it does not happen**: 120 characters, identical, at a mean batch of 8.68 over
-121 steps.
+engine. **On this model and this card it comes out identical**: 120 characters,
+at a mean batch of 8.68 over 121 steps. One model, one card, one seed, 120
+draws. That is a strong empirical result and it is not a proof, and an earlier
+version of this page opened by calling it one.
 
-Given the section above, that comparison was sharper than it was designed to be
-when it was written: at the time, the run on its own executed on the CPU and the
-batched run executed on the card, so it was quietly comparing two arithmetic
-implementations. Lowering the threshold put both runs on the card and turned it
-back into a test of the scheduler alone — which is what it was meant to be, and
-why the CPU-versus-CUDA comparison now has a test of its own rather than
-happening by accident.
+What would make it a guarantee is padding every batch to a fixed width so the
+kernel and the reduction order never change — at the cost of computing rows
+nobody asked for. What would make the measurement honest at scale is a
+divergence *rate* over 10⁵ draws across batch sizes rather than one comparison.
+The second is the more interesting number and neither is done.
 
-Both tests also assert that the sequences really did share steps. An earlier
-version of the first one passed while batching nothing at all — the backend was
-fast enough that each request finished before the next arrived, mean batch 1.00,
+`TestTheCPUAndGPUPathsAgree` is the sharper version of the same idea, and it
+exists because lowering the matmul threshold had to be safe before it could be a
+default: the same 200 characters generated once entirely on the host and once on
+the card, by two different implementations of the same model. Identical. Two
+hundred sequential draws from independently computed logits, none landing
+differently.
+
+Both batching tests also assert the sequences really did share steps. An earlier
+version of the first passed while batching nothing at all — the backend was fast
+enough that each request finished before the next arrived, mean batch 1.00,
 invariant trivially satisfied, nothing proved.
 
 The GPU tests skip unless `BRAID_WORKER` and `BRAID_MODEL` are set, which CI has
-neither of. If they are set and wrong, the tests fail rather than skip: an
-earlier version skipped on a bad path and reported a green run for a test that
-never started.
+neither of. If they are set and wrong, they fail rather than skip: an earlier
+version skipped on a bad path and reported a green run for a test that never
+started.
 
 ---
+
+## The failure that a dead process cannot stand in for
+
+A worker that dies closes its pipe and the next read fails at once. That is the
+easy failure, it is what the chaos tests kill, and it was the only one this
+server survived.
+
+A worker that is **alive and silent** — a wedged kernel, a driver reset that
+leaves the process up — holds the pipe open, and a pipe read has no timeout of
+its own. `Backend.Step` had no context and no deadline, so that read blocked the
+scheduler's single goroutine forever: every request behind it stalled, every new
+one queued, and `/healthz` went on answering that the server was fine. It was
+the worst bug in this repository and nothing in it could have found it, because
+every test killed processes rather than freezing them.
+
+`Step` now takes a context and each worker enforces its own ceiling. On expiry
+the process is killed rather than abandoned, and that is not tidiness: the
+protocol carries no request identifier, so a worker that answered late would
+answer the *next* step with this step's ids and nothing could notice. Killing it
+turns a hang into a death, which is a failure the pool already knows how to
+handle — failed over, restarted, transparent.
+
+Two tests hold it, both in CI, neither needing a GPU. The fake worker grew a
+`hang` mode: read the frame, answer never, stay alive. One asserts a single
+worker gives up on time and that the process is gone afterwards — checked by
+closing it, since there is no portable "is this pid alive", and a `Close` that
+returns promptly is proof the kill landed. The other hangs every worker in a
+pool at once, which is the correlated failure that actually happens when they
+share a card, and asserts the server digs itself out rather than staying dead.
+
+Writing the `hang` mode took two attempts. The first parked the fake in
+`select{}`, which the Go runtime calls a deadlock and answers by killing the
+process — producing the immediate EOF the mode existed to avoid. The assertion
+caught it. A weaker one would have passed.
+
+---
+
 
 ## Why the model runs in another process
 
@@ -409,7 +486,7 @@ A pipe has no ABI to disagree about. `braid_worker` is a C++ process that owns
 the model and answers step requests over stdin and stdout in a fixed binary
 frame; the Go side writes `n` windows and reads `n` ids back, plus the three
 timings and the kernel count it needs to say where the step went. It costs
-[about nine percent at batch 32](#where-a-step-actually-goes).
+[about twelve percent at batch 32](#where-a-step-actually-goes).
 
 What falls out of it is the shape the next phase needs: a worker is a thing that
 can be killed.
@@ -436,6 +513,58 @@ a caller that reads nothing at all still completes, buffered, paying for itself
 in memory and costing its batch neighbours nothing. `MaxTokensLimit` bounds that
 memory, and bounds how long one sequence can hold a seat in the batch — the same
 number doing both jobs.
+
+---
+
+## What the server says about itself
+
+`/stats` reports the scheduler's counters, the step breakdown when the backend
+can produce one, the pool when there is one, and **its own latency**:
+
+```json
+{"samples": 1024, "window": 1024,
+ "ttft_p50_ms": 2.659, "ttft_p95_ms": 250.669, "ttft_p99_ms": 278.05,
+ "total_p50_ms": 125.92, "total_p95_ms": 508.747, "total_p99_ms": 544.796}
+```
+
+That last part was missing for longer than it should have been. A comment in
+`stats.go` said *"a server that computes its own averages is a server that hides
+its tail"* — and the file it was written in exposed counters and a mean batch
+size. The percentiles lived only in the load harness, which meant this server
+could describe its own tail only while somebody was benchmarking it, which is
+exactly when a tail matters least.
+
+A window of the last 1 024 completions rather than a lifetime, because a p99
+over every request since boot is a number an hour of good service cannot move
+and an incident an hour ago never leaves. Rejections are kept out of it: they
+have no time to first token, and counting them as zero would drag every
+percentile down precisely when the server is overloaded and the tail is the only
+thing worth reading.
+
+---
+
+## How this was built
+
+With heavy AI assistance, the same as
+[cpp-ai-engine](https://github.com/DanielPastor05/cpp-ai-engine#how-this-was-built),
+and it is said here for the same reason: a reader who works it out for
+themselves has been told something the author would rather they had not noticed.
+
+What that does and does not mean, as precisely as it can be put:
+
+The design decisions are mine and they are the part worth reading — a stateless
+worker so failover is a retry, one goroutine so the batch has no locking to get
+wrong, a `Backend` seam narrow enough to test the scheduler with no model
+present. So is the discipline the measurements are held to: every number on this
+page was produced by running the thing, several of them contradicted what I
+expected, and the ones that turned out wrong were corrected in place rather than
+quietly replaced.
+
+Three of those corrections are still on this page on purpose. A speedup credited
+to the wrong change and fixed upstream in a second pull request. A 2.6× that was
+forward-time only and is 1.9× end to end. A 64× over-copy that reads like a
+catastrophe in the source and measures at 8%. Leaving them visible is the only
+way the rest of the numbers mean anything.
 
 ---
 
@@ -491,18 +620,33 @@ server whose numbers end up pasted somewhere.
 
 ## Next
 
-1. **Split a batch across workers.** Today a pool is redundancy, not capacity:
-   the scheduler steps serially and the other workers idle. Splitting is worth
-   doing across GPUs and pointless on one, so it wants a second card before it
-   wants code.
-2. **A KV cache.** The engine recomputes the full 64-id window every step. Now
-   that a step is broken down there is something to measure a cache against, and
-   the kernel and transfer counts say where it would and would not help. It
-   would also cost the property that makes failover free, which is worth
-   measuring before it is spent.
-3. **Get the embedding and the positional add onto the card.** They are what
+Ordered by what a measurement says, not by what sounds impressive.
+
+1. **A device-side slice, in the engine.** The worker pulls `(n, 64, vocab)` off
+   the card and reads one row of each. Worth
+   [4% to 8% of a step](#the-copy-is-mostly-waste-and-less-waste-than-it-looked),
+   and it cannot be done from here: `Tensor::slice` goes through `data()`.
+2. **Serve a model that is not a toy.** 172 728 parameters, a 64-id context and
+   a 120-character vocabulary mean the GPU is never the constraint and none of
+   these numbers transfer to anything larger. Everything else on this list is
+   worth less than this one.
+3. **A KV cache**, and publishing what it costs: the stateless worker is what
+   makes failover a retry, and a cache is state. That trade, measured, is more
+   interesting than the speedup.
+4. **A divergence rate for the batching invariant**, over 10⁵ draws across batch
+   sizes, instead of one 120-character comparison. Turns a strong empirical
+   claim into a number.
+5. **Split a batch across workers.** Today a pool is redundancy and not
+   capacity; splitting is worth doing across GPUs and pointless on one, so it
+   wants a second card before it wants code.
+6. **Move the load generator off the machine under test.** The 64-client row is
+   the only figure here with a spread worth apologising for, and its sixty-four
+   goroutines share a CPU with the server and the worker.
+7. **Get the embedding and the positional add onto the card.** They are what
    leaves the first LayerNorm's input on the host, which is why the residency
-   clause is still latent and why the floor has to be lowered instead.
-4. **Make the 64-client row reproducible.** It is the only figure on this page
-   with a spread worth apologising for, and running the load generator off the
-   machine under test is the obvious first thing to try.
+   clause upstream is still latent and the floor has to be lowered instead.
+
+Not on this list, deliberately: authentication, TLS and rate limiting. This
+serves a character model on a desk, and adding them would be theatre — the
+honest version is that it should not be exposed to anything, and that is a
+sentence rather than a feature.
