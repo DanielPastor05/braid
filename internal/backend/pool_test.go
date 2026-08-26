@@ -307,3 +307,34 @@ func TestAPoolRecoversWhenEveryWorkerHangsAtOnce(t *testing.T) {
 	}
 	t.Errorf("the pool never served again after every worker hung: %+v", pool.PoolStats())
 }
+
+// TestClosingAHungWorkerDoesNotBlockTheCloser is the hole the first version of
+// the timeout fix left behind.
+//
+// retire() closes a dead worker from the scheduler's own goroutine, and Close
+// asks a worker to stop by closing its stdin. A worker wedged in a kernel call
+// is not reading its stdin to be asked, so an unbounded Wait there is the same
+// hang the deadline was added to remove -- reached by a different route, from
+// the same goroutine, with the same consequence.
+func TestClosingAHungWorkerDoesNotBlockTheCloser(t *testing.T) {
+	exe, prefix := startFake(t, "hang:0")
+	w, err := NewWorker(exe, prefix, WorkerOptions{StepTimeout: time.Hour}, quiet())
+	if err != nil {
+		t.Fatalf("starting the fake: %v", err)
+	}
+
+	// Wedge it: one step it will never answer, abandoned by cancelling rather
+	// than by waiting out an hour.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, _ = w.Step(ctx, [][]int32{oneWindow(1)}, []float32{0.7}, []uint64{1})
+
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close() }()
+
+	select {
+	case <-closed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Close never returned on a worker that ignores its stdin")
+	}
+}

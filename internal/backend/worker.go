@@ -102,6 +102,12 @@ const (
 	// fires only for a process that has stopped answering rather than one
 	// having a bad day.
 	defaultStepTimeout = 30 * time.Second
+
+	// reapGrace bounds every wait on a process that is supposed to be dying.
+	// The first version of the timeout fix waited on the reaper without one,
+	// which fixed the hang for the case where the kill lands and reproduced it
+	// exactly for the case where it does not.
+	reapGrace = 5 * time.Second
 )
 
 // WorkerOptions tunes the engine inside the worker.
@@ -337,7 +343,16 @@ func (w *Worker) Step(ctx context.Context, windows [][]int32, temperatures []flo
 		// goroutine unblocks on the broken pipe, and a pool treats it as the
 		// death it now is.
 		w.killLocked()
-		<-done // reaped, so nothing is left writing to w.frame
+
+		// Bounded, because the reap is the same unbounded wait this whole
+		// change exists to remove -- one layer down. If the kill somehow does
+		// not land, leaking a goroutine is the cheaper failure: it holds this
+		// worker's buffers, and this worker is about to be retired and never
+		// stepped again, while blocking here would hold the scheduler.
+		select {
+		case <-done:
+		case <-time.After(reapGrace):
+		}
 		return nil, fmt.Errorf("backend: the worker did not answer within %v: %w",
 			w.stepTimeout, ctx.Err())
 	}
@@ -447,11 +462,35 @@ func (w *Worker) Close() error {
 	w.closed = true
 
 	if err := w.stdin.Close(); err != nil {
-		_ = w.cmd.Process.Kill()
-		return fmt.Errorf("backend: closing the worker's stdin: %w", err)
+		w.killLocked()
 	}
-	if err := w.cmd.Wait(); err != nil {
-		return fmt.Errorf("backend: the worker exited badly: %w", err)
+
+	// Closing stdin asks the worker to stop, and a worker wedged in a kernel
+	// call is not reading its stdin to be asked. Waiting on that unconditionally
+	// would block whoever is closing -- and retire() closes from the scheduler's
+	// own goroutine, so an unbounded Wait here is the hang again by another
+	// route. Ask, then insist, then give up and say so.
+	done := make(chan error, 1)
+	go func() { done <- w.cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("backend: the worker exited badly: %w", err)
+		}
+		return nil
+	case <-time.After(reapGrace):
 	}
-	return nil
+
+	w.killLocked()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("backend: the worker had to be killed to stop: %w", err)
+		}
+		return nil
+	case <-time.After(reapGrace):
+		return fmt.Errorf("backend: the worker would not exit within %v of being killed",
+			reapGrace)
+	}
 }
