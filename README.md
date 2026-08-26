@@ -32,6 +32,7 @@ answer, and this page tries hard not to blur the two.
 | **A worker hung mid-step** | killed on a deadline and failed over; before that it stopped the server for good |
 | **Landed upstream** | three PRs on the engine, all measured, one of them a correction to another |
 | **The bug none of that caught** | every window was padded at the wrong end, and [no measurement here could have told me](#the-bug-no-number-could-have-shown-me) |
+| **What a KV cache would buy** | [33x at thirty-two clients, 2.7x at one](#what-a-kv-cache-is-worth-here-before-building-one) - the floor is 177 kernel launches, not arithmetic |
 
 ---
 
@@ -288,6 +289,68 @@ arrived, mean batch 1.00, invariant trivially satisfied, nothing proved.
 
 ---
 
+## What a KV cache is worth here, before building one
+
+The model recomputes all 256 positions every step and the sampler reads one row
+of the result. A KV cache would keep the keys and values already computed and run
+the projections and the feed-forward over the single new position — on paper a
+256x cut in arithmetic, since attention is about a tenth of the FLOPs at this
+geometry and the rest is per-position.
+
+It is not 256x, and the reason is worth the benchmark. `braid_bench_decode` runs
+the same weights over a window of *S* positions instead of 256, with every
+operation forced onto the card so the sweep compares window sizes rather than
+execution paths:
+
+| batch | 256 positions | window ≤ 64 | ceiling |
+|---|---|---|---|
+| 1 | 6.41 ms | 2.33 ms | **2.7x** |
+| 8 | 21.26 ms | 2.30 ms | **9.3x** |
+| 32 | 83.83 ms | 2.52 ms | **33.3x** |
+
+**The floor is the same ~2.4 ms at every batch size.** It is 177 kernel launches,
+and a launch does not care how much work it carries: 2.4 ms over 177 is 13 µs
+each. A cache makes the kernels smaller, not fewer. So the win is 33x to a full
+batch, 2.7x to a single client, and 256x to nobody.
+
+That is the shape of the whole project in one table. At a batch of one this
+server is not compute-bound and never was — it is bound by how fast 177 kernels
+can be launched — so the optimisation that removes 99.6% of the arithmetic buys
+2.7x. At a batch of thirty-two the arithmetic is real and removing it buys 33x.
+**Batching and caching are not two optimisations, they are the same one measured
+from two ends**, and neither is worth anything without the other.
+
+And one more thing falls out. Run the same sweep with the engine's *own* dispatch
+defaults instead of forcing the card:
+
+| batch | 256 positions | window = 1 | kernels at 256 → 1 | ceiling |
+|---|---|---|---|---|
+| 1 | 6.43 ms | 3.95 ms | 176 → **0** | 1.6x |
+| 8 | 22.21 ms | 6.64 ms | 176 → **30** | 3.3x |
+| 32 | 78.48 ms | 4.66 ms | 177 → **138** | 16.8x |
+
+A narrow window is small work, small work falls below the engine's floors, and
+the forward lands back on the CPU — the batch-1 decode launches **zero** kernels.
+[Those floors were moved for this repository three times already](#what-the-small-model-was-hiding),
+and the bigger model made all three inert. A KV cache would make them live again,
+for the opposite reason: not because the model is small, but because the cache
+made the step small. The pull requests stop being history.
+
+```bash
+cmake --build build --target braid_bench_decode
+```
+
+```bash
+ENGINE_CUDA_MIN_FLOPS=1 ENGINE_CUDA_MIN_ELEMENTS=1 ENGINE_CUDA_MIN_LAYERNORM=1 ./build/braid_bench_decode models/charlm 100
+```
+
+A cached decode is not exactly a forward at *S*=1 — its attention still reads the
+256 cached keys this does not, about 0.4 ms at a batch of 32 against a 2.5 ms
+floor. So the table is a ceiling, and a close one. The cache itself is next; this
+is what it has to beat.
+
+---
+
 ## Killing a worker under load
 
 `-workers N` puts a pool behind the scheduler. The scheduler does not know: a
@@ -461,7 +524,7 @@ cmd/braidload/      the load harness that printed the tables
 internal/sched/     the loop: admission, batching, cancellation, stats, latency
 internal/backend/   the seam -- Backend is six methods; Mock, Worker and Pool implement them
 internal/api/       HTTP and server-sent events
-engine/             the C++ side: the model, the trainer, the worker process
+engine/             the C++ side: the model, the trainer, the worker process, the decode benchmark
 third_party/        cpp-ai-engine, pinned as a submodule
 ```
 
@@ -506,18 +569,18 @@ server whose numbers end up pasted somewhere.
 
 Ordered by what a measurement says.
 
-1. **A KV cache**, and publishing what it costs. The model recomputes the full
-   256-id window every step, which is now most of the 6.6 ms a batch-1 step
-   takes. Moving the padding to the right was the precondition and is done — a
-   token's position is now fixed for the life of a sequence up to the full 256,
-   and a cache keyed by position is worthless without that. Beyond 256 the window
-   slides and every position changes again, which is the honest boundary of what
-   a cache can be here. The interesting part is not the speedup: the stateless
-   worker is what
-   makes failover a retry with the same bytes, and a cache is state. The good
-   answer is a cache that is not authoritative — the scheduler still holds the
-   history, so a new worker can rebuild it with a prefill — and the deliverable
-   is what that prefill costs, measured against the failover table above.
+1. **A KV cache.** [What it is worth is already measured](#what-a-kv-cache-is-worth-here-before-building-one):
+   33x at a batch of thirty-two, 2.7x at one, bounded by a 2.4 ms launch floor.
+   Two things are done: moving the padding to the right, without which a token's
+   position changes every step and a cache keyed by position is worthless; and
+   the benchmark that says what the cache has to beat. What is left is the engine
+   change — `MultiHeadAttention::forward` takes the whole `(batch, seq, d_model)`
+   and has no incremental path, so this is the fourth pull request upstream.
+   The interesting part is not the speedup: the stateless worker is what makes
+   failover a retry with the same bytes, and a cache is state. The good answer is
+   a cache that is not authoritative — the scheduler still holds the history, so
+   a new worker can rebuild it with a prefill — and the deliverable is what that
+   prefill costs, measured against the failover table above.
 2. **Compare against a real serving system.** `cpp-ai-engine` opens with "1.70×
    slower than PyTorch, and that is the number worth publishing." This page
    compares against nothing. The same model and the same weights behind a minimal

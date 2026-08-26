@@ -26,3 +26,11 @@ target_include_directories(braid_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(braid_train train.cpp)
 target_link_libraries(braid_train PRIVATE engine)
 target_include_directories(braid_train PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# What a KV cache could win, measured before one exists. Not part of serving:
+# it loads the same checkpoint and times the model over narrower windows, which
+# is the cheapest honest answer to whether the engine change behind a real cache
+# is worth making.
+add_executable(braid_bench_decode bench_decode.cpp)
+target_link_libraries(braid_bench_decode PRIVATE engine)
+target_include_directories(braid_bench_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
