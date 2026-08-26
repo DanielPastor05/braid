@@ -146,10 +146,19 @@ type timed interface {
 	Timings() backend.Timings
 }
 
+// pooled is what a backend implements when it is more than one process and some
+// of them may have died since the server started.
+type pooled interface {
+	PoolStats() backend.PoolStats
+}
+
 func (s *Server) stats(w http.ResponseWriter, _ *http.Request) {
 	payload := map[string]any{"scheduler": s.sched.Stats()}
 	if t, ok := s.backend.(timed); ok {
 		payload["step"] = t.Timings()
+	}
+	if p, ok := s.backend.(pooled); ok {
+		payload["pool"] = p.PoolStats()
 	}
 	writeJSON(w, http.StatusOK, payload)
 }

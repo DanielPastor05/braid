@@ -19,6 +19,7 @@ real model on the GPU, not only asserted.
 | **Two engine thresholds moved** | matmul 2²² → 2²⁰ (**3.5×** at one client), LayerNorm 2¹⁵ → 2 048 (**1.4–1.9×** at one to five) |
 | **CPU and CUDA paths** | 200 characters identical, sampled independently |
 | **Batching invariance** | identical output alone and at mean batch 8.68, on the GPU |
+| **A worker killed mid-load** | 512 requests, **0 failed**, tail unmoved — workers hold no state |
 | **Landed upstream** | three PRs on the engine: the residency clause, the correction to it, and the floor becoming a threshold |
 
 ---
@@ -233,6 +234,56 @@ to five beat it in both directions.
 column alone suggested. A step is more than its forward.
 ---
 
+## Killing a worker under load
+
+`-workers N` puts a pool behind the scheduler. The scheduler does not know: a
+`Pool` is a `Backend` like any other, and nothing in `internal/sched` changed to
+support this.
+
+That is not luck. **A worker holds no state between steps.** The sequence's
+history lives in the scheduler and every step sends the whole 64-id window, so
+there is no cache to rebuild and no session to migrate — a step that fails on
+one worker is asked of the next, with the same bytes, and the caller cannot tell.
+A server that kept the context on the card would have to choose between
+rebuilding it elsewhere and failing the request.
+
+512 generations of 200 tokens at sixteen clients, twice, against the same server:
+
+| | requests | tokens/s | TTFT p50 | TTFT p95 | failed |
+|---|---|---|---|---|---|
+| nothing dies | 512 | 7 246 | 11 ms | 17 ms | 0 |
+| one worker killed mid-run | 512 | 7 281 | 11 ms | 18 ms | **0** |
+
+`Stop-Process -Force`, not a signal: a signal would exercise the shutdown path,
+which is not the path in question. The server discovers it as a failed write to
+a pipe it had every reason to expect to work — which is what an OOM kill or a
+driver reset looks like from inside.
+
+**One death, one failover, one restart, and the tail did not move.** The blast
+radius of a worker dying is exactly one step, because the scheduler advances the
+batch one step at a time and that worker was holding exactly one. It is worth
+being clear that this is a consequence of the design rather than a recovery
+mechanism that had to be engineered: there was nothing to lose, so nothing was
+lost.
+
+### What a pool is not
+
+**It is not capacity.** The scheduler steps serially, so at any instant one
+worker is computing and the rest are idle — three workers reach the same
+throughput as one, which the table above shows by matching the single-worker
+number to within noise. The pool buys redundancy and nothing else on one card.
+
+Making it capacity means splitting a batch across workers and waiting for all of
+them, which is worth doing when they are on different GPUs and pointless when
+they share one. That is the shape of the next change, not this one.
+
+The chaos test refuses to pass quietly: if the kill lands between steps and no
+failover is recorded, it fails rather than reporting a clean run. An earlier
+version of the shell harness killed a stray worker left over from an earlier
+run, and produced a beautiful table of a death that never happened.
+
+---
+
 ## Where a step actually goes
 
 The worker times itself between finishing the read and starting the write, and
@@ -425,15 +476,18 @@ server whose numbers end up pasted somewhere.
 
 ## Next
 
-1. **Keep the chain resident through `reshape` and `transpose`.** They are what
-   break it before a LayerNorm ever sees a device tensor, which is why the
-   residency clause from #2 is still latent. Fixing them is what would make it
-   pay, and would let the floor go back up.
+1. **Split a batch across workers.** Today a pool is redundancy, not capacity:
+   the scheduler steps serially and the other workers idle. Splitting is worth
+   doing across GPUs and pointless on one, so it wants a second card before it
+   wants code.
 2. **A KV cache.** The engine recomputes the full 64-id window every step. Now
    that a step is broken down there is something to measure a cache against, and
-   the kernel and transfer counts say where it would and would not help.
-3. **A router and more than one worker**, then `kill -9` one under load and
-   publish the recovery curve.
+   the kernel and transfer counts say where it would and would not help. It
+   would also cost the property that makes failover free, which is worth
+   measuring before it is spent.
+3. **Get the embedding and the positional add onto the card.** They are what
+   leaves the first LayerNorm's input on the host, which is why the residency
+   clause is still latent and why the floor has to be lowered instead.
 4. **Make the 64-client row reproducible.** It is the only figure on this page
    with a spread worth apologising for, and running the load generator off the
    machine under test is the obvious first thing to try.

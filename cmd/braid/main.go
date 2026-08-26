@@ -1,10 +1,15 @@
 // Command braid serves the character-level language model from cpp-ai-engine
 // behind one continuously batched scheduler.
 //
-// There is no engine wired in yet: this build runs against the mock backend,
-// which produces deterministic nonsense at a configurable cost per step. It is
-// enough to exercise the scheduler, the HTTP surface and the load harness, and
-// it is labelled everywhere it appears so that no number taken from it is ever
+// -worker names the process that holds the model, and -workers how many of them
+// to run: more than one is redundancy rather than capacity, because the
+// scheduler advances the batch one step at a time and only one worker computes
+// at a time.
+//
+// Without -worker it runs against the mock backend, which produces
+// deterministic nonsense at a configurable cost per step. That is enough to
+// exercise the scheduler, the HTTP surface and the load harness, and it is
+// labelled everywhere it appears so that no number taken from it is ever
 // mistaken for a number about the model.
 package main
 
@@ -12,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,6 +37,7 @@ func main() {
 		maxTokens = flag.Int("max-tokens", 1024, "longest generation a caller may ask for")
 		worker    = flag.String("worker", "", "path to braid_worker; empty runs the mock backend")
 		model     = flag.String("model", "models/charlm", "checkpoint prefix the worker loads")
+		workers   = flag.Int("workers", 1, "how many worker processes to run behind the scheduler")
 		// The engine's own default is 2^22, which keeps a batch of one entirely
 		// on the CPU at this model's size: zero kernels launched. 2^20 was
 		// measured, not guessed -- it is where the gain flattens out, and it
@@ -69,16 +76,30 @@ func main() {
 		kind string
 	)
 	if *worker != "" {
-		w, err := backend.NewWorker(*worker, *model, backend.WorkerOptions{
+		opts := backend.WorkerOptions{
 			MinMatmulFlops:       *minFlops,
 			MinElements:          *minElems,
 			MinLayerNormElements: *minLayerNorm,
-		}, log)
-		if err != nil {
-			log.Error("the worker would not start", "error", err, "worker", *worker, "model", *model)
-			os.Exit(1)
 		}
-		be, kind = w, "worker"
+		// One worker is a Worker rather than a Pool of one. The pool's failover
+		// has nowhere to go with a single process, and a plain worker makes that
+		// visible in the log line instead of implying a redundancy that is not
+		// there.
+		if *workers > 1 {
+			p, err := backend.NewPool(*worker, *model, *workers, opts, log)
+			if err != nil {
+				log.Error("the pool would not start", "error", err, "worker", *worker, "model", *model)
+				os.Exit(1)
+			}
+			be, kind = p, fmt.Sprintf("pool of %d", *workers)
+		} else {
+			w, err := backend.NewWorker(*worker, *model, opts, log)
+			if err != nil {
+				log.Error("the worker would not start", "error", err, "worker", *worker, "model", *model)
+				os.Exit(1)
+			}
+			be, kind = w, "worker"
+		}
 	} else {
 		mock := backend.NewMock()
 		mock.Base = *stepBase

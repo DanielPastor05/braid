@@ -182,6 +182,17 @@ func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*W
 	return w, nil
 }
 
+// Pid is the worker process's id, or 0 once it has been closed. The pool hands
+// these out so that a test can kill one the way the operating system would.
+func (w *Worker) Pid() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.cmd == nil || w.cmd.Process == nil {
+		return 0
+	}
+	return w.cmd.Process.Pid
+}
+
 func (w *Worker) SeqLen() int    { return w.seqLen }
 func (w *Worker) VocabSize() int { return len(w.alphabet) }
 
