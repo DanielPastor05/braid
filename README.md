@@ -24,50 +24,44 @@ answer, and this page tries hard not to blur the two.
 |---|---|
 | **Model** | the Transformer from `cpp-ai-engine`, **10 758 289 parameters**, 6 blocks, 384 wide, 256-id context, 145-symbol byte alphabet, 0.97 bits/char |
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
-| **Throughput** | 144 tokens/s at one client, **354 at sixteen** - median of three |
-| **What batching buys** | **2.5x**, and it saturates at sixteen clients |
-| **Where a step goes at batch 32** | 81.8 ms model, 1.9 ms copy back, 0.06 ms sampling |
+| **Throughput** | 192 tokens/s at one client, **2 363 at thirty-two** - median of three |
+| **What batching buys** | **12.3x**, and what stops it is the batch limit, not the card |
+| **Where a step goes at batch 32** | 12.2 ms model, 0.18 ms copy back, 0.05 ms sampling |
 | **Batching invariance** | 0 divergences in 25 000 draws - a bound, not a guarantee |
 | **A worker killed mid-load** | 0 requests failed; workers hold no state |
 | **A worker hung mid-step** | killed on a deadline and failed over; before that it stopped the server for good |
 | **Landed upstream** | three PRs on the engine, all measured, one of them a correction to another |
 | **The bug none of that caught** | every window was padded at the wrong end, and [no measurement here could have told me](#the-bug-no-number-could-have-shown-me) |
-| **What a KV cache would buy** | [33x at thirty-two clients, 2.7x at one](#what-a-kv-cache-is-worth-here-before-building-one) - the floor is 177 kernel launches, not arithmetic |
+| **The optimisation that mattered** | [not computing the padding](#the-two-hundred-and-fifteen-positions-nobody-read): 5.9x, and only possible once the padding moved |
+| **The one that did not** | a KV cache keyed by position could serve [2% of steps](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one) - batching puts every row at a different position |
 
 ---
 
 ## What batching buys, and where it stops paying
 
-96 generations of 30 tokens at each concurrency level. Every row is the median
+192 generations of 30 tokens at each concurrency level. Every row is the median
 of three sweeps, with the throughput range beside it.
 
-| clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | copy ms |
+| clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | kernels |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 2 880 | 1.00 | 144 (143-144) | 10 ms | 11 ms | 6.68 | 6.62 | 0.09 |
-| 2 | 1 485 | 1.94 | 221 (221-222) | 13 ms | 15 ms | 8.57 | 8.50 | 0.13 |
-| 4 | 744 | 3.87 | 280 (278-284) | 17 ms | 23 ms | 13.41 | 13.39 | 0.22 |
-| 8 | 373 | 7.72 | 334 (329-337) | 29 ms | 42 ms | 22.68 | 22.37 | 0.50 |
-| 16 | 187 | 15.40 | **353** (353-354) | 60 ms | 74 ms | 43.10 | 42.45 | 0.81 |
-| 32 | 94 | 30.64 | 354 (352-362) | **130 ms** | 146 ms | 85.93 | 81.77 | 1.87 |
+| 1 | 5 760 | 1.00 | 192 (189-197) | 7 ms | 11 ms | 4.93 | 4.89 | 140 |
+| 2 | 3 055 | 1.89 | 279 (275-287) | 13 ms | 17 ms | 6.59 | 6.58 | 140 |
+| 4 | 1 509 | 3.82 | 693 (691-698) | 11 ms | 16 ms | 5.40 | 5.32 | 169 |
+| 8 | 746 | 7.72 | 1 216 (1213-1224) | 11 ms | 15 ms | 6.18 | 6.07 | 175 |
+| 16 | 376 | 15.32 | 1 816 (1801-1859) | 18 ms | 21 ms | 8.27 | 8.07 | 175 |
+| 32 | 189 | 30.48 | **2 363** (2350-2374) | 28 ms | 39 ms | 12.56 | 12.15 | 175 |
+| 64 | 182 | 31.65 | 2 415 (2374-2496) | **408 ms** | 438 ms | 12.82 | 12.40 | 176 |
+| 128 | 184 | 31.30 | 2 360 (2311-2367) | **884 ms** | 1 267 ms | 13.08 | 12.68 | 176 |
 
-**Batching is worth 2.5x here, and it is finished by sixteen clients.** Those two
-rows were re-run on their own at five repeats in both sweep directions, because
-a three-repeat pass once put them 8% apart with the ranges not overlapping and
-that would have been the wrong conclusion:
+**Batching is worth 12.3x, and what stops it is not the card.** Look at the mean
+batch in the last three rows: 30.5, 31.7, 31.3, against a `MaxBatch` of 32. At
+sixty-four clients the batch is already as full as the scheduler will let it get,
+so the extra clients queue — the throughput does not move and the time to first
+token goes from 28 ms to 408 ms and then to 884 ms. That is a configuration
+ceiling, not a hardware one, and it is the next thing to sweep.
 
-| | 16 clients | 32 clients |
-|---|---|---|
-| ascending | 350 (344-354) | 357 (351-370) |
-| descending | 364 (347-365) | 363 (352-373) |
-
-They overlap in both directions. Thirty-two buys nothing measurable over sixteen
-and costs **1.9x the time to first token** (56-58 ms to 103-110 ms at p50).
-Sixteen is where this server should be configured to stop.
-
-**One client needs 2 880 forward passes for 2 880 tokens, sixteen need 187.**
-Thirty times fewer trips through the model for two and a half times the
-throughput, which is the whole shape of the thing: the trips are not free any
-more.
+**One client needs 5 760 forward passes for 5 760 tokens, thirty-two need 189.**
+Thirty times fewer trips through the model for twelve times the throughput.
 
 Reproduce it:
 
@@ -76,8 +70,56 @@ go run ./cmd/braid -worker ./build/braid_worker.exe -model models/charlm
 ```
 
 ```bash
-go run ./cmd/braidload -requests 96 -max-tokens 30 -repeat 3 -concurrency 1,2,4,8,16,32
+go run ./cmd/braidload -requests 192 -max-tokens 30 -repeat 3 -concurrency 1,2,4,8,16,32,64,128
 ```
+
+---
+
+## The two hundred and fifteen positions nobody read
+
+The table above used to end at 354 tokens/s. The difference is one change, and it
+is not a clever one.
+
+The model's context is 256 ids, so the scheduler hands the worker a 256-id window
+per sequence. A sequence is almost never 256 ids long: the load harness sends an
+eleven-character prompt and asks for thirty tokens, so a row grows from 11 to 41
+and the server's `mean_width` over a whole sweep is **29**. **The worker computed
+all 256 positions anyway** — for every row, on every step — and then read one row
+of the result per sequence.
+
+Now a step runs at the width of its longest row. The rest was padding, and its
+logits went nowhere.
+
+| clients | before | after | |
+|---|---|---|---|
+| 1 | 146 | 183 | 1.25x |
+| 2 | 211 | 268 | 1.27x |
+| 4 | 293 | 657 | 2.24x |
+| 8 | 340 | 1 119 | 3.29x |
+| 16 | 346 | 1 736 | 5.02x |
+| 32 | 373 | 2 194 | **5.88x** |
+
+Same configuration both ways, 96 generations of 30 tokens, median of three. The
+forward at a batch of thirty-two goes from 78.95 ms to 12.61 ms in that pair, and
+to 12.15 in the wider sweep above.
+
+**A shorter row is still correct at the batch's width.** Its own padding sits
+between its length and the width, and the causal mask at the position being
+sampled — `length-1` — reaches only `0..length-1`, which is all real ids. So the
+width can be the maximum rather than something every row has to agree on, which
+is what makes this usable at all under continuous batching.
+
+**It was only possible because the padding moved.** With the padding at the front
+the real ids were at the *end* of the row and there was no prefix to narrow to;
+[the fix that put them at the front](#the-bug-no-number-could-have-shown-me) was
+a correctness fix, and this fell out of it a day later.
+
+One more thing came back with it. At one and two clients a step now launches
+**140 kernels where a 256-wide step launched 176**: a narrow step is small work,
+and the engine keeps small work on the CPU on purpose. That is the same dispatch
+threshold this project [moved three times upstream](#what-the-small-model-was-hiding)
+and then declared inert, arriving from the other direction — not because the
+model is small, but because the step got small.
 
 ---
 
@@ -87,15 +129,24 @@ This repository spent most of its life serving a model of **172 728**
 parameters over a 64-id context, and almost everything it concluded from that
 was about the harness rather than about serving.
 
+Every figure in the right-hand column was taken at the full 256-position width,
+because that is what a step was when this was written. Five of them have since
+moved again, for a reason that has nothing to do with the model, and they are
+marked accordingly — [the section after this one](#the-two-hundred-and-fifteen-positions-nobody-read)
+is where they went.
+
 | | 172 728 params, 64 ctx | 10 758 289 params, 256 ctx |
 |---|---|---|
-| what batching buys | **7.5x** | **2.5x** |
-| where throughput saturates | 32 clients | **16 clients** |
-| forward, batch 1 -> 12 | 0.77 -> ~1.0 ms | **6.81 -> 30.36 ms** |
-| kernels per step | 0 to 60, discontinuous | **176, flat** |
+| what batching buys | **7.5x** | **2.5x** → now 12.3x |
+| where throughput saturates | 32 clients | **16 clients** → now 32 |
+| forward, batch 1 -> 12 | 0.77 -> ~1.0 ms | **6.81 -> 30.36 ms** → now 4.9 at one, 6.1 at eight |
+| kernels per step | 0 to 60, discontinuous | **176, flat** → now 140 at small batches |
 | PCIe crossings per step | 5 each way below batch 6 | **1 each way, always** |
-| the pipe, batch 32 | 0.68 ms, 12% of a step | **below the noise floor** |
-| engine CUDA thresholds | two of them had to be moved | **both inert** |
+| the pipe, batch 32 | 0.68 ms, 12% of a step | **below the noise floor** → now 1.4% |
+| engine CUDA thresholds | two of them had to be moved | **both inert** → live again |
+
+This section is about the model change, and the model change is what the
+left-to-middle comparison still describes correctly.
 
 Read the middle row first. The old forward went from 0.77 ms at a batch of one
 to about 1.0 ms at twelve: **nearly flat**, because there was not enough
@@ -108,8 +159,8 @@ Everything else in the table follows from that one fact:
 
 **The 7.5x was mostly an artifact.** Batching amortises fixed cost. When almost
 all of a step *is* fixed cost, batching looks spectacular. Give the GPU real
-work and the honest number is 2.5x - still worth having, and no longer the
-headline.
+work and the honest number was 2.5x - and it took a second look at what a step
+was actually computing to find the rest.
 
 **Both engine thresholds are now inert**, and that took three merged pull
 requests to discover was necessary and one bigger model to discover was
@@ -130,19 +181,29 @@ was wrong was believing the numbers described inference rather than describing a
 model too small to be inferred from. The fix was not a better measurement. It
 was a bigger model.
 
-### And the pipe stopped being measurable
+And the thresholds are not inert any more: a step narrowed to its longest row is
+small work again, so at one and two clients the engine keeps part of it on the
+CPU and the count drops to 140. The three pull requests went from necessary to
+moot to load-bearing, without anybody touching them.
 
-The process boundary cost 0.68 ms at a batch of thirty-two, 12% of a step. Now
-the subtraction that measures it - the wall clock minus what the worker reports
-of itself - comes out **negative** at small batches: -0.03 ms at one, -0.21 ms
-at eight. Two clocks disagreeing by a fraction of a millisecond over a step that
-now takes eighty.
+### And the pipe went under the noise, and came back
 
-That is not a bug and it is not zero. It is the method running out of
+The process boundary cost 0.68 ms at a batch of thirty-two on the small model,
+12% of a step. The subtraction that measures it is the wall clock minus what the
+worker reports of itself, so it has no resolution of its own: on the big model it
+went **negative** at small batches, -0.03 ms at one and -0.21 ms at eight, which
+is two clocks disagreeing by a fraction of a millisecond over a step that took
+eighty.
+
+That was not a bug and it was not zero. It was the method running out of
 resolution, and the code said so before it happened: the comment on `PipeMS`
 promises the value is reported as measured rather than clamped, "because a
-negative here means the measurement is wrong and that is worth seeing." At batch
-thirty-two, where the frame is 32 KB, it is 2.24 ms and real again.
+negative here means the measurement is wrong and that is worth seeing."
+
+Now that a step is 12.6 ms rather than 86, the subtraction has something to
+subtract from again: **0.17 ms at thirty-two clients, 1.4% of a step**, and 0.01
+at one. The frame is the same 32 KB it always was. What changed is that the
+number it is being compared against stopped being enormous.
 
 
 ---
@@ -187,10 +248,16 @@ Still a 10 M-parameter character model trained for 24 minutes — it is not
 *right*, it was never going to be right. But it is now answering the prompt.
 
 The load harness sends `"the engine "`, eleven characters. **Every throughput
-number on this page was measured with the model reading 245 tabs.** The numbers
-are not wrong — the tensor is the same shape either way, the same 176 kernels
-run, and the padding costs nothing it would not have cost as text. They were
-simply never about generating anything.
+number this page used to quote was measured with the model reading 245 tabs.**
+Those numbers were not wrong for what they measured — the tensor is the same
+shape either way, the same 176 kernels ran, and a pad id costs exactly what a
+real id costs. They were simply never about generating anything.
+
+They did not survive long. Once the padding was at the *back* it was obvious that
+nobody read its logits either, and
+[not computing it at all](#the-two-hundred-and-fifteen-positions-nobody-read) was
+worth 5.9x — so the fix that made the output mean something also made the numbers
+that described it obsolete within a day.
 
 **What makes this worth writing down is that nothing in the repository could
 have caught it.** Twenty-eight tests, a measured divergence rate, percentiles, a
@@ -259,6 +326,14 @@ position, its neighbours **and every row's length** redrawn every trial — so
 what is measured is the batch rather than one arrangement of it, and rows that
 sample at different positions are part of the arrangement.
 
+That test got harder to pass than it looks, after the step
+[narrowed to its longest row](#the-two-hundred-and-fifteen-positions-nobody-read).
+A row used to be 256 positions wide whoever it sat next to. Now its width is the
+batch's maximum, so **the shape of the tensor a sequence is computed in depends
+on its neighbours' lengths** — the row runs at its own width alone and at
+somebody else's in company, which is a different matmul and can be a different
+kernel. The rate below was re-measured after that change, and it did not move.
+
 | batch | trials | diverged |
 |---|---|---|
 | 2 | 5 000 | 0 |
@@ -270,7 +345,7 @@ sample at different positions are part of the arrangement.
 Zero observations is not a rate of zero. By the rule of three, 0 in 25 000 puts
 the 95% upper bound at **1.2 × 10⁻⁴** — about one flipped token in eight
 thousand at worst, and possibly none at all. Raise `BRAID_DIVERGENCE_TRIALS` and
-the bound tightens; the run above took eighteen minutes.
+the bound tightens; the run above took sixteen minutes.
 
 The test asserts a **ceiling of 1%**, not zero, deliberately. Nothing in the
 engine promises the same reduction order at two batch sizes, so a test demanding
@@ -282,59 +357,98 @@ next token is a hash of the sequence's real ids and its length: bit-exact by
 construction, and it catches every scheduler bug — a crossed row, a window built
 from the wrong end, the wrong sequence advanced. It deliberately does *not* hash
 the padding, for the same reason the model cannot see it: a mock that hashed the
-whole row would go on passing if the length were ever threaded through wrong. Both tests also assert the sequences really did
-share steps. An earlier version of the second passed while batching nothing at
-all: the backend was fast enough that each request finished before the next
-arrived, mean batch 1.00, invariant trivially satisfied, nothing proved.
+whole row would go on passing if the length were ever threaded through wrong.
+
+Both tests also assert the sequences really did share steps. An earlier version
+of the second passed while batching nothing at all: the backend was fast enough
+that each request finished before the next arrived, mean batch 1.00, invariant
+trivially satisfied, nothing proved.
 
 ---
 
-## What a KV cache is worth here, before building one
+## What a KV cache is worth here, and why this server cannot use one
 
-The model recomputes all 256 positions every step and the sampler reads one row
-of the result. A KV cache would keep the keys and values already computed and run
-the projections and the feed-forward over the single new position — on paper a
-256x cut in arithmetic, since attention is about a tenth of the FLOPs at this
-geometry and the rest is per-position.
+The plan was to add a key/value cache and then measure it. Measuring first said
+the win was a third of what the arithmetic promised. Building it said the server
+cannot use it at all. Both of those are worth more than the cache would have
+been.
 
-It is not 256x, and the reason is worth the benchmark. `braid_bench_decode` runs
-the same weights over a window of *S* positions instead of 256, with every
-operation forced onto the card so the sweep compares window sizes rather than
-execution paths:
+### First: what it could win
+
+The model recomputes every position it is given, and the sampler reads one row of
+the result. A cache would keep the keys and values already computed and run the
+projections and the feed-forward over the single new position — on paper a 256x
+cut, since attention is about a tenth of the FLOPs at this geometry and the rest
+is per-position.
+
+`braid_bench_decode` runs the same weights over a window of *S* positions instead
+of 256, with every operation forced onto the card so the sweep compares window
+sizes rather than execution paths:
 
 | batch | 256 positions | window ≤ 64 | ceiling |
 |---|---|---|---|
-| 1 | 6.41 ms | 2.33 ms | **2.7x** |
-| 8 | 21.26 ms | 2.30 ms | **9.3x** |
-| 32 | 83.83 ms | 2.52 ms | **33.3x** |
+| 1 | 6.41 ms | 2.33 ms | 2.7x |
+| 8 | 21.26 ms | 2.30 ms | 9.3x |
+| 32 | 83.83 ms | 2.52 ms | 33.3x |
 
 **The floor is the same ~2.4 ms at every batch size.** It is 177 kernel launches,
 and a launch does not care how much work it carries: 2.4 ms over 177 is 13 µs
 each. A cache makes the kernels smaller, not fewer. So the win is 33x to a full
 batch, 2.7x to a single client, and 256x to nobody.
 
-That is the shape of the whole project in one table. At a batch of one this
-server is not compute-bound and never was — it is bound by how fast 177 kernels
-can be launched — so the optimisation that removes 99.6% of the arithmetic buys
-2.7x. At a batch of thirty-two the arithmetic is real and removing it buys 33x.
-**Batching and caching are not two optimisations, they are the same one measured
-from two ends**, and neither is worth anything without the other.
+### Then: that ceiling was measured against a baseline that no longer exists
 
-And one more thing falls out. Run the same sweep with the engine's *own* dispatch
-defaults instead of forcing the card:
+Those rows compare a 256-position step to a 1-position step. **This server does
+not run 256-position steps any more** — it runs at the width of the longest
+sequence in the batch, and `/stats` puts the mean of that at **29** under the
+load harness. The honest remaining win is 29 → 1, not 256 → 1: interpolating the
+same table between its 16- and 32-position rows, roughly 4x at a batch of
+thirty-two rather than 33x.
 
-| batch | 256 positions | window = 1 | kernels at 256 → 1 | ceiling |
-|---|---|---|---|---|
-| 1 | 6.43 ms | 3.95 ms | 176 → **0** | 1.6x |
-| 8 | 22.21 ms | 6.64 ms | 176 → **30** | 3.3x |
-| 32 | 78.48 ms | 4.66 ms | 177 → **138** | 16.8x |
+It grows with the generation, of course. A server whose clients ask for a
+thousand tokens rather than thirty would run near the full context and get most
+of the 33x back. This one does not.
 
-A narrow window is small work, small work falls below the engine's floors, and
-the forward lands back on the CPU — the batch-1 decode launches **zero** kernels.
-[Those floors were moved for this repository three times already](#what-the-small-model-was-hiding),
-and the bigger model made all three inert. A KV cache would make them live again,
-for the opposite reason: not because the model is small, but because the cache
-made the step small. The pull requests stop being history.
+That is the fourth number this page has had to take back, and the cause is the
+same each time: **a ratio is only as honest as its denominator.** The benchmark
+was correct and the conclusion drawn from it was not, because the baseline it
+divided by was itself waste.
+
+### And then: a position-keyed cache can serve 2% of steps
+
+A cache is indexed by position, and one write offset is shared by the whole
+batch — every row appends its new key at the same slot. That works only if every
+row is at the same position.
+
+Continuous batching is the practice of making sure they are not. Requests arrive
+when they arrive, so at any moment the batch holds a sequence on its third token
+next to one on its two-hundredth.
+
+The scheduler counts it, because it already knows every row's length:
+
+| load | 4 clients | 16 clients | 32 clients |
+|---|---|---|---|
+| every request identical | 14.3% | 2.7% | 2.3% |
+| prompt length and token count varied | 0.4% | 2.1% | 2.1% |
+
+**Around two percent of steps have every row at the same position** — and the
+first row of that table is the flattering one, because it is the load harness
+sending every client the same prompt and the same token count, which is not a
+property of serving but of the harness.
+
+So the cache is built, it is correct, it is tested, and it would apply to one
+step in fifty. It went upstream anyway —
+[`Tensor::copy_into`](https://github.com/DanielPastor05/cpp-ai-engine/pull/5) and
+[`nn::KVCache`](https://github.com/DanielPastor05/cpp-ai-engine/pull/6), both
+merged, with a parity test that decoding one position at a time equals one
+forward over all of them — because the engine is a library and a library's users
+are not all continuously batched servers.
+
+**What a server like this one actually needs is a per-row write offset**: each
+sequence's cache growing at its own rate, in blocks, with a table saying where
+each row's blocks live. That is PagedAttention, and it is the next phase rather
+than a footnote to this one. The useful thing is that the reason for it is now a
+measurement — two percent — rather than a citation.
 
 ```bash
 cmake --build build --target braid_bench_decode
@@ -344,10 +458,10 @@ cmake --build build --target braid_bench_decode
 ENGINE_CUDA_MIN_FLOPS=1 ENGINE_CUDA_MIN_ELEMENTS=1 ENGINE_CUDA_MIN_LAYERNORM=1 ./build/braid_bench_decode models/charlm 100
 ```
 
-A cached decode is not exactly a forward at *S*=1 — its attention still reads the
-256 cached keys this does not, about 0.4 ms at a batch of 32 against a 2.5 ms
-floor. So the table is a ceiling, and a close one. The cache itself is next; this
-is what it has to beat.
+One more caveat on the first table, in the direction that costs it: a cached
+decode is not exactly a forward at *S*=1, because its attention still reads the
+whole cache. That is about 0.4 ms at a batch of thirty-two against a 2.5 ms
+floor. The table is a ceiling, and a close one.
 
 ---
 
@@ -363,16 +477,26 @@ there is no cache to rebuild and no session to migrate — a step that fails on
 one worker is asked of the next, with the same bytes, and the caller cannot
 tell.
 
-128 generations of 40 tokens at sixteen clients, twice, against the same server:
+512 generations of 60 tokens at sixteen clients, twice, against the same server:
 
 | | requests | tokens/s | TTFT p50 | TTFT p95 | failed |
 |---|---|---|---|---|---|
-| nothing dies | 128 | 370 | 47 ms | 75 ms | 0 |
-| one worker killed mid-run | 128 | 364 | 46 ms | 74 ms | **0** |
+| nothing dies | 512 | 1 466 | 21 ms | 26 ms | 0 |
+| one worker killed mid-run | 512 | 1 500 | 18 ms | 25 ms | **0** |
 
 `Stop-Process -Force`, not a signal: a signal would exercise the shutdown path,
 which is not the path in question. One death, one failover, one restart, and the
-tail did not move.
+tail did not move. The killed run came out marginally *faster*, which is the
+noise band saying the difference is not measurable.
+
+The load is 512 requests rather than the 128 this used to run, and that is worth
+a sentence. The first attempt after the step got faster reported a beautifully
+clean result and the harness refused it: **`THIS RUN PROVES NOTHING: the pool
+never saw a death`**. The whole run now finishes in four and a half seconds, so a
+kill fired at the four-second mark landed after the last step the victim would
+ever be asked for. The check exists because an earlier version of this harness
+killed a stray worker from a previous run and reported a clean result, and it
+caught its second distinct way of proving nothing.
 
 **The blast radius of a worker dying is exactly one step**, because the
 scheduler advances the batch one step at a time and that worker was holding
@@ -436,10 +560,10 @@ the model and answers step requests over stdin and stdout in a fixed binary
 frame; the Go side writes `n` windows and reads `n` ids back, plus the timings
 and counters it needs to say where the step went.
 
-It used to cost about 12% of a step. At this model's size
-[it is below the noise floor](#and-the-pipe-stopped-being-measurable), and what
-falls out of it is the shape the pool needs: a worker is a thing that can be
-killed.
+It cost about 12% of a step on the small model and
+[1.4% now](#and-the-pipe-went-under-the-noise-and-came-back), having spent a
+while under the noise floor in between. What falls out of the boundary is the
+shape the pool needs: a worker is a thing that can be killed.
 
 ---
 
@@ -475,6 +599,13 @@ arithmetic and none of the memory.
 `/stats` reports the scheduler's counters, the step breakdown when the backend
 can produce one, the pool when there is one, and **its own latency** as
 percentiles over the last 1 024 completions.
+
+Two of the counters are there for an argument rather than for operations.
+`mean_width` is the positions a step actually ran over — the longest row, not the
+model's context — and `aligned_step_share` is the fraction of steps whose rows
+were all at the same position. The second is what a position-keyed key/value
+cache could serve, and
+[measuring it is what settled that this server cannot use one](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one).
 
 That last part was missing for longer than it should have been. A comment in
 `stats.go` said *"a server that computes its own averages is a server that hides
@@ -569,32 +700,32 @@ server whose numbers end up pasted somewhere.
 
 Ordered by what a measurement says.
 
-1. **A KV cache.** [What it is worth is already measured](#what-a-kv-cache-is-worth-here-before-building-one):
-   33x at a batch of thirty-two, 2.7x at one, bounded by a 2.4 ms launch floor.
-   Two things are done: moving the padding to the right, without which a token's
-   position changes every step and a cache keyed by position is worthless; and
-   the benchmark that says what the cache has to beat. What is left is the engine
-   change — `MultiHeadAttention::forward` takes the whole `(batch, seq, d_model)`
-   and has no incremental path, so this is the fourth pull request upstream.
-   The interesting part is not the speedup: the stateless worker is what makes
-   failover a retry with the same bytes, and a cache is state. The good answer is
-   a cache that is not authoritative — the scheduler still holds the history, so
-   a new worker can rebuild it with a prefill — and the deliverable is what that
-   prefill costs, measured against the failover table above.
-2. **Compare against a real serving system.** `cpp-ai-engine` opens with "1.70×
+1. **Raise `MaxBatch` and sweep again.** At sixty-four and a hundred and
+   twenty-eight clients the mean batch sits at 31.6 against a limit of 32, the
+   throughput is flat and the time to first token goes to 408 ms and 884 ms.
+   [The ceiling is the scheduler's, not the card's](#what-batching-buys-and-where-it-stops-paying),
+   and the sweep that finds the real one costs an afternoon.
+2. **Per-row cache offsets — which is to say, paged attention.** The cache
+   itself is [built, merged and unusable here](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one):
+   one write offset is shared by the whole batch, and only 2% of steps have every
+   row at the same position. Each sequence needs its cache growing at its own
+   rate, in blocks, with a table saying where each row's blocks are. That is the
+   same change as the memory-accounting item below, approached from the other
+   side, and the two should be done together.
+3. **Compare against a real serving system.** `cpp-ai-engine` opens with "1.70×
    slower than PyTorch, and that is the number worth publishing." This page
    compares against nothing. The same model and the same weights behind a minimal
    PyTorch server, same hardware and same harness, and publish the gap with the
    step breakdown that explains it.
-3. **Memory as the scheduling resource.** With a cache at this context length,
+4. **Memory as the scheduling resource.** With a cache at this context length,
    admission should count blocks rather than requests: a generation of 1 000
    tokens and one of 10 do not cost the same and `QueueDepth` pretends they do.
    That, and what eviction costs under pressure, is what PagedAttention is
    actually about.
-4. **A device-side slice, in the engine.** The worker pulls the logits for every
+5. **A device-side slice, in the engine.** The worker pulls the logits for every
    position and reads one row of each. It was 4–8% of a step at the old size and
    wants re-measuring at this one.
-5. **Run the load generator off this machine.** Its goroutines share a CPU with
+6. **Run the load generator off this machine.** Its goroutines share a CPU with
    the server and the worker, and that is the last uncontrolled variable in the
    table.
 
