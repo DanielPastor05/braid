@@ -88,12 +88,26 @@ type Config struct {
 	MaxTokensLimit int
 }
 
-// Default is a starting point, not a measurement. The right MaxBatch is the one
-// past which throughput stops rising and only the tail moves, and that number
-// belongs to a backend -- so it cannot be known until there is a real one to
-// sweep. Until then these are round numbers, and the README says so.
+// Default was a starting point and is now a measurement, at least for MaxBatch.
+//
+// It was 32 because 32 is a round number. Swept against the real backend at 32,
+// 64 and 128, throughput saturates at about 2 750 tokens/s from a batch of
+// roughly sixty and does not rise after: 64 buys 8% over 32 and 128 buys nothing
+// over 64. What the limit actually controls past that point is whether clients
+// queue. At 64 concurrent clients, raising it from 32 to 64 left the throughput
+// where it was and took the median time to first token from 382 ms to 47 ms,
+// because a client that does not fit in the batch is a client waiting for a slot
+// rather than a client being served slowly.
+//
+// So it is a latency knob above the saturation point, not a throughput one, and
+// 64 is where it costs nothing at low concurrency and removes the cliff at high.
+// Going further is not free: a batch of 128 makes a step 41 ms where 64 makes it
+// 21, and everybody in that batch waits the whole step.
+//
+// QueueDepth and MaxTokensLimit are still round numbers, and this comment is
+// still the place that will say so when they stop being.
 func Default() Config {
-	return Config{MaxBatch: 32, QueueDepth: 256, MaxTokensLimit: 1024}
+	return Config{MaxBatch: 64, QueueDepth: 256, MaxTokensLimit: 1024}
 }
 
 // A sequence is one in-flight request inside the loop.

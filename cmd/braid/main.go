@@ -31,10 +31,13 @@ import (
 
 func main() {
 	var (
-		addr      = flag.String("addr", ":8080", "address to listen on")
-		maxBatch  = flag.Int("max-batch", 32, "most sequences in one forward pass")
-		queue     = flag.Int("queue", 256, "how many requests may wait for admission")
-		maxTokens = flag.Int("max-tokens", 1024, "longest generation a caller may ask for")
+		addr = flag.String("addr", ":8080", "address to listen on")
+		// One source for the three the scheduler owns, so a swept default lands
+		// here without a second place to remember. See sched.Default.
+		defaults  = sched.Default()
+		maxBatch  = flag.Int("max-batch", defaults.MaxBatch, "most sequences in one forward pass")
+		queue     = flag.Int("queue", defaults.QueueDepth, "how many requests may wait for admission")
+		maxTokens = flag.Int("max-tokens", defaults.MaxTokensLimit, "longest generation a caller may ask for")
 		worker    = flag.String("worker", "", "path to braid_worker; empty runs the mock backend")
 		model     = flag.String("model", "models/charlm", "checkpoint prefix the worker loads")
 		workers   = flag.Int("workers", 1, "how many worker processes to run behind the scheduler")

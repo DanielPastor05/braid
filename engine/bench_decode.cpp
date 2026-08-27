@@ -1,11 +1,18 @@
 // What a KV cache could win, measured before one is built.
 //
-// Serving this model costs one forward pass over all 256 positions per token,
-// and the sampler reads exactly one row of the result. A KV cache would keep the
-// keys and values of the positions already seen and run the projections and the
-// feed-forward over the single new position instead of over all of them -- which
-// on paper is a 256x reduction in arithmetic, because attention is only about a
-// tenth of the FLOPs at this geometry and everything else is per-position.
+// READ THE LAST PARAGRAPH FIRST. The headline number below is measured against a
+// baseline this server stopped running the day after: it computes 256 positions
+// per step, and the worker now runs at the width of its longest row. The table
+// is still true about window widths and still worth having. What it is not is
+// what a cache would buy here.
+//
+// Serving this model used to cost one forward pass over all 256 positions per
+// token, with the sampler reading exactly one row of the result. A KV cache
+// would keep the keys and values of the positions already seen and run the
+// projections and the feed-forward over the single new position instead of over
+// all of them -- which on paper is a 256x reduction in arithmetic, because
+// attention is only about a tenth of the FLOPs at this geometry and everything
+// else is per-position.
 //
 // On paper, and it is not what happens. This measures the ceiling without
 // building the cache -- the same model and weights over a window of S positions
@@ -19,9 +26,8 @@
 //
 // The floor is the same ~2.4 ms at every batch size, because it is 177 kernel
 // launches and a launch does not care how much work it carries: 2.4 ms / 177 is
-// 13 microseconds each. A cache makes the kernels smaller, not fewer. So it is
-// worth 33x to a full batch and 2.7x to a single client, and the naive 256x is
-// not available at any batch size.
+// 13 microseconds each. A cache makes the kernels smaller, not fewer, so the
+// naive 256x is not available at any batch size.
 //
 // Run it with the engine's *own* dispatch defaults and the win is smaller still
 // -- 1.6x at a batch of one -- because a narrow window falls below the floors
@@ -38,6 +44,23 @@
 //
 // ENGINE_CUDA_MIN_FLOPS, ENGINE_CUDA_MIN_ELEMENTS and ENGINE_CUDA_MIN_LAYERNORM
 // are read by the engine at start; set them to 1 for the path-consistent sweep.
+//
+// The correction, kept here rather than in a commit message because it is the
+// point. Those ceilings divide a 256-position step by a 1-position step, and the
+// worker stopped running 256-position steps: it runs at the width of the longest
+// row in the batch, whose mean the server reports as 29 under the load harness.
+// The remaining win is 29 -> 1, which this table puts at roughly 4x at a batch of
+// thirty-two rather than 33x. A ratio is only as honest as its denominator, and
+// that denominator was itself waste.
+//
+// It grows with the generation. A server whose clients ask for a thousand tokens
+// would run near the full context and get most of the 33x back. This one asks
+// for thirty.
+//
+// And the cache cannot be used here in any case: it is keyed by position, one
+// write offset is shared by the whole batch, and only about 2% of steps have
+// every row at the same position. Continuous batching is the practice of making
+// sure they do not. The server counts it as aligned_step_share.
 
 #include "charmodel.hpp"
 

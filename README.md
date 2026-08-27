@@ -24,8 +24,8 @@ answer, and this page tries hard not to blur the two.
 |---|---|
 | **Model** | the Transformer from `cpp-ai-engine`, **10 758 289 parameters**, 6 blocks, 384 wide, 256-id context, 145-symbol byte alphabet, 0.97 bits/char |
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
-| **Throughput** | 192 tokens/s at one client, **2 363 at thirty-two** - median of three |
-| **What batching buys** | **12.3x**, and what stops it is the batch limit, not the card |
+| **Throughput** | 192 tokens/s at one client, **2 363 at thirty-two**, 2 772 at sixty-four - median of three |
+| **What batching buys** | **12.3x**, and [about 14x](#and-where-the-ceiling-actually-is) once the batch limit stopped being the ceiling |
 | **Where a step goes at batch 32** | 12.2 ms model, 0.18 ms copy back, 0.05 ms sampling |
 | **Batching invariance** | 0 divergences in 25 000 draws - a bound, not a guarantee |
 | **A worker killed mid-load** | 0 requests failed; workers hold no state |
@@ -53,12 +53,13 @@ of three sweeps, with the throughput range beside it.
 | 64 | 182 | 31.65 | 2 415 (2374-2496) | **408 ms** | 438 ms | 12.82 | 12.40 | 176 |
 | 128 | 184 | 31.30 | 2 360 (2311-2367) | **884 ms** | 1 267 ms | 13.08 | 12.68 | 176 |
 
-**Batching is worth 12.3x, and what stops it is not the card.** Look at the mean
-batch in the last three rows: 30.5, 31.7, 31.3, against a `MaxBatch` of 32. At
-sixty-four clients the batch is already as full as the scheduler will let it get,
-so the extra clients queue — the throughput does not move and the time to first
-token goes from 28 ms to 408 ms and then to 884 ms. That is a configuration
-ceiling, not a hardware one, and it is the next thing to sweep.
+**Batching is worth 12.3x here, and what stops it is not the card.** Look at the
+mean batch in the last three rows: 30.5, 31.7, 31.3, against the `MaxBatch` of 32
+this sweep ran with. At sixty-four clients the batch is already as full as the
+scheduler will let it get, so the extra clients queue — the throughput does not
+move and the time to first token goes from 28 ms to 408 ms and then to 884 ms.
+That is a configuration ceiling, and the section below is what happened when it
+was raised.
 
 **One client needs 5 760 forward passes for 5 760 tokens, thirty-two need 189.**
 Thirty times fewer trips through the model for twelve times the throughput.
@@ -72,6 +73,41 @@ go run ./cmd/braid -worker ./build/braid_worker.exe -model models/charlm
 ```bash
 go run ./cmd/braidload -requests 192 -max-tokens 30 -repeat 3 -concurrency 1,2,4,8,16,32,64,128
 ```
+
+---
+
+### And where the ceiling actually is
+
+That last paragraph said the limit was a configuration rather than the card, so
+the next thing was to raise it and ask the card. 256 generations of 30 tokens,
+median of three, at three values of `-max-batch`:
+
+| | 32 clients | 64 clients | 128 clients |
+|---|---|---|---|
+| `-max-batch 32` | 2 559 tok/s, 25 ms | 2 528, **382 ms** | 2 581, **1 089 ms** |
+| `-max-batch 64` | 2 590 tok/s, 25 ms | **2 772, 47 ms** | 2 605, 762 ms |
+| `-max-batch 128` | 2 545 tok/s, 27 ms | 2 732, 50 ms | **2 745, 94 ms** |
+
+Throughput is the second number's flat direction: **about 2 750 tokens/s from a
+batch of roughly sixty, and nothing after.** 64 buys 8% over 32; 128 buys nothing
+over 64. That ceiling is the card.
+
+Against the 192 tokens/s a single client gets, that is about 14x rather than the
+12.3x in the table above — approximately, and deliberately so: the two numbers
+come from sweeps with different request counts, and a ratio whose halves were
+measured in different runs deserves a word like "about". The 12.3x is the one
+measured end to end in a single sweep.
+
+The latency is the whole story. At 64 concurrent clients, raising the limit from
+32 to 64 left the throughput where it was and took the median time to first token
+from **382 ms to 47 ms** — because a client that does not fit in the batch is not
+being served slowly, it is waiting for a slot. Above the saturation point
+`MaxBatch` is a latency knob and not a throughput one.
+
+**The default is now 64**, measured rather than round. Going further is not free:
+a batch of 128 makes a step 41 ms where 64 makes it 21, and everybody in that
+batch waits the whole step — so 128 is right only for a server that expects 128
+clients.
 
 ---
 
@@ -137,7 +173,7 @@ is where they went.
 
 | | 172 728 params, 64 ctx | 10 758 289 params, 256 ctx |
 |---|---|---|
-| what batching buys | **7.5x** | **2.5x** → now 12.3x |
+| what batching buys | **7.5x** | **2.5x** → now 12.3x, ~14x at a raised limit |
 | where throughput saturates | 32 clients | **16 clients** → now 32 |
 | forward, batch 1 -> 12 | 0.77 -> ~1.0 ms | **6.81 -> 30.36 ms** → now 4.9 at one, 6.1 at eight |
 | kernels per step | 0 to 60, discontinuous | **176, flat** → now 140 at small batches |
@@ -700,32 +736,27 @@ server whose numbers end up pasted somewhere.
 
 Ordered by what a measurement says.
 
-1. **Raise `MaxBatch` and sweep again.** At sixty-four and a hundred and
-   twenty-eight clients the mean batch sits at 31.6 against a limit of 32, the
-   throughput is flat and the time to first token goes to 408 ms and 884 ms.
-   [The ceiling is the scheduler's, not the card's](#what-batching-buys-and-where-it-stops-paying),
-   and the sweep that finds the real one costs an afternoon.
-2. **Per-row cache offsets — which is to say, paged attention.** The cache
+1. **Per-row cache offsets — which is to say, paged attention.** The cache
    itself is [built, merged and unusable here](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one):
    one write offset is shared by the whole batch, and only 2% of steps have every
    row at the same position. Each sequence needs its cache growing at its own
    rate, in blocks, with a table saying where each row's blocks are. That is the
    same change as the memory-accounting item below, approached from the other
    side, and the two should be done together.
-3. **Compare against a real serving system.** `cpp-ai-engine` opens with "1.70×
+2. **Compare against a real serving system.** `cpp-ai-engine` opens with "1.70×
    slower than PyTorch, and that is the number worth publishing." This page
    compares against nothing. The same model and the same weights behind a minimal
    PyTorch server, same hardware and same harness, and publish the gap with the
    step breakdown that explains it.
-4. **Memory as the scheduling resource.** With a cache at this context length,
+3. **Memory as the scheduling resource.** With a cache at this context length,
    admission should count blocks rather than requests: a generation of 1 000
    tokens and one of 10 do not cost the same and `QueueDepth` pretends they do.
    That, and what eviction costs under pressure, is what PagedAttention is
    actually about.
-5. **A device-side slice, in the engine.** The worker pulls the logits for every
+4. **A device-side slice, in the engine.** The worker pulls the logits for every
    position and reads one row of each. It was 4–8% of a step at the old size and
    wants re-measuring at this one.
-6. **Run the load generator off this machine.** Its goroutines share a CPU with
+5. **Run the load generator off this machine.** Its goroutines share a CPU with
    the server and the worker, and that is the last uncontrolled variable in the
    table.
 
