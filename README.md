@@ -34,6 +34,7 @@ answer, and this page tries hard not to blur the two.
 | **The bug none of that caught** | every window was padded at the wrong end, and [no measurement here could have told me](#the-bug-no-number-could-have-shown-me) |
 | **The optimisation that mattered** | [not computing the padding](#the-two-hundred-and-fifteen-positions-nobody-read): 5.9x, and only possible once the padding moved |
 | **The one that did not** | a KV cache keyed by position could serve [2% of steps](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one) - batching puts every row at a different position |
+| **Against PyTorch** | same weights, same card, fp32 both sides: **[1.57x slower](#against-pytorch-on-the-same-card)** at the width it serves at, and **2.7x faster** on small work |
 
 ---
 
@@ -501,6 +502,108 @@ floor. The table is a ceiling, and a close one.
 
 ---
 
+## Against PyTorch, on the same card
+
+This page compared itself to nothing for its whole life. `cpp-ai-engine` opens
+with *"1.70× slower than PyTorch, and that is the number worth publishing"*, and
+braid had no equivalent. Here it is.
+
+`bench/reference/` holds the same model in PyTorch — 6 pre-norm blocks, 384 wide,
+6 heads, sinusoidal positions — **reading the same weights**, straight out of
+`models/charlm.bin`. Not a reimplementation trained separately, which would
+compare two models. The engine's checkpoint format is self-describing enough to
+parse in thirty lines of `struct`, and that is the only reason this comparison is
+worth anything.
+
+### Parity first
+
+A reference implementation that is faster and subtly different is not a
+reference, it is a second model. The ways to get there are ordinary: pre-norm
+written as post-norm, a `Linear` loaded without its transpose — which on a square
+matrix, and every attention projection here is square, loads cleanly and computes
+nonsense — the positional encoding's pair index off by an integer division. All
+three produce plausible logits.
+
+So `parity.py` runs first, against `braid_worker` over its own protocol rather
+than against a C++ program written for the occasion. Mixed-length batches, a
+temperature low enough that the sampler lands on the argmax, and the comparison
+is which token each row picks:
+
+```
+500 rows compared over 200 batches
+argmax disagreements: 0
+```
+
+### Then speed
+
+fp32 on both sides, TF32 pinned off. Same card, same weights, one process at a
+time, both synchronising after every forward, both warmed three times. Not
+server-against-server: braid's scheduler and PyTorch's absence of one would be
+most of the difference, and the question here is the arithmetic underneath.
+
+Three passes each, **interleaved** so that neither gets the cold card or the hot
+one to itself, medians below. The engine's column has every operation dispatched
+to the GPU rather than left to its size thresholds, so that the two columns are
+comparing arithmetic and not dispatch policy.
+
+| batch | window | engine | PyTorch | |
+|---|---|---|---|---|
+| 1 | 1 | **2.44 ms** | 6.56 ms | engine 2.68x faster |
+| 1 | 32 | **2.52 ms** | 6.45 ms | engine 2.56x faster |
+| 1 | 256 | 6.68 ms | **6.48 ms** | even |
+| 8 | 4 | **2.65 ms** | 7.56 ms | engine 2.85x faster |
+| 8 | 256 | 22.41 ms | **10.26 ms** | engine 2.18x slower |
+| 32 | 1 | **2.70 ms** | 5.56 ms | engine 2.06x faster |
+| 32 | 16 | 7.77 ms | **6.55 ms** | engine 1.19x slower |
+| 32 | 32 | 11.20 ms | **7.14 ms** | engine **1.57x** slower |
+| 32 | 64 | 20.06 ms | **9.08 ms** | engine 2.21x slower |
+| 32 | 256 | 81.16 ms | **35.24 ms** | engine 2.30x slower |
+
+**The engine wins on overhead and loses on kernels**, and the crossover is
+between sixteen and thirty-two positions at a batch of thirty-two.
+
+Look at PyTorch's column first: it is **flat at 5.5 to 7 ms** from a single
+position at a batch of one all the way to sixteen positions at a batch of
+thirty-two. That is not compute, it is the floor — a Python interpreter
+dispatching a hundred and seventy-odd operations per forward, one at a time. The
+engine has the same shape of floor and it sits at **2.4 to 2.7 ms**, because C++
+has no interpreter to pay for. Below the crossover the engine is not computing
+faster, it is simply cheaper to *ask*.
+
+Above it, cuBLAS wins and it is not close: 35 ms against 81 at the full context.
+
+### The number that counts
+
+**braid serves at a mean width of 29 and saturates at a batch of about sixty.**
+The nearest measured row is a batch of thirty-two over thirty-two positions, and
+there **the engine is 1.57× slower than PyTorch.**
+
+`cpp-ai-engine` measures **1.70×** for a completely different workload — a
+convolutional network training on MNIST, not a transformer decoding — with TF32
+pinned off there too. The same engine, the same card, two workloads with nothing
+in common, and the ratio agrees to within eight percent. Neither number was
+fitted to the other; this one was measured today and that one months ago.
+
+That consistency is the useful part. A hand-written CUDA backend that lands
+within a factor of two of cuBLAS across two unrelated workloads is a backend
+whose remaining gap is *the matmul kernel*, not a pile of accidents — and the
+step breakdown says the same thing: at a batch of thirty-two the model is 12.2 ms
+of a 12.6 ms step, with the copy back at 0.18 and the pipe at 0.17.
+
+```bash
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+```
+
+```bash
+python bench/reference/parity.py models/charlm --trials 200
+```
+
+```bash
+python bench/reference/speed.py models/charlm --repeats 100
+```
+
+---
+
 ## Killing a worker under load
 
 `-workers N` puts a pool behind the scheduler. The scheduler does not know: a
@@ -686,6 +789,7 @@ anything.
 ## Layout
 
 ```
+bench/reference/    the same model in PyTorch, reading the same weights
 cmd/braid/          the server
 cmd/braidload/      the load harness that printed the tables
 internal/sched/     the loop: admission, batching, cancellation, stats, latency
@@ -743,11 +847,14 @@ Ordered by what a measurement says.
    rate, in blocks, with a table saying where each row's blocks are. That is the
    same change as the memory-accounting item below, approached from the other
    side, and the two should be done together.
-2. **Compare against a real serving system.** `cpp-ai-engine` opens with "1.70×
-   slower than PyTorch, and that is the number worth publishing." This page
-   compares against nothing. The same model and the same weights behind a minimal
-   PyTorch server, same hardware and same harness, and publish the gap with the
-   step breakdown that explains it.
+2. **Server against server, not forward against forward.**
+   [The comparison that exists](#against-pytorch-on-the-same-card) puts the two
+   forwards side by side and deliberately leaves the serving layer out, because
+   braid's scheduler against PyTorch's absence of one would be most of the
+   difference. The other measurement is worth having too: the same weights behind
+   a minimal PyTorch server with its own continuous batching, same harness, and
+   the gap that opens between "our arithmetic is 1.64x slower" and whatever the
+   end-to-end number turns out to be.
 3. **Memory as the scheduling resource.** With a cache at this context length,
    admission should count blocks rather than requests: a generation of 1 000
    tokens and one of 10 do not cost the same and `QueueDepth` pretends they do.

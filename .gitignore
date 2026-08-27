@@ -14,3 +14,6 @@ go.work.sum
 # Build output
 /build/
 /models/
+
+# Python bytecode from the PyTorch reference
+__pycache__/
