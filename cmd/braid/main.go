@@ -48,17 +48,30 @@ func main() {
 		// the engine was built with.
 		minFlops = flag.Uint64("cuda-min-flops", 1<<20,
 			"engine threshold: matmuls below this many FLOPs stay on the CPU (0 keeps the engine's default)")
-		// Left alone. The engine's elementwise default is already 2^20, and the
-		// sweep that moved the matmul threshold showed nothing to gain from
-		// moving this one -- so it stays where it is rather than being set to
-		// its own value and implying a change that was never made.
-		minElems = flag.Uint64("cuda-min-elements", 0,
+		// These two were left at the engine's defaults for as long as a step
+		// computed all 256 positions, and at that size the defaults were right:
+		// a LayerNorm saw n*98304 elements and cleared its 2^15 floor at a batch
+		// of one, so moving it changed nothing.
+		//
+		// Not computing the padding made a step narrow again, and both floors
+		// came back to life on the wrong side. A step at a batch of one over the
+		// twenty-nine positions this serves at is 11 136 elements, which is
+		// under both -- so every elementwise add and every normalisation went
+		// back to the host, one PCIe round trip at a time.
+		//
+		// Swept, three interleaved passes, then confirmed against the server:
+		// lowering both is worth 1.66x at one client and 2.09x at two, a wash
+		// from four upward, and it makes the kernel count a flat 177 where it
+		// was 140 at one client and 175 at thirty-two. Below four rows in the
+		// batch it costs about 40% -- a one-token prompt served alone -- which is
+		// not a case this serves and is the reason these are flags.
+		//
+		// Note what this reverses: an earlier sweep on the 172 728-parameter
+		// model found going to 1 slightly *worse*. It was, then. The regime
+		// changed twice since.
+		minElems = flag.Uint64("cuda-min-elements", 1,
 			"engine threshold: elementwise ops below this many elements stay on the CPU (0 keeps the default)")
-		// Inert at this model's size and kept for the smaller one. The engine's
-		// floor is 2^15 elements; a LayerNorm here sees n*98304 and clears it at
-		// a batch of one. It mattered enormously when the model was 96 wide over
-		// a 64-id context -- that is the story in the README, and it is history.
-		minLayerNorm = flag.Uint64("cuda-min-layernorm", 0,
+		minLayerNorm = flag.Uint64("cuda-min-layernorm", 1,
 			"engine threshold: LayerNorms below this many elements stay on the CPU (0 keeps the default)")
 		stepBase = flag.Duration("mock-step", 8*time.Millisecond, "mock backend: fixed cost of a step")
 		stepPer  = flag.Duration("mock-per-seq", 200*time.Microsecond, "mock backend: marginal cost per sequence")

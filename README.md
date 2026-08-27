@@ -24,15 +24,16 @@ answer, and this page tries hard not to blur the two.
 |---|---|
 | **Model** | the Transformer from `cpp-ai-engine`, **10 758 289 parameters**, 6 blocks, 384 wide, 256-id context, 145-symbol byte alphabet, 0.97 bits/char |
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
-| **Throughput** | 192 tokens/s at one client, **2 363 at thirty-two**, 2 772 at sixty-four - median of three |
-| **What batching buys** | **12.3x**, and [about 14x](#and-where-the-ceiling-actually-is) once the batch limit stopped being the ceiling |
-| **Where a step goes at batch 32** | 12.2 ms model, 0.18 ms copy back, 0.05 ms sampling |
+| **Throughput** | 340 tokens/s at one client, **3 003 at sixty-four** - median of three |
+| **What batching buys** | **8.8x**, and it is [a peak, not a plateau](#and-where-the-ceiling-actually-is) |
+| **Where a step goes at batch 64** | 18.3 ms model, 0.36 ms copy back, 0.10 ms sampling, 0.68 ms pipe |
 | **Batching invariance** | 0 divergences in 25 000 draws - a bound, not a guarantee |
 | **A worker killed mid-load** | 0 requests failed; workers hold no state |
 | **A worker hung mid-step** | killed on a deadline and failed over; before that it stopped the server for good |
-| **Landed upstream** | three PRs on the engine, all measured, one of them a correction to another |
+| **Landed upstream** | five PRs on the engine, all measured, one of them a correction to another |
 | **The bug none of that caught** | every window was padded at the wrong end, and [no measurement here could have told me](#the-bug-no-number-could-have-shown-me) |
 | **The optimisation that mattered** | [not computing the padding](#the-two-hundred-and-fifteen-positions-nobody-read): 5.9x, and only possible once the padding moved |
+| **What it broke on the way** | it made a step small again, so [two dispatch floors came back to life on the wrong side](#the-thresholds-came-back-to-life-on-the-wrong-side) - worth another 1.66x at one client |
 | **The one that did not** | a KV cache keyed by position could serve [2% of steps](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one) - batching puts every row at a different position |
 | **Against PyTorch** | same weights, same card, fp32 both sides: **[1.57x slower](#against-pytorch-on-the-same-card)** at the width it serves at, and **2.7x faster** on small work |
 
@@ -45,25 +46,33 @@ of three sweeps, with the throughput range beside it.
 
 | clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | kernels |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 5 760 | 1.00 | 192 (189-197) | 7 ms | 11 ms | 4.93 | 4.89 | 140 |
-| 2 | 3 055 | 1.89 | 279 (275-287) | 13 ms | 17 ms | 6.59 | 6.58 | 140 |
-| 4 | 1 509 | 3.82 | 693 (691-698) | 11 ms | 16 ms | 5.40 | 5.32 | 169 |
-| 8 | 746 | 7.72 | 1 216 (1213-1224) | 11 ms | 15 ms | 6.18 | 6.07 | 175 |
-| 16 | 376 | 15.32 | 1 816 (1801-1859) | 18 ms | 21 ms | 8.27 | 8.07 | 175 |
-| 32 | 189 | 30.48 | **2 363** (2350-2374) | 28 ms | 39 ms | 12.56 | 12.15 | 175 |
-| 64 | 182 | 31.65 | 2 415 (2374-2496) | **408 ms** | 438 ms | 12.82 | 12.40 | 176 |
-| 128 | 184 | 31.30 | 2 360 (2311-2367) | **884 ms** | 1 267 ms | 13.08 | 12.68 | 176 |
+| 1 | 5 760 | 1.00 | 340 (339-341) | 5 ms | 8 ms | 2.75 | 2.66 | 177 |
+| 2 | 3 134 | 1.84 | 621 (618-628) | 8 ms | 10 ms | 2.92 | 2.83 | 177 |
+| 4 | 1 546 | 3.73 | 765 (761-782) | 10 ms | 13 ms | 4.81 | 4.71 | 177 |
+| 8 | 756 | 7.62 | 1 215 (1213-1222) | 11 ms | 14 ms | 6.08 | 6.02 | 177 |
+| 16 | 380 | 15.16 | 1 900 (1887-1943) | 15 ms | 18 ms | 7.82 | 7.57 | 177 |
+| 32 | 192 | 30.00 | 2 569 (2451-2582) | 23 ms | 32 ms | 11.50 | 11.06 | 177 |
+| 64 | 96 | 60.00 | **3 003** (2835-3016) | 42 ms | 68 ms | 19.45 | 18.33 | 177 |
+| 128 | 94 | 61.28 | 2 862 (2745-2893) | **684 ms** | 738 ms | 21.14 | 19.77 | 177 |
 
-**Batching is worth 12.3x here, and what stops it is not the card.** Look at the
-mean batch in the last three rows: 30.5, 31.7, 31.3, against the `MaxBatch` of 32
-this sweep ran with. At sixty-four clients the batch is already as full as the
-scheduler will let it get, so the extra clients queue — the throughput does not
-move and the time to first token goes from 28 ms to 408 ms and then to 884 ms.
-That is a configuration ceiling, and the section below is what happened when it
-was raised.
+**Batching is worth 8.8x here, and the peak is at sixty-four clients.** Past that
+the batch is as full as `MaxBatch` allows — 61.3 against a limit of 64 — so the
+extra clients queue and the time to first token goes from 42 ms to 684 ms while
+the throughput does not move.
 
-**One client needs 5 760 forward passes for 5 760 tokens, thirty-two need 189.**
-Thirty times fewer trips through the model for twelve times the throughput.
+The kernel count is **177 on every row**. Every discontinuity this page used to
+have a section about is gone, and the last one to go is
+[two sections down](#the-thresholds-came-back-to-life-on-the-wrong-side).
+
+**One client needs 5 760 forward passes for 5 760 tokens, sixty-four need 96.**
+Sixty times fewer trips through the model for nine times the throughput.
+
+That multiplier has now fallen three times while the server got faster: 7.5x on
+the small model, 2.5x on the big one, 12.3x once the padding stopped being
+computed, 8.8x once the dispatch floors were lowered. **It measures how much
+fixed cost there is left to amortise, not how good the batching is.** A project
+that optimised for it would have been steering away from every real improvement
+on this page.
 
 Reproduce it:
 
@@ -79,36 +88,28 @@ go run ./cmd/braidload -requests 192 -max-tokens 30 -repeat 3 -concurrency 1,2,4
 
 ### And where the ceiling actually is
 
-That last paragraph said the limit was a configuration rather than the card, so
-the next thing was to raise it and ask the card. 256 generations of 30 tokens,
-median of three, at three values of `-max-batch`:
+The limit was 32 because 32 is a round number, so it was swept. 256 generations
+of 30 tokens, median of three:
 
-| | 32 clients | 64 clients | 128 clients |
+| | 64 clients | 128 clients | 192 clients |
 |---|---|---|---|
-| `-max-batch 32` | 2 559 tok/s, 25 ms | 2 528, **382 ms** | 2 581, **1 089 ms** |
-| `-max-batch 64` | 2 590 tok/s, 25 ms | **2 772, 47 ms** | 2 605, 762 ms |
-| `-max-batch 128` | 2 545 tok/s, 27 ms | 2 732, 50 ms | **2 745, 94 ms** |
+| `-max-batch 64` | **3 000 tok/s, 45 ms** | 2 837, 680 ms | 2 940, 783 ms |
+| `-max-batch 128` | 2 955, 47 ms | 2 756, 90 ms | 2 721, 145 ms |
+| `-max-batch 192` | 2 983, 48 ms | 2 798, 83 ms | 2 725, 137 ms |
 
-Throughput is the second number's flat direction: **about 2 750 tokens/s from a
-batch of roughly sixty, and nothing after.** 64 buys 8% over 32; 128 buys nothing
-over 64. That ceiling is the card.
+**A batch of sixty is a peak and not a plateau.** Raising the limit past 64 makes
+the throughput *worse*: at a mean batch of 113 the server does 2 756 tok/s where
+at 60 it does 3 000, because doubling the batch more than doubles the step —
+19.3 ms becomes 40.5. Everybody in that batch waits the whole of it.
 
-Against the 192 tokens/s a single client gets, that is about 14x rather than the
-12.3x in the table above — approximately, and deliberately so: the two numbers
-come from sweeps with different request counts, and a ratio whose halves were
-measured in different runs deserves a word like "about". The 12.3x is the one
-measured end to end in a single sweep.
+So `MaxBatch` is two knobs at once. Below the peak it buys throughput; at the
+peak it stops; above it, it costs. **The default is now 64**, measured rather
+than round, and that is where all three rows agree the card is happiest.
 
-The latency is the whole story. At 64 concurrent clients, raising the limit from
-32 to 64 left the throughput where it was and took the median time to first token
-from **382 ms to 47 ms** — because a client that does not fit in the batch is not
-being served slowly, it is waiting for a slot. Above the saturation point
-`MaxBatch` is a latency knob and not a throughput one.
-
-**The default is now 64**, measured rather than round. Going further is not free:
-a batch of 128 makes a step 41 ms where 64 makes it 21, and everybody in that
-batch waits the whole step — so 128 is right only for a server that expects 128
-clients.
+The earlier version of this section, taken before the dispatch floors were
+lowered, put the peak at 2 750 tok/s and called it the card. It was the card
+*plus* a step that went home to the host for its normalisations. The card turned
+out to have another 9% in it.
 
 ---
 
@@ -160,6 +161,53 @@ model is small, but because the step got small.
 
 ---
 
+## The thresholds came back to life, on the wrong side
+
+The engine keeps small work on the CPU on purpose. Three size floors decide:
+`ENGINE_CUDA_MIN_FLOPS` for matmuls, `ENGINE_CUDA_MIN_ELEMENTS` for elementwise
+operations, `ENGINE_CUDA_MIN_LAYERNORM` for normalisations. This project
+[moved the first and made the third settable](#what-the-small-model-was-hiding),
+three merged pull requests, and then a bigger model made all of them inert and
+that section said so.
+
+Not computing the padding undid that. A step at a batch of one over the
+twenty-nine positions this actually serves is 11 136 elements, which is under
+both remaining floors — so **every residual add and every normalisation went back
+to the host, one PCIe round trip at a time.** The kernel count in the table above
+said it out loud: 140 at one client where a wide step launched 176.
+
+Three interleaved passes over the decode benchmark, then the server asked
+directly:
+
+| clients | as it shipped | both floors lowered | |
+|---|---|---|---|
+| 1 | 207 tok/s | **343** | 1.66x |
+| 2 | 300 | **627** | 2.09x |
+| 4 | 704 | 774 | 1.10x |
+| 8 | 1 246 | 1 222 | — |
+| 16 | 1 928 | 1 898 | — |
+| 32 | 2 462 | 2 522 | — |
+| 64 | 2 519 | 2 600 | — |
+
+**1.66x at one client, 2.09x at two, and a wash from four upward** — the rows
+where it does nothing are the rows where the batch was already big enough to
+clear the floors on its own. The kernel count goes flat at 177 everywhere, and
+every discontinuity this page has ever had a section about is gone.
+
+Both defaults are now 1. There is one case it costs: below about four rows in the
+batch — a one-token prompt served alone — it is roughly 40% worse, because
+pushing 384 floats to the card is not worth the trip. That case does not occur in
+serving, and it is why these are flags rather than constants.
+
+**Note what this reverses.** An earlier sweep, on the 172 728-parameter model,
+found that lowering these to 1 was *slightly worse*, and this page said so. It
+was, then. The regime has changed twice since — a bigger model, then a narrower
+step — and the floors have been right, then irrelevant, then wrong, without
+anybody touching them. A threshold is a claim about the size of the work, and the
+work here has changed size three times.
+
+---
+
 ## What the small model was hiding
 
 This repository spent most of its life serving a model of **172 728**
@@ -174,13 +222,13 @@ is where they went.
 
 | | 172 728 params, 64 ctx | 10 758 289 params, 256 ctx |
 |---|---|---|
-| what batching buys | **7.5x** | **2.5x** → now 12.3x, ~14x at a raised limit |
-| where throughput saturates | 32 clients | **16 clients** → now 32 |
-| forward, batch 1 -> 12 | 0.77 -> ~1.0 ms | **6.81 -> 30.36 ms** → now 4.9 at one, 6.1 at eight |
-| kernels per step | 0 to 60, discontinuous | **176, flat** → now 140 at small batches |
+| what batching buys | **7.5x** | **2.5x** → now 8.8x, and [that is not the improvement it looks like](#what-batching-buys-and-where-it-stops-paying) |
+| where throughput saturates | 32 clients | **16 clients** → now 64, and it is a peak |
+| forward, batch 1 -> 12 | 0.77 -> ~1.0 ms | **6.81 -> 30.36 ms** → now 2.7 at one, 6.0 at eight |
+| kernels per step | 0 to 60, discontinuous | **176, flat** → now 177, flat at every size |
 | PCIe crossings per step | 5 each way below batch 6 | **1 each way, always** |
-| the pipe, batch 32 | 0.68 ms, 12% of a step | **below the noise floor** → now 1.4% |
-| engine CUDA thresholds | two of them had to be moved | **both inert** → live again |
+| the pipe, batch 32 | 0.68 ms, 12% of a step | **below the noise floor** → now 2.2% |
+| engine CUDA thresholds | two of them had to be moved | **both inert** → [live again, and wrong](#the-thresholds-came-back-to-life-on-the-wrong-side) |
 
 This section is about the model change, and the model change is what the
 left-to-middle comparison still describes correctly.
@@ -853,7 +901,7 @@ Ordered by what a measurement says.
    braid's scheduler against PyTorch's absence of one would be most of the
    difference. The other measurement is worth having too: the same weights behind
    a minimal PyTorch server with its own continuous batching, same harness, and
-   the gap that opens between "our arithmetic is 1.64x slower" and whatever the
+   the gap that opens between "our arithmetic is 1.57x slower" and whatever the
    end-to-end number turns out to be.
 3. **Memory as the scheduling resource.** With a cache at this context length,
    admission should count blocks rather than requests: a generation of 1 000
