@@ -81,6 +81,24 @@ func (s *Scheduler) loop() {
 		s.stats.steps.Add(1)
 		s.stats.advanced.Add(int64(len(active)))
 
+		// What this step cost in positions, and whether a position-keyed cache
+		// could have served it. Counted here rather than in the worker because
+		// the scheduler already knows both, and asking the worker would mean a
+		// protocol field for a measurement.
+		width, aligned := int32(0), true
+		for _, length := range lengths {
+			if length > width {
+				width = length
+			}
+			if length != lengths[0] {
+				aligned = false
+			}
+		}
+		s.stats.widthSum.Add(int64(width))
+		if aligned {
+			s.stats.alignedSteps.Add(1)
+		}
+
 		now := time.Now()
 		kept := active[:0]
 		for i, seq := range active {

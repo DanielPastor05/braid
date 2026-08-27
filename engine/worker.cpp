@@ -63,6 +63,7 @@
 #include "engine/serialize.hpp"
 #include "engine/tensor.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -71,6 +72,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <random>
 #include <sstream>
 #include <string>
@@ -221,7 +223,20 @@ int main(int argc, char** argv) {
               << ", min_elements " << engine::cuda::min_elementwise_elements() << "\n";
     std::cerr.flush();
 
-    const engine::Tensor mask = engine::nn::causal_mask(braid::kSeqLen);
+    // One mask per width actually used, built on demand and kept. A run of a
+    // sequence walks its length upward one position at a time, so this fills
+    // with the widths that run touches and then stops allocating. Rebuilding a
+    // (S, S) mask every step would be host work and a PCIe upload per step, for
+    // a tensor that never changes.
+    std::map<std::size_t, engine::Tensor> masks;
+    const auto mask_for = [&masks](std::size_t width) -> const engine::Tensor& {
+        auto found = masks.find(width);
+        if (found == masks.end()) {
+            found = masks.emplace(width, engine::nn::causal_mask(width)).first;
+        }
+        return found->second;
+    };
+
     engine::autograd::NoGradGuard no_grad;
 
     std::vector<std::int32_t> windows;
@@ -268,14 +283,32 @@ int main(int argc, char** argv) {
             }
         }
 
+        // The longest row decides the width of the step. Everything past it in
+        // every row is padding whose logits nobody reads, and computing it was
+        // costing the whole batch: at a batch of 32 a step over 256 positions is
+        // 78 ms and one over 32 is 11.
+        //
+        // A shorter row is still correct at this width. Its own padding sits
+        // between its length and the width, and the causal mask at the position
+        // being sampled -- length-1 -- reaches only 0..length-1, which is all
+        // real. That is why the width can be the maximum rather than a value
+        // every row has to agree on, and it is the second thing the padding
+        // moving to the right bought.
+        std::size_t width = 1;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            width = std::max(width, static_cast<std::size_t>(lengths[i]));
+        }
+
         try {
             using clock = std::chrono::steady_clock;
             const auto t0 = clock::now();
 
-            engine::Tensor ids({n, braid::kSeqLen}, 0.0f, false);
+            engine::Tensor ids({n, width}, 0.0f, false);
             float* id_values = ids.data();
-            for (std::size_t i = 0; i < ids_count; ++i) {
-                id_values[i] = static_cast<float>(windows[i]);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                const std::int32_t* row = windows.data() + static_cast<std::size_t>(i) * braid::kSeqLen;
+                float* out = id_values + static_cast<std::size_t>(i) * width;
+                for (std::size_t j = 0; j < width; ++j) out[j] = static_cast<float>(row[j]);
             }
             const auto t1 = clock::now();
             const std::size_t kernels_before = engine::cuda::kernels_launched();
@@ -287,7 +320,7 @@ int main(int argc, char** argv) {
 
             // The one forward pass. n rows in, n rows of logits out, and the
             // model has no way of knowing the rows belong to different callers.
-            const engine::Tensor logits = model.forward(ids, mask);  // (n, S, vocab)
+            const engine::Tensor logits = model.forward(ids, mask_for(width));  // (n, W, vocab)
 
             // The kernels are asynchronous, so forward() returning says only
             // that they were launched. Synchronising here ends the compute and
@@ -297,9 +330,9 @@ int main(int argc, char** argv) {
             engine::cuda::synchronize();
             const auto t_compute = clock::now();
 
-            // This pulls (n, kSeqLen, vocab) to the host when the sampling
-            // below reads one row of it per sequence: the last real position of
-            // each. The other 255 come across for nothing, every step. Measured
+            // This pulls (n, width, vocab) to the host when the sampling below
+            // reads one row of it per sequence: the last real position of each.
+            // The other width-1 come across for nothing, every step. Measured
             // rather than assumed, because a device-side slice is an engine
             // change and "it must be slow" is not a reason to make one.
             const float* data = logits.data();
@@ -312,8 +345,7 @@ int main(int argc, char** argv) {
                 // of the window. Everything past it is padding, which the
                 // causal mask makes unreachable from here.
                 const std::size_t last = static_cast<std::size_t>(lengths[i]) - 1;
-                const float* row =
-                    data + (static_cast<std::size_t>(i) * braid::kSeqLen + last) * vocab_size;
+                const float* row = data + (static_cast<std::size_t>(i) * width + last) * vocab_size;
                 next[i] = sample_row(row, vocab_size, temperatures[i], seeds[i]);
             }
             const auto t3 = clock::now();

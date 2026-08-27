@@ -19,6 +19,19 @@ type Stats struct {
 	completed  atomic.Int64
 	failed     atomic.Int64
 	stepErrors atomic.Int64
+
+	// alignedSteps counts the steps whose sequences were all the same length,
+	// and widthSum the width each step actually ran at.
+	//
+	// Neither is a performance counter. They are the two numbers that say what a
+	// key/value cache could do here, and a cache is the reason they exist. A
+	// cache keyed by position needs every row of the batch at the same position,
+	// because one write offset is shared by the whole batch -- so alignedSteps
+	// over steps is the fraction of steps such a cache could serve at all. The
+	// width is what the batch costs instead: the longest row, since every row is
+	// computed to the same width.
+	alignedSteps atomic.Int64
+	widthSum     atomic.Int64
 }
 
 // Snapshot is Stats at one instant, safe to serialise.
@@ -32,6 +45,14 @@ type Snapshot struct {
 	Completed  int64 `json:"completed"`
 	Failed     int64 `json:"failed"`
 	StepErrors int64 `json:"step_errors"`
+
+	// AlignedShare is the fraction of steps whose sequences were all the same
+	// length. See the note on alignedSteps: it is what a position-keyed cache
+	// could serve, and under continuous batching it is not 1.
+	AlignedShare float64 `json:"aligned_step_share"`
+	// MeanWidth is the positions a step actually ran over, which is the longest
+	// sequence in it and not the model's full context.
+	MeanWidth float64 `json:"mean_width"`
 
 	// Latency over a recent window, not since boot. A p99 measured over every
 	// request a long-lived process ever served is a number an hour of good
@@ -62,6 +83,8 @@ func (s *Scheduler) Stats() Snapshot {
 	}
 	if snap.Steps > 0 {
 		snap.MeanBatch = float64(snap.Advanced) / float64(snap.Steps)
+		snap.AlignedShare = float64(s.stats.alignedSteps.Load()) / float64(snap.Steps)
+		snap.MeanWidth = float64(s.stats.widthSum.Load()) / float64(snap.Steps)
 	}
 	snap.Latency = s.latency.snapshot()
 	return snap

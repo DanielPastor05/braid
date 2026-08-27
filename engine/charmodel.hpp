@@ -63,8 +63,15 @@ struct CharModel {
     // stacked: one sequence when training a batch, or n concurrent requests
     // when serving them together. The model cannot tell the difference, which
     // is the entire premise of batching them.
+    // S may be narrower than kSeqLen. Serving hands in only as many positions as
+    // the longest sequence in the batch actually has, because everything past it
+    // is padding whose logits nobody reads; training hands in the full window.
+    // The positional table is cut to match, and only when it has to be -- the
+    // slice is a copy, and the training path should not pay for one.
     engine::Tensor forward(const engine::Tensor& ids, const engine::Tensor& mask) {
-        engine::Tensor h = embedding.forward(ids) + positions;
+        const std::size_t take = ids.shape()[1];
+        engine::Tensor h = embedding.forward(ids) +
+                           (take == kSeqLen ? positions : positions.slice(0, 0, take));
         for (engine::nn::TransformerBlock& block : blocks) h = block.forward(h, &mask);
         return head.forward(h);
     }

@@ -384,6 +384,43 @@ func TestWindowIsRightPadded(t *testing.T) {
 	}
 }
 
+// TestAlignmentAndWidthAreCounted holds the two numbers that say what a
+// position-keyed key/value cache could do here.
+//
+// A batch computes every row to the width of its longest, so the width is what
+// a step costs in positions. And a cache keyed by position shares one write
+// offset across the batch, so it can only serve a step whose rows are all at the
+// same position -- which continuous batching does not arrange, because requests
+// arrive when they arrive. That is the measurement, not an opinion, and it is
+// the reason the cache landed in the engine and not in the worker.
+func TestAlignmentAndWidthAreCounted(t *testing.T) {
+	s, err := New(fastMock(), Config{MaxBatch: 8, QueueDepth: 32, MaxTokensLimit: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// One request on its own: every step has exactly one row, so every step is
+	// trivially aligned.
+	tokens, done, err := s.Submit(context.Background(),
+		Request{Prompt: "abc", MaxTokens: 5, Temperature: 0.7, Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, res := drain(t, tokens, done); res.Err != nil {
+		t.Fatal(res.Err)
+	}
+
+	snap := s.Stats()
+	if snap.AlignedShare != 1 {
+		t.Errorf("a single sequence gave an aligned share of %v, want 1", snap.AlignedShare)
+	}
+	// Three prompt ids, then a token per step: widths 3, 4, 5, 6, 7 -> mean 5.
+	if snap.MeanWidth < 3 || snap.MeanWidth > 7 {
+		t.Errorf("mean width %v is outside the range the sequence spans", snap.MeanWidth)
+	}
+}
+
 func TestSubmitRejectsNonsense(t *testing.T) {
 	s, err := New(fastMock(), Default())
 	if err != nil {
