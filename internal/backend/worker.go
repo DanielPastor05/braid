@@ -108,6 +108,12 @@ const (
 	// having a bad day.
 	defaultStepTimeout = 30 * time.Second
 
+	// maxErrorMessage caps the error text a worker may announce before the
+	// server allocates room for it. The worker writes the length and the server
+	// believes it, so without a bound the number is a request to allocate --
+	// four bytes read at the wrong offset ask for four gigabytes.
+	maxErrorMessage = 64 << 10
+
 	// reapGrace bounds every wait on a process that is supposed to be dying.
 	// The first version of the timeout fix waited on the reaper without one,
 	// which fixed the hang for the case where the kill lands and reproduced it
@@ -396,6 +402,16 @@ func (w *Worker) exchange(frame []byte, n int) ([]int32, [7]uint64, error) {
 		var length uint32
 		if err := binary.Read(w.stdout, binary.LittleEndian, &length); err != nil {
 			return nil, timings, fmt.Errorf("backend: reading the worker's error length: %w", err)
+		}
+		// Bounded before it is allocated. The length arrives from the worker,
+		// and a worker that is confused rather than malicious is enough: four
+		// bytes read at the wrong offset are a four-gigabyte allocation, and the
+		// server dies of a message it was trying to log. Nothing the worker has
+		// to say needs more than this.
+		if length > maxErrorMessage {
+			return nil, timings, fmt.Errorf(
+				"backend: the worker announced a %d-byte error message, which is not a message",
+				length)
 		}
 		message := make([]byte, length)
 		if _, err := io.ReadFull(w.stdout, message); err != nil {
