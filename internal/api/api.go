@@ -38,6 +38,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /v1/generate", s.generate)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /stats", s.stats)
+	mux.HandleFunc("GET /metrics", s.metrics)
 	return mux
 }
 
