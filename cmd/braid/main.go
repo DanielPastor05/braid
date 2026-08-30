@@ -19,9 +19,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/DanielPastor05/braid/internal/api"
@@ -38,9 +41,19 @@ func main() {
 		maxBatch  = flag.Int("max-batch", defaults.MaxBatch, "most sequences in one forward pass")
 		queue     = flag.Int("queue", defaults.QueueDepth, "how many requests may wait for admission")
 		maxTokens = flag.Int("max-tokens", defaults.MaxTokensLimit, "longest generation a caller may ask for")
-		worker    = flag.String("worker", "", "path to braid_worker; empty runs the mock backend")
-		model     = flag.String("model", "models/charlm", "checkpoint prefix the worker loads")
-		workers   = flag.Int("workers", 1, "how many worker processes to run behind the scheduler")
+		// The README has always said this server should not be exposed to
+		// anything. That was a sentence, and a sentence is not a control. These
+		// two are the control: without a token the server refuses to listen
+		// anywhere but loopback, so exposing it is now a thing you have to mean.
+		authToken = flag.String("auth-token", "",
+			"bearer token required on every request; without one the server binds loopback only")
+		rate = flag.Float64("rate", 0,
+			"requests per second allowed per client address, 0 for no limit")
+		burst = flag.Int("burst", 16, "how many requests a client may make back to back")
+
+		worker  = flag.String("worker", "", "path to braid_worker; empty runs the mock backend")
+		model   = flag.String("model", "models/charlm", "checkpoint prefix the worker loads")
+		workers = flag.Int("workers", 1, "how many worker processes to run behind the scheduler")
 		// The engine's own default is 2^22, which keeps a batch of one entirely
 		// on the CPU at this model's size: zero kernels launched. 2^20 was
 		// measured, not guessed -- it is where the gain flattens out, and it
@@ -79,6 +92,17 @@ func main() {
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Refusing to start beats starting and hoping. An unauthenticated inference
+	// server on a reachable interface is a GPU anybody can spend: sixty-four
+	// concurrent requests asking for the maximum token count occupy the batch
+	// for minutes, from one machine, with no way to say no.
+	if *authToken == "" && !loopbackOnly(*addr) {
+		log.Error("refusing to listen on a reachable address without -auth-token",
+			"addr", *addr,
+			"fix", "pass -auth-token, or bind 127.0.0.1 to keep it local")
+		os.Exit(1)
+	}
 
 	// No silent fallback. A server that quietly runs the mock when the worker
 	// fails to start would answer every request with plausible nonsense and
@@ -132,9 +156,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	guard := api.NewGuard(*authToken, *rate, *burst)
+	if *authToken != "" || *rate > 0 {
+		log.Info("guard", "auth", *authToken != "", "rate", *rate, "burst", *burst)
+	}
+
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: api.New(scheduler, be, log).Routes(),
+		Handler: guard.Wrap(api.New(scheduler, be, log).Routes()),
 		// No WriteTimeout: a generation is a long-lived stream and a deadline
 		// on the whole response would cut it off mid-sentence. The request
 		// context, MaxTokens and MaxWait are what bound a request here.
@@ -154,8 +183,35 @@ func main() {
 		IdleTimeout: 60 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM as well as interrupt. Interrupt alone is what a terminal sends;
+	// SIGTERM is what every process supervisor sends -- systemd, Docker,
+	// Kubernetes -- so without it a deployment kills generations mid-stream and
+	// the graceful shutdown below never runs. It is one identifier and it is the
+	// difference between "shuts down cleanly" and "shuts down cleanly when a
+	// human does it by hand".
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The guard's bucket map is keyed by client address, so on a reachable
+	// interface it grows with every address that has ever connected -- memory
+	// exhaustion at one packet per key. A full bucket is indistinguishable from
+	// one that does not exist, so the sweep is free to forget them.
+	if *rate > 0 {
+		go func() {
+			tick := time.NewTicker(time.Minute)
+			defer tick.Stop()
+			for {
+				select {
+				case now := <-tick.C:
+					if dropped := guard.Sweep(now, 10*time.Minute); dropped > 0 {
+						log.Debug("forgot idle rate-limit buckets", "count", dropped)
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 
 	go func() {
 		log.Info("listening",
@@ -178,4 +234,26 @@ func main() {
 		log.Error("the scheduler did not close cleanly", "error", err)
 	}
 	log.Info("stopped", "stats", scheduler.Stats())
+}
+
+// loopbackOnly reports whether an address will only accept connections from
+// this machine.
+//
+// The empty host in ":8080" is the trap: it means every interface, which reads
+// like a default and behaves like a decision. It is treated as reachable here,
+// which is why the default -addr does not start without a token.
+func loopbackOnly(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Not a host:port at all. Whatever it is, do not assume it is safe.
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
