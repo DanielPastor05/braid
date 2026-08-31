@@ -34,18 +34,18 @@ type Stats struct {
 	widthSum     atomic.Int64
 
 	// cached counts sequences admitted with a key/value cache slot, uncached
-	// those admitted without one. **uncached is expected to stay at zero, and
-	// that is the point of it.**
+	// those admitted without one, and which of the two is interesting depends on
+	// CacheSlots.
 	//
-	// There are MaxBatch slots; a sequence takes one in begin(); begin() is only
-	// reached while fewer than MaxBatch are active; and every active sequence
-	// holds exactly one until it finishes. Live slots therefore equal the active
-	// count, which is below MaxBatch, so the free list is never empty and the
-	// no-slot path is a safety net rather than something load can reach.
+	// At a slot per row of the batch, uncached cannot move: a sequence takes one
+	// in begin(), begin() is only reached while fewer than MaxBatch are active,
+	// and every active sequence holds exactly one until it finishes. Live slots
+	// equal the active count, so the free list is never empty. There, zero is an
+	// assertion -- if it moves, the free list is leaking.
 	//
-	// It is counted anyway because the alternative to a counter here is
-	// believing the paragraph above. If it moves, that reasoning has broken and
-	// sequences are quietly recomputing what they could have had.
+	// Below that, it moves on purpose. Cache memory is a budget, the sequences
+	// that miss out recompute, and the ratio is what the budget bought or gave
+	// up.
 	cached   atomic.Int64
 	uncached atomic.Int64
 
@@ -76,9 +76,9 @@ type Snapshot struct {
 	MeanWidth float64 `json:"mean_width"`
 
 	// Cached and Uncached are sequences admitted with and without a key/value
-	// cache slot. Uncached should be zero -- see the note on the counters, where
-	// the invariant that makes it zero is written down, which is why it is worth
-	// exporting a number that never changes.
+	// cache slot. See the note on the counters: whether the second one is an
+	// assertion or a measurement depends on whether CacheSlots is below
+	// MaxBatch.
 	Cached   int64 `json:"cached_sequences"`
 	Uncached int64 `json:"uncached_sequences"`
 

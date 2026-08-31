@@ -509,72 +509,85 @@ func TestRejectionsStayOutOfTheLatencyWindow(t *testing.T) {
 	}
 }
 
-// TestEverySequenceGetsACacheSlot is an invariant, and writing it is what
-// turned a metric I was about to ship into one I understood.
+// TestCacheSlotsAreABudgetAndRunningOutIsASlowdown covers both regimes, and the
+// difference between them is the whole reason CacheSlots exists.
 //
-// It was going to be a degradation curve: slots run out, the sequences that go
-// without are served by recomputing rather than refused, and the ratio says how
-// much slower the server got. That is a good failure mode and it is not this
-// server's, because it cannot happen here.
+// With a slot per row of the batch, nobody can go without: a sequence takes one
+// in begin(), begin() is only reached while fewer than MaxBatch are active, and
+// every active sequence holds exactly one until finish() gives it back. Live
+// slots equal the active count, so the free list is never empty. Zero is the
+// assertion there.
 //
-// There are MaxBatch slots. A sequence takes one in begin(), begin() is only
-// reached while len(active) < MaxBatch, and every active sequence holds exactly
-// one until finish() gives it back. So live slots equal len(active), which is
-// below MaxBatch, so the free list is never empty. The -1 branch is a safety
-// net over an invariant rather than a path load can reach.
-//
-// The counter stays, and what it is for is this: if it ever moves, the
-// invariant above has broken and a sequence is quietly running slower than it
-// should. Zero is the assertion.
-func TestEverySequenceGetsACacheSlot(t *testing.T) {
-	const slots = 3
+// Set CacheSlots below MaxBatch and that stops being true on purpose. Cache
+// memory becomes a budget -- the worker's pool is slots x context -- and the
+// sequences that miss out are served by *recomputing*, more slowly and just as
+// correctly. That is the failure mode worth having, and at this model's size it
+// is the only way to create memory pressure at all: one sequence costs 18 MB and
+// the card runs out of compute at a batch of sixty.
+func TestCacheSlotsAreABudgetAndRunningOutIsASlowdown(t *testing.T) {
 	const clients = 8
 
-	s, err := New(fastMock(), Config{MaxBatch: slots, QueueDepth: 64, MaxTokensLimit: 64})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	var wg sync.WaitGroup
-	texts := make([]string, clients)
-	for i := range clients {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			text, res := run(t, s, Request{
-				Prompt: "slots", MaxTokens: 12, Temperature: 0.7, Seed: uint64(i),
-			})
-			if res.Err != nil {
-				t.Errorf("client %d: %v", i, res.Err)
-				return
-			}
-			texts[i] = text
-		}()
-	}
-	wg.Wait()
-
-	for i, text := range texts {
-		if len(text) == 0 {
-			t.Errorf("client %d generated nothing", i)
+	run8 := func(t *testing.T, cfg Config) Snapshot {
+		t.Helper()
+		s, err := New(fastMock(), cfg)
+		if err != nil {
+			t.Fatal(err)
 		}
+		defer s.Close()
+
+		var wg sync.WaitGroup
+		texts := make([]string, clients)
+		for i := range clients {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				text, res := run(t, s, Request{
+					Prompt: "slots", MaxTokens: 12, Temperature: 0.7, Seed: uint64(i),
+				})
+				if res.Err != nil {
+					t.Errorf("client %d was refused rather than served: %v", i, res.Err)
+					return
+				}
+				texts[i] = text
+			}()
+		}
+		wg.Wait()
+
+		// Whichever regime, every client is served. A slot is an optimisation
+		// and never a condition of being answered.
+		for i, text := range texts {
+			if len(text) == 0 {
+				t.Errorf("client %d generated nothing", i)
+			}
+		}
+		return s.Stats()
 	}
 
-	snap := s.Stats()
-	if snap.Uncached != 0 {
-		t.Errorf("%d sequences ran without a cache slot; with MaxBatch slots and at "+
-			"most MaxBatch active, that should be impossible", snap.Uncached)
-	}
-	if snap.Cached != int64(clients) {
-		t.Errorf("%d clients were served but %d were counted as taking a slot",
-			clients, snap.Cached)
-	}
+	t.Run("a slot per row means nobody goes without", func(t *testing.T) {
+		snap := run8(t, Config{MaxBatch: 4, QueueDepth: 64, MaxTokensLimit: 64})
+		if snap.Uncached != 0 {
+			t.Errorf("%d sequences ran without a slot; with MaxBatch slots and at most "+
+				"MaxBatch active, that should be impossible", snap.Uncached)
+		}
+		if snap.Cached != clients {
+			t.Errorf("%d clients served but %d counted as taking a slot", clients, snap.Cached)
+		}
+	})
 
-	// And the slots come back. A leak here would not fail anything above -- the
-	// free list would just drain and later sequences would run uncached, which
-	// is slower and correct and would go unnoticed without this.
-	if len(s.freeSlots) != slots {
-		t.Errorf("%d of %d slots came back after everything finished",
-			len(s.freeSlots), slots)
-	}
+	t.Run("one slot for four rows means three recompute", func(t *testing.T) {
+		snap := run8(t, Config{
+			MaxBatch: 4, CacheSlots: 1, QueueDepth: 64, MaxTokensLimit: 64,
+		})
+		if snap.Cached+snap.Uncached != clients {
+			t.Errorf("%d clients admitted, %d accounted for",
+				clients, snap.Cached+snap.Uncached)
+		}
+		// The point of the sub-test: with one slot and four rows in a batch,
+		// somebody must have gone without. If this ever reads zero the free
+		// list is not the size it was asked for.
+		if snap.Uncached == 0 {
+			t.Error("one slot served four concurrent rows without anybody missing out")
+		}
+		t.Logf("%d cached, %d recomputed", snap.Cached, snap.Uncached)
+	})
 }

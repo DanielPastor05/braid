@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The GPU job below runs on nothing but this. See its comment for why a push
+  # trigger would be worse than no trigger.
+  workflow_dispatch:
 
 jobs:
   test:
@@ -51,3 +54,61 @@ jobs:
       # testdata/ and fails the job.
       - name: Fuzz the worker's response parser
         run: go test -run FuzzWorkerReadsAResponse -fuzz FuzzWorkerReadsAResponse -fuzztime 60s ./internal/backend/
+
+      # The Go half of the image, on every push.
+      #
+      # Not the whole image: the worker stage pulls a five-gigabyte CUDA devel
+      # base and compiles kernels for four architectures, which is twenty
+      # minutes a push to catch a class of error that a GPU-capable build
+      # environment would catch anyway. This stage is seconds and it does catch
+      # the ones that actually happen -- a Dockerfile that no longer parses, a
+      # package that stopped building without cgo, a path that moved.
+      - name: The server image builds
+        run: docker build --target server -t braid-server-stage .
+
+  # The tests that need a GPU, which is why they are not in the job above.
+  #
+  # Nothing in the free runner fleet has one, so this job is manual and expects
+  # a self-hosted runner labelled `gpu`. Until one is registered it does not run
+  # at all -- and it is worth being blunt about what that means: the divergence
+  # measurements, the chaos harness and the failover-with-a-warm-cache check all
+  # run on one desk, and the green badge on the job above does not cover them.
+  #
+  # workflow_dispatch only, deliberately. A `push` trigger with no matching
+  # runner queues forever and reports as pending, which is worse than not
+  # running: it looks like coverage.
+  gpu:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+
+      - name: Build the worker
+        run: |
+          cmake -B build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target braid_worker braid_train
+
+      - name: Train a checkpoint
+        run: ./build/braid_train . models/charlm 6000
+
+      # -p 1 is not decoration. Go runs packages in parallel, three of them
+      # start real workers, and two processes wanting seven gigabytes do not fit
+      # on eight. The symptom is "did not answer within 30s", which reads like a
+      # hang and is a queue for memory.
+      - name: The suite, against a real card
+        env:
+          BRAID_WORKER: ${{ github.workspace }}/build/braid_worker
+          BRAID_MODEL: ${{ github.workspace }}/models/charlm
+        run: go test -p 1 -count=1 -timeout 40m ./internal/...
+
+      - name: Cached decode agrees with recomputation
+        run: |
+          cmake --build build --target braid_test_cached
+          ENGINE_CUDA_MIN_FLOPS=1 ./build/braid_test_cached models/charlm

@@ -29,6 +29,7 @@ import (
 
 	"github.com/DanielPastor05/braid/internal/api"
 	"github.com/DanielPastor05/braid/internal/backend"
+	"github.com/DanielPastor05/braid/internal/kvmem"
 	"github.com/DanielPastor05/braid/internal/sched"
 )
 
@@ -49,6 +50,19 @@ func main() {
 		// operator to decide.
 		cache = flag.Bool("cache", true,
 			"keep a key/value cache in the worker, indexed by slot")
+		// What the cache may occupy on the card, in megabytes.
+		//
+		// The worker's pool is slots x context x the model's geometry, so this
+		// decides how many sequences can hold a cache at once -- and the
+		// sequences that cannot are served by recomputing, more slowly and just
+		// as correctly. Below MaxBatch it is the only way to make memory
+		// pressure exist at this model's size: one sequence at the full context
+		// costs 18 MB and the card runs out of compute at a batch of sixty.
+		//
+		// The default is what sixty-four slots need, so out of the box nobody
+		// goes without and this flag does nothing until it is turned down.
+		kvBudget = flag.Int("kv-budget-mb", 0,
+			"megabytes the key/value cache may occupy; 0 sizes it for -max-batch")
 		// The README has always said this server should not be exposed to
 		// anything. That was a sentence, and a sentence is not a control. These
 		// two are the control: without a token the server refuses to listen
@@ -121,6 +135,36 @@ func main() {
 		be   backend.Backend
 		kind string
 	)
+	// How many sequences can hold a cache slot, from the memory budget rather
+	// than from the batch size. internal/kvmem does the arithmetic -- the model's
+	// geometry times the context times two tensors per block -- so the answer is
+	// derived when the geometry changes instead of being a constant that used to
+	// be right.
+	cacheSlots := *maxBatch
+	if *kvBudget > 0 {
+		budget := kvmem.Budget{
+			Heads: 6, HeadDim: 64, Layers: 6,
+			Context: backend.SeqLen, BlockSize: 16,
+			Bytes: int64(*kvBudget) << 20,
+		}
+		affordable := budget.Sequences()
+		if affordable < 1 {
+			log.Error("the key/value budget does not buy one sequence at the full context",
+				"kv_budget_mb", *kvBudget,
+				"one_sequence_mb", budget.BytesPerSequence()>>20)
+			os.Exit(1)
+		}
+		if affordable < cacheSlots {
+			cacheSlots = affordable
+			// Said out loud because it changes how the server behaves under
+			// load, not just how much memory it takes: past this many
+			// concurrent sequences the extra ones recompute.
+			log.Warn("the key/value budget buys fewer slots than the batch",
+				"slots", cacheSlots, "max_batch", *maxBatch,
+				"one_sequence_mb", budget.BytesPerSequence()>>20)
+		}
+	}
+
 	if *worker != "" {
 		opts := backend.WorkerOptions{
 			MinMatmulFlops:       *minFlops,
@@ -129,7 +173,7 @@ func main() {
 			Cache:                *cache,
 			// A slot per row that can share a step. Sized here rather than in
 			// the worker because the scheduler is what decides MaxBatch.
-			CacheSlots: *maxBatch,
+			CacheSlots: cacheSlots,
 		}
 		// One worker is a Worker rather than a Pool of one. The pool's failover
 		// has nowhere to go with a single process, and a plain worker makes that
@@ -160,6 +204,7 @@ func main() {
 
 	scheduler, err := sched.New(be, sched.Config{
 		MaxBatch:       *maxBatch,
+		CacheSlots:     cacheSlots,
 		QueueDepth:     *queue,
 		MaxTokensLimit: *maxTokens,
 	})

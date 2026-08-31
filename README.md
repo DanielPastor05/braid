@@ -1059,13 +1059,26 @@ and once with a worker killed a second and a half in, when every slot is warm.
 subtly wrong would produce fluent text that differs, and that is the failure
 worth catching.
 
-**`internal/kvmem` is still not wired into the serving path.** It is arithmetic
-and a block allocator with tests; what it is waiting for is the per-row cache in the worker, which is
-waiting on three engine pull requests --
-[#7 `copy_into_rows`](https://github.com/DanielPastor05/cpp-ai-engine/pull/7),
-[#8 a fill and a mask per row](https://github.com/DanielPastor05/cpp-ai-engine/pull/8),
-[#9 a device path for `select_rows`](https://github.com/DanielPastor05/cpp-ai-engine/pull/9)
--- stacked in that order and all green.
+**What the server uses, and what it does not.** `-kv-budget-mb` sizes the number
+of cache slots from this arithmetic rather than from the batch size: the worker's
+pool is slots x context, so the budget decides how many sequences can hold a
+cache at once. Below `-max-batch` the free list runs out, and the sequences that
+miss a slot are **served by recomputing** -- more slowly, and identically, because
+the whole window is sent every step regardless. `/metrics` counts both.
+
+That degradation is the only way memory pressure exists at this size, and the
+package says so itself: one sequence costs 18 MB, sixty-four cost 1.12 GB, and
+the card runs out of *compute* at a batch of sixty. So the pressure has to be
+created -- a smaller budget, or a longer context -- rather than found. The same
+arithmetic at a real model's width and a 32k context binds hard and needs no
+help.
+
+**The block allocator and the three eviction policies are not called by
+anything.** They are the design for a paged cache, tested and unused, and the
+honest reason they are still here rather than deleted is that the worker's cache
+is slots x full context: nothing is ever allocated per block, so nothing is ever
+evicted. Wiring them in means paged attention, which is a kernel this project
+does not have.
 
 ```bash
 go test ./internal/kvmem/ -v
@@ -1423,6 +1436,52 @@ BRAID_WORKER="$PWD/build/braid_worker.exe" BRAID_MODEL="$PWD/models/charlm" go t
 they fitted on one card together. At 1024 they do not, and the symptom is not an
 out-of-memory message but a worker that stops answering and a test that reports
 `did not answer within 30s` — which reads like a hang and is a queue for memory.
+
+**And these are the tests CI does not run.** The green badge covers formatting,
+vet, the build, the mock-backed suite, an allocation regression gate and a minute
+of fuzzing — everything that needs no GPU. The divergence measurements, the chaos
+harness, the failover-with-a-warm-cache check and the cached-decode parity all
+skip on a runner with no card, which is every runner GitHub gives away. They run
+on one desk.
+
+The `gpu` job in `.github/workflows/ci.yml` is the fix and it is not enabled: it
+wants a self-hosted runner labelled `gpu` and is `workflow_dispatch` only, since
+a `push` trigger with no matching runner queues forever and reports as pending —
+which looks like coverage and is worse than nothing. Register a runner and it
+becomes real; until then this paragraph is the honest version of the badge.
+
+### In a container
+
+```bash
+docker build -t braid .
+```
+
+```bash
+docker run --gpus all -v "$PWD/models:/models:ro" -p 8080:8080 braid -auth-token "$TOKEN"
+```
+
+Two stages and two toolchains, because the two halves cannot be built by the same
+compiler — which is [the same reason they are two
+processes](#why-the-model-runs-in-another-process). The runtime layer is CUDA's
+*runtime* image rather than *devel*: the toolkit is a build dependency and
+carrying it would add gigabytes nothing runs.
+
+The model is not baked in. `braid_train` writes a 43 MB checkpoint that is
+reproducible from a seed, so an image carrying one would be shipping a build
+artifact with a copy of two repositories' source inside it. Mount it.
+
+Without `--gpus` the worker starts, logs `cuda no`, and serves from the CPU at a
+speed not worth measuring — a real fallback rather than a crash, and the log line
+says which one you got. Without `-auth-token` the server refuses to listen on
+`0.0.0.0` at all, which in a container is the useful default: an image that
+listens on every interface unauthenticated because it was convenient is how this
+goes wrong.
+
+**CI builds the Go stage on every push and not the CUDA one**, because that stage
+pulls a five-gigabyte base and compiles kernels for four architectures. So the
+image is verified to the extent that its server half compiles and its syntax
+holds; the worker stage has not been built anywhere but a machine with the
+toolkit.
 
 
 Training is about 35 minutes on a 3060 Ti and lands at **1.51 bits/char** — worse

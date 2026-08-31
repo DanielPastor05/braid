@@ -71,6 +71,20 @@ type Result struct {
 
 // Config tunes the loop. The zero value is not usable; see Default.
 type Config struct {
+	// CacheSlots is how many sequences may hold a key/value cache slot at once.
+	//
+	// Zero means MaxBatch, which is the arrangement where nobody ever goes
+	// without. Set it lower and cache memory becomes a budget rather than a
+	// consequence of the batch size: the worker's pool is slots x context, so
+	// halving this halves the gigabyte it reserves, and the sequences that miss
+	// out are served by recomputing rather than refused.
+	//
+	// That degradation is the point. It is the only way to make memory pressure
+	// exist at this model's size -- one sequence at the full context costs 18 MB
+	// and the card runs out of compute at a batch of sixty, so nothing about
+	// ordinary load creates it.
+	CacheSlots int
+
 	// MaxBatch is the most sequences that may share one forward pass. Above the
 	// point where the GPU is saturated this buys nothing and costs latency for
 	// everyone in the batch, which is why it is a number and not "as many as
@@ -197,11 +211,15 @@ func New(b backend.Backend, cfg Config) (*Scheduler, error) {
 		return nil, fmt.Errorf("sched: MaxTokensLimit must be at least 1, got %d", cfg.MaxTokensLimit)
 	}
 
+	slots := cfg.CacheSlots
+	if slots <= 0 || slots > cfg.MaxBatch {
+		slots = cfg.MaxBatch
+	}
 	// Handed out from the end, so the first sequence gets slot 0 and the
 	// numbering a worker sees starts where a person would expect it to.
-	free := make([]int32, cfg.MaxBatch)
+	free := make([]int32, slots)
 	for i := range free {
-		free[i] = int32(cfg.MaxBatch - 1 - i)
+		free[i] = int32(slots - 1 - i)
 	}
 
 	s := &Scheduler{

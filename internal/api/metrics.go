@@ -53,14 +53,19 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	// does have is indexed by slot instead.
 	gauge("braid_aligned_step_share", "Steps whose sequences were all the same length.", snap.AlignedShare)
 
-	// The second of these should never move. There are MaxBatch slots and at
-	// most MaxBatch sequences active, so one is always free -- and a sequence
-	// that somehow went without would still be served correctly, by
-	// recomputing, which is exactly why nothing else would notice. Alert on it
-	// being non-zero rather than on a rate.
+	// The ratio of these two is what -kv-budget-mb buys or gives up. With a slot
+	// per row of the batch the second stays at zero and the free list can never
+	// empty; with a smaller budget it rises, and those sequences are served by
+	// recomputing rather than refused -- slower, and identical, because the whole
+	// window goes to the worker every step either way.
+	//
+	// So alert on the ratio when the budget is deliberately small, and on any
+	// movement at all when it is not: at a slot per row, non-zero means the free
+	// list is leaking and sequences are quietly recomputing what they could have
+	// had.
 	counter("braid_sequences_cached_total", "Sequences admitted with a cache slot.", snap.Cached)
 	counter("braid_sequences_uncached_total",
-		"Sequences admitted without a cache slot. Expected to stay at zero.", snap.Uncached)
+		"Sequences admitted without a cache slot, and served by recomputing.", snap.Uncached)
 
 	if l := snap.Latency; l.Samples > 0 {
 		gauge("braid_latency_samples", "Completions in the latency window.", float64(l.Samples))
