@@ -89,15 +89,6 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusTooManyRequests, "the queue is full")
 		return
-	case errors.Is(err, sched.ErrWouldMissDeadline):
-		// Also a 429, and deliberately the same code: from the client's side
-		// both mean "come back later", and the difference -- there was room but
-		// not time -- is the server's business rather than theirs. The message
-		// says which, for anyone reading logs.
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusTooManyRequests,
-			"the queue is longer than max_wait_ms allows for")
-		return
 	case errors.Is(err, sched.ErrClosed):
 		writeError(w, http.StatusServiceUnavailable, "the server is shutting down")
 		return

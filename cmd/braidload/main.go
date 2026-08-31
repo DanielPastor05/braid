@@ -114,13 +114,16 @@ func main() {
 		// was never pushed. These two make it possible to push.
 		arrivals = flag.String("arrivals", "",
 			"open loop: comma-separated requests per second to offer, instead of -concurrency")
-		forEach = flag.Duration("for", 20*time.Second, "how long to hold each arrival rate")
+		forEach  = flag.Duration("for", 20*time.Second, "how long to hold each arrival rate")
+		waitFlag = flag.Int("max-wait-ms", 0,
+			"deadline to send with each request; 0 sends none and the server queues instead")
 		sloFlag = flag.Float64("slo-ms", 100,
 			"time to first token a request must beat to count towards goodput")
 		repeat = flag.Int("repeat", 1,
 			"how many times to measure each level; above one the table reports a median and a range")
 	)
 	flag.Parse()
+	maxWaitMS = *waitFlag
 
 	client := &http.Client{Timeout: 10 * time.Minute}
 
@@ -287,13 +290,23 @@ func sweep(client *http.Client, addr string, n, count, maxTokens int, temp float
 
 // generate runs one request and times it, reading the stream token by token so
 // that the first-token measurement is the client's, not the server's.
+// maxWaitMS is sent with every request when it is above zero: the deadline the
+// caller is willing to wait before its first token. A server that admits on
+// queue depth alone cannot honour it, which is the point of being able to send
+// it -- the difference between the two admissions is only visible from out here.
+var maxWaitMS int
+
 func generate(client *http.Client, addr string, maxTokens int, temp float32, seed uint64) sample {
-	body, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"prompt":      "the engine ",
 		"max_tokens":  maxTokens,
 		"temperature": temp,
 		"seed":        seed,
-	})
+	}
+	if maxWaitMS > 0 {
+		fields["max_wait_ms"] = maxWaitMS
+	}
+	body, _ := json.Marshal(fields)
 
 	start := time.Now()
 	resp, err := client.Post(addr+"/v1/generate", "application/json", bytes.NewReader(body))

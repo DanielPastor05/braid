@@ -26,7 +26,8 @@ answer, and this page tries hard not to blur the two.
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
 | **Throughput** | 328 tokens/s at one client, **5 394 at sixty-four** - median of three |
 | **What batching buys** | **16.4x** in tokens, and [none of it past the knee](#the-part-of-it-anybody-is-waiting-for) in goodput |
-| **Under real arrivals** | across the cliff throughput *rises* 15% and [goodput falls six-fold](#and-the-same-cliff-against-the-real-model), and nothing is refused until well past it |
+| **Under real arrivals** | across the cliff throughput *rises* 15% and [goodput falls six-fold](#and-the-same-cliff-against-the-real-model) |
+| **The fix that was not** | admission on predicted wait, built for that cliff, [delivered four times less](#so-i-built-admission-on-predicted-wait-and-it-made-things-worse) than queueing and was reverted |
 | **Where a step goes at batch 64** | 20.0 ms model, 0.39 ms copy back, 0.10 ms sampling, 0.89 ms pipe |
 | **Batching invariance** | 0 divergences in 25 000 draws, and the logits behind them [drift 2e-5](#a-zero-that-was-hiding-its-own-denominator) - which is the number that means something |
 | **A worker killed mid-load** | 0 requests failed, and with a warm cache the text is [character for character the same](#what-the-cache-is-not-allowed-to-cost) |
@@ -235,20 +236,44 @@ request is admitted and every request is late — a p99 of 1.3 seconds with a
 100 ms SLO, and not one 429 to tell anybody. `QueueDepth` is 256 by default and
 that is a decision to make everyone slow rather than tell anyone no.
 
-**So it now admits on predicted wait as well as on room.** A request that says
-what late means to it -- `max_wait_ms` -- is refused at submission when the queue
-ahead of it is longer than that, rather than admitted and answered too late. The
-estimate is one multiplication: at capacity the batch is full, so one sequence
-finishes every `tokens / MaxBatch` steps, and the nth in the queue waits about n
-of those. Wrong in detail, right in shape, and only ever compared against a
-deadline the caller volunteered.
+### So I built admission on predicted wait, and it made things worse
 
 Queue depth answers *is there room*. A caller with a deadline asked *will I be
-served in time*, and those stopped being the same question at 200 requests a
-second.
+served in time*, and past the cliff those are different questions -- so `Submit`
+grew an estimate: at capacity the batch is full, one sequence finishes every
+`tokens / MaxBatch` steps, and the nth in the queue waits about n of those.
+Refuse when that exceeds the caller's `max_wait_ms`. One multiplication over
+counters the scheduler already had.
 
-Both refusals are a 429, deliberately: from the client's side they both mean come
-back later, and which one it was is the server's business.
+Measured against simply queueing, at the same offered rates, scoring goodput
+against the same 100 ms:
+
+| offered/s | queueing | admitting on predicted wait |
+|---|---|---|
+| 150 | 3 709 | 3 866 |
+| 200 | **3 348** | **836** |
+| 250 | 204 | **0** |
+
+**Four times less useful work at 200, and nothing at all served at 250.** A 2x
+margin on the deadline was tried and changed nothing that mattered.
+
+The mechanism is worth more than the feature would have been. **Simply queueing
+already meets the deadline for most requests at 200/s** -- goodput 3 348 of 4 168
+tokens -- and the predictor said they would all miss. It models a queued request
+as waiting for slots to free one at a time, when `admit` refills the batch to
+`MaxBatch` in a single pass: thirty queued requests can enter on one step, not
+over thirty steps. Systematically pessimistic, so it sheds work the server has
+the capacity for, and shedding makes the queue shorter, which makes the estimate
+look justified.
+
+So it was reverted. What survives is the step timing it needed --
+`mean_step_ms` is in `/stats` now, and `braidload` can send a deadline with
+`-max-wait-ms` -- and the knowledge that **the honest fix here is not a better
+estimator.** Load shedding is worth having when the server genuinely cannot serve
+the work; at 200 requests a second this one can, and the queue was already the
+right answer. The cliff at 250 is where shedding would pay, and admission that
+only fires there needs to measure the tail it is protecting rather than predict
+it.
 
 ```bash
 go run ./cmd/braidload -arrivals 20,50,100,150,200,250 -for 15s -max-tokens 30

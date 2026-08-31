@@ -35,18 +35,6 @@ var (
 	// after the GPU has already worked on it wastes the work.
 	ErrDeadlineExceeded = errors.New("sched: deadline passed before the request could start")
 
-	// ErrWouldMissDeadline is returned at submission when the queue is short
-	// enough to accept the request and long enough that it would not be served
-	// in time.
-	//
-	// It exists because of a measurement. Offered two hundred requests a second
-	// against a capacity near one hundred and fifty, this server admitted every
-	// one of them -- the queue is 256 deep and swallowed the whole overload --
-	// and answered them at a p99 of 1.3 seconds against a 100 ms budget, without
-	// a single rejection to say so. Queue depth is the wrong thing to admit on:
-	// it says whether there is *room*, and the caller asked about *time*.
-	ErrWouldMissDeadline = errors.New("sched: the queue is longer than the caller's deadline")
-
 	// ErrClosed is returned once the scheduler has been shut down.
 	ErrClosed = errors.New("sched: closed")
 )
@@ -281,11 +269,6 @@ func (s *Scheduler) Submit(ctx context.Context, req Request) (<-chan Token, <-ch
 	// Told no now rather than late later. Only for callers who said what late
 	// means to them: without a MaxWait there is no deadline to miss and the
 	// queue is the right answer.
-	if req.MaxWait > 0 && s.predictedWait(req.MaxTokens) > req.MaxWait {
-		s.stats.rejected.Add(1)
-		return nil, nil, ErrWouldMissDeadline
-	}
-
 	select {
 	case s.incoming <- seq:
 		s.stats.queued.Add(1)
@@ -294,33 +277,6 @@ func (s *Scheduler) Submit(ctx context.Context, req Request) (<-chan Token, <-ch
 		s.stats.rejected.Add(1)
 		return nil, nil, ErrQueueFull
 	}
-}
-
-// predictedWait estimates how long a request arriving now would sit before its
-// first token.
-//
-// At capacity the batch is full, so a queued request waits for somebody to
-// finish. One sequence finishes every `tokens / MaxBatch` steps on average, so
-// the nth in the queue waits about n of those. The new request's own MaxTokens
-// stands in for the queue's, which is wrong in detail and right in shape: a
-// queue of long generations does drain more slowly.
-//
-// Deliberately not a control loop. It is one multiplication over counters the
-// scheduler already keeps, and it is only ever compared against a deadline the
-// caller volunteered -- so being off by a factor is a request served or refused
-// slightly wrongly, not a server that oscillates.
-func (s *Scheduler) predictedWait(tokens int) time.Duration {
-	steps := s.stats.steps.Load()
-	if steps == 0 {
-		return 0 // nothing measured yet; the queue is the only answer available
-	}
-	perStep := time.Duration(s.stats.stepNanos.Load() / steps)
-	ahead := len(s.incoming)
-	if ahead == 0 {
-		return 0
-	}
-	stepsPerCompletion := float64(tokens) / float64(s.cfg.MaxBatch)
-	return time.Duration(float64(ahead) * stepsPerCompletion * float64(perStep))
 }
 
 // Close stops the loop and fails everything still in flight. It returns once
