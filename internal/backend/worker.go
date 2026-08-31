@@ -154,6 +154,17 @@ type WorkerOptions struct {
 	// noise. With the logits it measures the noise.
 	EmitLogits bool
 
+	// Cache asks the worker to keep a key/value cache indexed by the slot each
+	// row carries.
+	//
+	// Off by default, and that is a measurement rather than caution: it buys
+	// 1.29x the throughput at sixteen clients and takes TTFT p95 from 24 ms to
+	// 194, because a sequence arriving has to get its prompt into the cache and
+	// the worker does those one at a time inside a step, with every other row
+	// waiting behind them. Which half of that trade matters is the operator's
+	// call.
+	Cache bool
+
 	// MinLayerNormElements is the third of the engine's thresholds, and the one
 	// that decided whether a small forward chained across the card or came home
 	// at every normalisation.
@@ -217,6 +228,9 @@ func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*W
 	}
 	if opts.EmitLogits {
 		w.cmd.Env = append(w.cmd.Env, "BRAID_EMIT_LOGITS=1")
+	}
+	if opts.Cache {
+		w.cmd.Env = append(w.cmd.Env, "BRAID_CACHE=1")
 	}
 
 	stdin, err := w.cmd.StdinPipe()

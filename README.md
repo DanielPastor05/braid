@@ -887,48 +887,80 @@ guessed "about a quarter of the step, and then the fused attention kernel has a
 baseline to beat"; measured it is a tenth, and the baseline to beat is the
 attention over capacity rather than the movement.
 
-### It is wired in now, and it is slower
+### It is wired in, and it buys throughput with tail latency
 
 The worker holds the cache, the protocol carries a slot per row (BRD7), and the
-scheduler hands slots out of a free list of `MaxBatch` and takes them back when
-a sequence ends. `BRAID_CACHE=1` turns it on. Same harness, same weights, one
+scheduler hands slots out of a free list of `MaxBatch`, taking them back when a
+sequence ends. `BRAID_CACHE=1` turns it on. Same harness, same weights, one
 worker:
 
-| clients | without the cache | with it | kernels |
-|---|---|---|---|
-| 1 | 311 tok/s | **336** | 177 → 177 |
-| 4 | 714 | 787 | 177 → 194 |
-| 16 | **1 838** | 1 136 | 177 → **263** |
-| 64 | **2 346** | 1 076 | 177 → **558** |
+| clients | tokens/s off | on | | TTFT p95 off | on |
+|---|---|---|---|---|---|
+| 1 | 318 | 326 | 1.03x | 8 ms | 8 ms |
+| 4 | 720 | **1 014** | **1.41x** | 15 ms | 29 ms |
+| 16 | 1 811 | **2 327** | **1.29x** | 24 ms | **194 ms** |
+| 32 | 2 469 | **2 775** | 1.12x | 35 ms | **326 ms** |
+| 64 | 2 735 | 2 695 | 0.99x | 59 ms | **678 ms** |
 
-It wins where the batch is small and loses badly where it is not, which is the
-opposite of what the component benchmark predicted, and the kernel count says
-why: a step is launching three times the kernels it used to.
+**Throughput up to 1.41x, and the tail eight times worse.** Both halves are the
+same cause and it is worth naming: a sequence arriving has to get its prompt into
+the cache, which is an extra forward pass, and the worker does those one at a
+time inside the step. Every other row in that batch waits behind them. That is
+**prefill interfering with decode**, the problem real serving systems answer with
+chunked prefill or by disaggregating the two, and neither is a two-line change.
 
-**Two of those were my own bugs, and both are the same bug.** The first ordering
-of gather-and-narrow moved 1.2 GB a step instead of 4.7 MB -- 125 tokens a
-second, fifteen times *worse* than no cache. The second was the prefill
-allocating a cache at the full context to write forty positions, which is
-[exactly the finding above](#the-cache-is-built-and-what-it-costs-is-the-room-you-gave-it)
-committed in the one place the finding was not looking. Fixing them took 125 →
-889 → 1 136.
+So the flag stays **off by default**. A server whose p95 goes from 24 ms to 194
+for 1.29x the tokens has not obviously been improved, and which half matters is
+the operator's call rather than mine.
 
-**What is left is not a bug.** Each arriving sequence needs its prompt in the
-cache, which is one extra forward pass, and at thirty-token generations that is
-one prefill for every thirty cached steps: 0.52 prefills a step at sixteen
-clients, times 177 kernels, is the 263. And the step itself still narrows the
-whole pool -- sixty-four slots at width forty-eight -- to serve sixteen active
-rows, because `select_rows` gives sixteen rows at the *full context* and `slice`
-gives sixty-four slots at the *right width*, and the thing actually wanted is
-sixteen by forty-eight. Four times less than the better of the two.
+**What the cache does not cost is correctness under failover.** A worker with it
+on holds state -- the keys and values of every sequence in its slots -- and the
+claim the protocol makes is that this state is never authoritative: the whole
+window is sent every step, so a replacement worker refills a slot it has never
+seen and carries on.
 
-So the next primitive is a gather that takes a width, and this is the third one
-this phase has needed and not found after
-[#11](https://github.com/DanielPastor05/cpp-ai-engine/pull/11) and
-[#12](https://github.com/DanielPastor05/cpp-ai-engine/pull/12). Until it exists
-the flag stays **off by default**, because a server that is slower with its cache
-than without it should not ship with the cache on, however much work went into
-it.
+`TestAKilledWorkerLosesItsCacheAndNotItsAnswer` is that claim as a test rather
+than a paragraph. Six clients, a hundred and twenty tokens each, temperature low
+enough that the sampler lands on the argmax, generated twice: once undisturbed
+and once with a worker killed a second and a half in, when every slot is warm.
+**The two runs agree character for character.** Not "it did not crash" and not
+"the text is plausible" -- the same characters, because a cache that came back
+subtly wrong would produce fluent text that differs, and that is the failure
+worth catching.
+
+### Four bugs on the way, and three were the same bug
+
+Getting from *fifteen times slower* to 1.29x took four fixes, and the pattern in
+them is worth more than the number:
+
+| | throughput at 16 clients |
+|---|---|
+| gather-and-narrow in the wrong order | 125 tok/s |
+| prefill allocating at the full context | 889 |
+| gather and narrow as two operations | 1 136 → 1 239 |
+| **the pool never reached the device** | **2 327** |
+
+The first was picking one order and writing a comment calling it generally
+cheaper, which
+[this repository's own benchmark](#and-the-other-one-found-the-same-way) had
+already contradicted. The second was
+[the capacity finding](#the-cache-is-built-and-what-it-costs-is-the-room-you-gave-it)
+committed in the one place that finding was not looking. The third wanted a
+primitive that did not exist and is now
+[#13](https://github.com/DanielPastor05/cpp-ai-engine/pull/13).
+
+**The fourth is the one to remember.** Every device path in this engine is
+admitted on *residency*: `select_rows_window` needs the pool on the card to read
+it, `scatter_rows` needs it there to write it, and both fall back to the host
+silently when it is not. A pool built by `make_caches` has only ever existed on
+the host — so nothing ever put it on the card, and the cache spent its whole life
+on the wrong side of PCIe. The fix is adding zeros to zeros once, which looks
+like a no-op and is the opposite of one.
+
+That trap has now produced four wrong results in one day: a gather benchmark
+reporting PCIe bandwidth, a write-back that looked faster than the kernel
+replacing it, and this. **If a number here is within an order of magnitude of
+PCIe, check residency before believing it.**
 
 **`internal/kvmem` is still not wired into the serving path.** It is arithmetic
 and a block allocator with tests; what it is waiting for is the per-row cache in the worker, which is

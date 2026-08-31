@@ -1,6 +1,7 @@
 package sched
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -174,4 +175,111 @@ func TestAPoolOfOneStillServes(t *testing.T) {
 	if stats := pool.PoolStats(); stats.Deaths != 0 || stats.Failovers != 0 {
 		t.Errorf("a quiet run recorded %d deaths and %d failovers", stats.Deaths, stats.Failovers)
 	}
+}
+
+// TestAKilledWorkerLosesItsCacheAndNotItsAnswer is the property the cache is
+// allowed to cost nothing: correctness under failover.
+//
+// A worker with the cache on holds state -- the keys and values of every
+// sequence in its slots -- and the protocol's claim is that this state is never
+// authoritative. The scheduler still sends the whole window every step, so a
+// replacement worker that has never seen a sequence refills its slot from that
+// window and carries on. Killing one mid-generation should therefore change the
+// timing and nothing else.
+//
+// The check is against the same prompts and seeds generated with nothing killed:
+// not "it did not crash" and not "the text is plausible", but the same
+// characters. A cache that came back subtly wrong would produce fluent text that
+// differs, which is the failure this exists to catch.
+func TestAKilledWorkerLosesItsCacheAndNotItsAnswer(t *testing.T) {
+	exe := os.Getenv("BRAID_WORKER")
+	model := os.Getenv("BRAID_MODEL")
+	if exe == "" || model == "" {
+		t.Skip("set BRAID_WORKER and BRAID_MODEL to run this against the engine")
+	}
+
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	opts := backend.WorkerOptions{
+		MinMatmulFlops:       1 << 20,
+		MinLayerNormElements: 2048,
+		Cache:                true,
+	}
+
+	const clients = 6
+	const tokens = 120
+
+	// Deterministic: temperature low enough that the sampler lands on the
+	// argmax, and a seed per client. Two runs of this must agree character for
+	// character or nothing below means anything.
+	generate := func(kill bool) []string {
+		pool, err := backend.NewPool(exe, model, 3, opts, quiet)
+		if err != nil {
+			t.Fatalf("starting the pool: %v", err)
+		}
+		s, err := New(pool, Config{MaxBatch: 8, QueueDepth: 64, MaxTokensLimit: 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		out := make([]string, clients)
+		var wg sync.WaitGroup
+		for i := range clients {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				text, res := run(t, s, Request{
+					Prompt:      fmt.Sprintf("the %d cache", i),
+					MaxTokens:   tokens,
+					Temperature: 1e-4,
+					Seed:        uint64(i + 1),
+				})
+				if res.Err != nil {
+					t.Errorf("client %d: %v", i, res.Err)
+					return
+				}
+				out[i] = text
+			}()
+		}
+
+		if kill {
+			// Late enough that every slot is warm, early enough that most of the
+			// generation is still ahead: a kill after the last step would prove
+			// nothing, which this repository's chaos harness already learned once.
+			time.Sleep(1500 * time.Millisecond)
+			pids := pool.Pids()
+			if len(pids) < 2 {
+				t.Errorf("expected a live pool, found %d workers -- this run proves nothing",
+					len(pids))
+			} else if victim, err := os.FindProcess(pids[0]); err == nil {
+				if err := victim.Kill(); err != nil {
+					t.Errorf("killing worker %d: %v", pids[0], err)
+				} else {
+					t.Logf("killed worker pid %d with warm caches", pids[0])
+				}
+			}
+		}
+		wg.Wait()
+		return out
+	}
+
+	clean := generate(false)
+	killed := generate(true)
+
+	for i := range clients {
+		if clean[i] == "" {
+			t.Fatalf("client %d produced nothing even with no kill", i)
+		}
+		if clean[i] != killed[i] {
+			t.Errorf("client %d differs after a worker died with a warm cache\n  clean:  %q\n  killed: %q",
+				i, first(clean[i], 60), first(killed[i], 60))
+		}
+	}
+}
+
+func first(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

@@ -304,6 +304,26 @@ int main(int argc, char** argv) {
         // server, so nothing in the old pool is addressable any more. It happens
         // once, on the first frame.
         pool = model.make_caches(slots, braid::kSeqLen);
+
+        // Put it on the card, once, and this is not optional.
+        //
+        // Every device path in the engine is admitted on residency, and both of
+        // the ones this pool needs -- select_rows_window to read it and
+        // scatter_rows to write it -- *require* the pool to be resident and
+        // silently take the host path when it is not. A pool built by
+        // make_caches has only ever existed on the host, so nothing would ever
+        // put it there: each step would gather on the host, upload, step,
+        // download, and scatter on the host. The cache would live on the wrong
+        // side of PCIe for its whole life.
+        //
+        // Adding zeros to zeros is the cheapest operation that leaves the result
+        // resident. It looks like a no-op and it is the opposite of one.
+        for (auto& block : pool) {
+            block.keys = block.keys + block.keys;
+            block.values = block.values + block.values;
+        }
+        engine::cuda::synchronize();
+
         pool_slots = slots;
     };
 
@@ -465,35 +485,23 @@ int main(int argc, char** argv) {
                     at[i] = static_cast<std::size_t>(lengths[i]) - 1;
                 }
 
-                // Gather the active slots, narrowed to the step's width -- and
-                // the order of those two decides the step.
+                // The active slots at the step's width, in one operation.
                 //
-                // Narrowing first touches every slot at the new width;
-                // gathering first touches the active slots at the full context.
-                // So it is `pool_slots * cap` against `n * kSeqLen`, and neither
-                // wins everywhere: a small batch out of a large pool wants the
-                // gather first, a full batch at a short width wants the slice.
-                //
-                // Getting this backwards is not a missed optimisation. Serving
-                // thirty-token generations from sixty-four slots, the wrong
-                // order moves 1.2 GB a step instead of 4.7 MB, and the server
-                // measured **fifteen times slower with the cache than without
-                // it** -- 125 tokens a second against 1 964. That is how this
-                // condition came to be here rather than a comment claiming one
-                // order was generally better.
-                const bool narrow_first = pool_slots * cap < static_cast<std::size_t>(n) * braid::kSeqLen;
-
+                // Composing gather and slice moves the intersection twice over:
+                // gathering first takes `n` rows at the *full context*,
+                // narrowing first takes *every slot* at the right width, and
+                // what is wanted is `n * cap`. Serving sixteen rows at width
+                // forty-eight from sixty-four slots of a thousand positions, the
+                // better composition still moves four times too much and the
+                // natural one twenty-one times too much -- which is why this
+                // server was slower with its cache than without it until
+                // select_rows_window existed.
                 std::vector<engine::nn::KVCache> compact;
                 compact.reserve(braid::kBlocks);
                 for (std::size_t b = 0; b < braid::kBlocks; ++b) {
                     engine::nn::KVCache one(1, braid::kHeads, 1, braid::kDModel / braid::kHeads);
-                    if (narrow_first) {
-                        one.keys = pool[b].keys.slice(2, 0, cap).select_rows(active);
-                        one.values = pool[b].values.slice(2, 0, cap).select_rows(active);
-                    } else {
-                        one.keys = pool[b].keys.select_rows(active).slice(2, 0, cap);
-                        one.values = pool[b].values.select_rows(active).slice(2, 0, cap);
-                    }
+                    one.keys = pool[b].keys.select_rows_window(active, 2, 0, cap);
+                    one.values = pool[b].values.select_rows_window(active, 2, 0, cap);
                     one.filled.assign(at.begin(), at.end());
                     compact.push_back(std::move(one));
                 }
