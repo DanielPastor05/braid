@@ -40,6 +40,10 @@ type Worker struct {
 
 	stepTimeout time.Duration
 	timing      Timings
+
+	// A diagnostic, off unless asked for. See EmitLogits.
+	emitLogits bool
+	lastLogits []float32
 }
 
 // Timings is where a step's wall time went, summed over every step so far.
@@ -138,6 +142,18 @@ type WorkerOptions struct {
 	// this is not a latency budget, it is the line between slow and gone.
 	StepTimeout time.Duration
 
+	// EmitLogits asks the worker to append the logits of every sampled row to
+	// each response.
+	//
+	// It is off by default and serving does not want it: n * vocab floats a step
+	// that nobody reads, when the sampled id is the whole answer. What wants it
+	// is the batch-invariance measurement. That test compares the *token* two
+	// runs produced, so it can only see a difference in the arithmetic when the
+	// difference happens to cross a boundary of the sampler's inverse CDF --
+	// which measures the probability that the noise mattered rather than the
+	// noise. With the logits it measures the noise.
+	EmitLogits bool
+
 	// MinLayerNormElements is the third of the engine's thresholds, and the one
 	// that decided whether a small forward chained across the card or came home
 	// at every normalisation.
@@ -167,7 +183,12 @@ func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*W
 	if timeout <= 0 {
 		timeout = defaultStepTimeout
 	}
-	w := &Worker{alphabet: alphabet, seqLen: workerSeqLen, stepTimeout: timeout}
+	w := &Worker{
+		alphabet:    alphabet,
+		seqLen:      workerSeqLen,
+		stepTimeout: timeout,
+		emitLogits:  opts.EmitLogits,
+	}
 	for i := range w.index {
 		w.index[i] = -1
 	}
@@ -193,6 +214,9 @@ func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*W
 	if opts.MinLayerNormElements > 0 {
 		w.cmd.Env = append(w.cmd.Env,
 			fmt.Sprintf("ENGINE_CUDA_MIN_LAYERNORM=%d", opts.MinLayerNormElements))
+	}
+	if opts.EmitLogits {
+		w.cmd.Env = append(w.cmd.Env, "BRAID_EMIT_LOGITS=1")
 	}
 
 	stdin, err := w.cmd.StdinPipe()
@@ -424,10 +448,16 @@ func (w *Worker) exchange(frame []byte, n int) ([]int32, [7]uint64, error) {
 			"backend: the worker sent status %d, which is not a status", status)
 	}
 
-	// n ids, the three timings the worker measured of itself, and the count
-	// of kernels its forward launched.
+	// n ids, the timings the worker measured of itself, the count of kernels its
+	// forward launched, and -- only when it was asked for -- the logits of every
+	// sampled row.
 	const timingBytes = 7 * 8
 	need := n*4 + timingBytes
+	logitCount := 0
+	if w.emitLogits {
+		logitCount = n * len(w.alphabet)
+		need += logitCount * 4
+	}
 	if cap(w.result) < need {
 		w.result = make([]byte, need)
 	}
@@ -443,7 +473,27 @@ func (w *Worker) exchange(frame []byte, n int) ([]int32, [7]uint64, error) {
 	for i := range timings {
 		timings[i] = binary.LittleEndian.Uint64(result[n*4+i*8:])
 	}
+	if logitCount > 0 {
+		at := n*4 + timingBytes
+		w.lastLogits = make([]float32, logitCount)
+		for i := range w.lastLogits {
+			w.lastLogits[i] = math.Float32frombits(binary.LittleEndian.Uint32(result[at+i*4:]))
+		}
+	}
 	return out, timings, nil
+}
+
+// LastLogits is the logits of every sampled row of the most recent step, laid
+// out row-major as n * VocabSize, or nil unless the worker was started with
+// EmitLogits.
+//
+// It is deliberately the *last* step rather than a return from Step: threading a
+// diagnostic through the Backend interface would put it in front of every
+// implementation and every caller, to be ignored by all of them.
+func (w *Worker) LastLogits() []float32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.lastLogits
 }
 
 // killLocked ends the process. The caller holds mu; closed is deliberately left

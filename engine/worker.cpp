@@ -29,6 +29,7 @@
 //             u64 kernels                  CUDA kernels the forward launched
 //             u64 to_device                 host->device copies (PCIe crossings)
 //             u64 to_host                   device->host copies
+//             f32 logits[n * vocab]        only with BRAID_EMIT_LOGITS=1
 //     error   u32 length, then that many bytes of message
 //
 // The timings exist so that the server can subtract them from the wall time it
@@ -50,6 +51,15 @@
 // position length-1, but only if the caller says where that is, which is what
 // this field is for and why the version went up rather than the field being
 // inferred.
+//
+// The logits block is a diagnostic and is off unless BRAID_EMIT_LOGITS is set,
+// which is why it is an environment variable rather than a protocol version.
+// Serving does not want it: it is n * vocab floats a step that nobody reads, and
+// the sampled id is the whole answer. What wants it is the batch-invariance
+// measurement, which compares the *token* two runs produced and so can only see
+// a difference in the arithmetic when it happens to cross a boundary of the
+// sampler's inverse CDF. Comparing the logits measures the noise instead of the
+// probability that the noise mattered.
 //
 // A zero-length read on stdin is a clean shutdown, not a failure: it is what
 // the server closing the pipe looks like.
@@ -187,6 +197,12 @@ int main(int argc, char** argv) {
     // the discontinuity at a batch of six was traced: if pinning the kernel
     // flattens it, the cause is which kernel Auto picks and not how much work
     // there is. Auto is what braid actually serves with.
+    // A diagnostic, read once. See the note on the logits block above.
+    const bool emit_logits = std::getenv("BRAID_EMIT_LOGITS") != nullptr;
+    if (emit_logits) {
+        std::cerr << "braid_worker: emitting logits, which serving does not want" << std::endl;
+    }
+
     if (const char* forced = std::getenv("BRAID_MATMUL_KERNEL")) {
         const std::string want = forced;
         engine::cuda::MatmulKernel kernel = engine::cuda::MatmulKernel::Auto;
@@ -244,6 +260,7 @@ int main(int argc, char** argv) {
     std::vector<float> temperatures;
     std::vector<std::uint64_t> seeds;
     std::vector<std::int32_t> next;
+    std::vector<float> sampled;  // only filled when BRAID_EMIT_LOGITS is set
 
     for (;;) {
         std::uint32_t magic = 0;
@@ -340,12 +357,16 @@ int main(int argc, char** argv) {
 
             const std::size_t vocab_size = vocab.size();
             next.resize(n);
+            if (emit_logits) sampled.resize(static_cast<std::size_t>(n) * vocab_size);
             for (std::uint32_t i = 0; i < n; ++i) {
                 // The last *real* position of this row, not the last position
                 // of the window. Everything past it is padding, which the
                 // causal mask makes unreachable from here.
                 const std::size_t last = static_cast<std::size_t>(lengths[i]) - 1;
                 const float* row = data + (static_cast<std::size_t>(i) * width + last) * vocab_size;
+                if (emit_logits) {
+                    std::copy_n(row, vocab_size, sampled.begin() + static_cast<std::size_t>(i) * vocab_size);
+                }
                 next[i] = sample_row(row, vocab_size, temperatures[i], seeds[i]);
             }
             const auto t3 = clock::now();
@@ -376,6 +397,9 @@ int main(int argc, char** argv) {
             write_all(&kernels, sizeof kernels);
             write_all(&to_device, sizeof to_device);
             write_all(&to_host, sizeof to_host);
+            if (emit_logits) {
+                write_all(sampled.data(), sampled.size() * sizeof(float));
+            }
             std::cout.flush();
         } catch (const std::exception& e) {
             write_error(e.what());
