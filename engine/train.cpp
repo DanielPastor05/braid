@@ -37,11 +37,34 @@
 
 namespace {
 
-// Sixteen rather than the thirty-two the small model trained at. Six blocks
-// over a 256-id context keep (batch, heads, 256, 256) attention scores alive
-// for the backward pass -- 25 MB a block at this batch -- and the card has 8 GB
-// to hold all of it, the parameters, the gradients and Adam's two moments.
-constexpr std::size_t kBatch = 16;
+// Four, down from sixteen, and the reason is the square in the attention.
+//
+// Six blocks keep (batch, heads, S, S) scores alive for the backward pass. At a
+// 256-id context and a batch of sixteen that was 25 MB a block; at 1024 it is
+// 100 MB a block even at four, so 600 MB of scores before the parameters, the
+// gradients and Adam's two moments are counted, on a card with 8 GB.
+//
+// Four is also the batch that keeps the step the same size in tokens: 4 * 1024
+// is 16 * 256, so the same number of steps still sees the same amount of corpus
+// and the learning rate schedule does not have to be re-derived. What changes is
+// the cost of a step, because attention is the part that squares.
+constexpr std::size_t kBatch = 4;
+
+// write_vocab puts the alphabet beside the weights. Called before training
+// rather than after, so that an interrupted run leaves a checkpoint that can
+// still be loaded.
+bool write_vocab(const std::string& prefix, const engine::data::CharVocab& vocab) {
+    std::string alphabet;
+    for (std::size_t i = 0; i < vocab.size(); ++i) alphabet += vocab.symbol(i);
+
+    std::ofstream out(prefix + ".vocab", std::ios::binary);
+    if (!out) {
+        std::cerr << "could not write " << prefix << ".vocab" << std::endl;
+        return false;
+    }
+    out.write(alphabet.data(), static_cast<std::streamsize>(alphabet.size()));
+    return out.good();
+}
 
 // One batch of (context, next character) pairs, drawn at random positions.
 void sample_batch(const std::vector<std::size_t>& corpus, std::mt19937& rng, engine::Tensor& ids,
@@ -145,6 +168,14 @@ int main(int argc, char** argv) {
     std::vector<std::size_t> targets;
     std::mt19937 rng(1234);
 
+    // Written before the first step, not after the last. A checkpoint is only
+    // loadable beside the alphabet it was trained with, and the intermediate
+    // checkpoints below would otherwise sit next to a stale vocab from whatever
+    // ran here before -- a shape mismatch the engine catches loudly, which is
+    // better than silence and still an hour of compute spent on a file nobody
+    // can open.
+    if (!write_vocab(prefix, vocab)) return 1;
+
     const auto started = std::chrono::steady_clock::now();
     for (int step = 1; step <= steps; ++step) {
         sample_batch(corpus, rng, ids, targets);
@@ -166,6 +197,27 @@ int main(int argc, char** argv) {
                         nats, nats / std::log(2.0f), opt.learning_rate(), elapsed);
             std::fflush(stdout);
         }
+
+        // A checkpoint every so often, because a run this long is a run that can
+        // be interrupted. The first attempt at the 1024-id context died at step
+        // 4400 of 6000 -- twenty-four minutes of compute -- when something else
+        // on the machine wanted the card, and there was nothing on disk to
+        // resume from because the only write was at the end.
+        //
+        // Written to a temporary name and then renamed, so a crash during the
+        // write leaves the previous checkpoint intact rather than a truncated
+        // file that loads as far as the corruption.
+        if (step % 500 == 0 && step != steps) {
+            auto named = model.named_parameters();
+            const std::string partial = prefix + ".partial";
+            engine::save_parameters(named, partial + ".bin");
+            std::error_code ec;
+            std::filesystem::rename(partial + ".bin", prefix + ".bin", ec);
+            if (ec) {
+                std::cerr << "could not move the checkpoint into place: " << ec.message()
+                          << std::endl;
+            }
+        }
     }
 
     // The alphabet travels with the weights. CharVocab derives its alphabet as
@@ -175,17 +227,8 @@ int main(int argc, char** argv) {
     auto named = model.named_parameters();
     engine::save_parameters(named, prefix + ".bin");
 
-    std::string alphabet;
-    for (std::size_t i = 0; i < vocab.size(); ++i) alphabet += vocab.symbol(i);
-    std::ofstream vocab_file(prefix + ".vocab", std::ios::binary);
-    if (!vocab_file) {
-        std::cerr << "could not write " << prefix << ".vocab\n";
-        return 1;
-    }
-    vocab_file.write(alphabet.data(), static_cast<std::streamsize>(alphabet.size()));
-    vocab_file.close();
 
     std::printf("wrote %s.bin (%zu tensors) and %s.vocab (%zu symbols)\n", prefix.c_str(),
-                named.size(), prefix.c_str(), alphabet.size());
+                named.size(), prefix.c_str(), vocab.size());
     return 0;
 }
