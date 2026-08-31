@@ -36,3 +36,18 @@ jobs:
       # for it, which a plain Windows checkout does not have.
       - name: Test
         run: go test -race -count=2 ./...
+
+      # The allocation gate, run without -race.
+      #
+      # The race detector allocates on its own account, so allocs/op under it is
+      # a different number and not a stable one. The gate is about the code's
+      # allocations, so it gets a plain run -- and it is cheap, because the
+      # benchmark it drives is against the mock backend.
+      - name: Allocation regression gate
+        run: go test -run TestTheHotLoopDoesNotGrowItsAllocations -count=1 -v ./internal/sched/
+
+      # Fuzz seeds run in the normal suite; this gives the response parser a
+      # minute of actual fuzzing on every push. Any crash is written to
+      # testdata/ and fails the job.
+      - name: Fuzz the worker's response parser
+        run: go test -run FuzzWorkerReadsAResponse -fuzz FuzzWorkerReadsAResponse -fuzztime 60s ./internal/backend/
