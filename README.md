@@ -26,7 +26,7 @@ answer, and this page tries hard not to blur the two.
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
 | **Throughput** | 328 tokens/s at one client, **5 394 at sixty-four** - median of three |
 | **What batching buys** | **16.4x** in tokens, and [none of it past the knee](#the-part-of-it-anybody-is-waiting-for) in goodput |
-| **Under real arrivals** | offered 300/s instead of 150, throughput *rises* to 2 963 and [goodput falls to 200](#the-harness-could-not-overload-anything-and-said-so-by-never-trying) |
+| **Under real arrivals** | across the cliff throughput *rises* 15% and [goodput falls six-fold](#and-the-same-cliff-against-the-real-model), and nothing is refused until well past it |
 | **Where a step goes at batch 64** | 20.0 ms model, 0.39 ms copy back, 0.10 ms sampling, 0.89 ms pipe |
 | **Batching invariance** | 0 divergences in 25 000 draws, and the logits behind them [drift 2e-5](#a-zero-that-was-hiding-its-own-denominator) - which is the number that means something |
 | **A worker killed mid-load** | 0 requests failed, and with a warm cache the text is [character for character the same](#what-the-cache-is-not-allowed-to-cost) |
@@ -208,6 +208,37 @@ broken one.
 
 ```bash
 go run ./cmd/braidload -arrivals 150,300,600,1200 -for 8s -max-tokens 20
+```
+
+### And the same cliff against the real model
+
+The table above is the scheduler against a mock. Here is the server itself, with
+the key/value cache on, a real worker and a real card:
+
+| offered/s | completed | refused | tokens/s | goodput/s | TTFT p99 | mean batch |
+|---|---|---|---|---|---|---|
+| 20 | 286 | 0 | 569 | 569 | 21 ms | 2.3 |
+| 50 | 699 | 0 | 1 389 | 1 389 | 23 ms | 5.9 |
+| 100 | 1 405 | 0 | 2 787 | 2 787 | 34 ms | 18.9 |
+| 150 | 1 933 | 0 | 3 833 | **3 706** | 130 ms | 38.6 |
+| 200 | 2 412 | 0 | 4 401 | **571** | 1 311 ms | 62.0 |
+| 250 | 2 540 | 178 | 4 536 | **196** | 1 738 ms | 62.0 |
+
+**The cliff is between 150 and 200 offered requests a second.** Across it the
+server produces 15% *more* tokens and delivers **six times less** useful work,
+which is the same shape as the mock and worth seeing twice: throughput past
+saturation is not a performance number, it is the sound of a queue filling.
+
+One thing this run says that the mock's does not. **Nothing is refused until
+250.** At 200 the queue is deep enough to swallow the whole overload, so every
+request is admitted and every request is late — a p99 of 1.3 seconds with a
+100 ms SLO, and not one 429 to tell anybody. `QueueDepth` is 256 by default and
+that is a decision to make everyone slow rather than tell anyone no. Past the
+cliff it is the wrong one, and the fix is admission on *predicted wait* rather
+than on queue length, which this server does not do.
+
+```bash
+go run ./cmd/braidload -arrivals 20,50,100,150,200,250 -for 15s -max-tokens 30
 ```
 
 ---
