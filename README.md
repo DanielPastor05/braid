@@ -24,10 +24,10 @@ answer, and this page tries hard not to blur the two.
 |---|---|
 | **Model** | the Transformer from `cpp-ai-engine`, **10 758 289 parameters**, 6 blocks, 384 wide, 256-id context, 145-symbol byte alphabet, 0.97 bits/char |
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
-| **Throughput** | 340 tokens/s at one client, **3 003 at sixty-four** - median of three |
-| **What batching buys** | **8.8x**, and it is [a peak, not a plateau](#and-where-the-ceiling-actually-is) |
-| **Where a step goes at batch 64** | 18.3 ms model, 0.36 ms copy back, 0.10 ms sampling, 0.68 ms pipe |
-| **Batching invariance** | 0 divergences in 25 000 draws - a bound, not a guarantee |
+| **Throughput** | 321 tokens/s at one client, **2 698 at sixty-four** - median of three |
+| **What batching buys** | **8.7x** in tokens, and [none of it past the knee](#the-part-of-it-anybody-is-waiting-for) in goodput |
+| **Where a step goes at batch 64** | 20.0 ms model, 0.39 ms copy back, 0.10 ms sampling, 0.89 ms pipe |
+| **Batching invariance** | 0 divergences in 25 000 draws, and the logits behind them [drift 2e-5](#a-zero-that-was-hiding-its-own-denominator) - which is the number that means something |
 | **A worker killed mid-load** | 0 requests failed; workers hold no state |
 | **A worker hung mid-step** | killed on a deadline and failed over; before that it stopped the server for good |
 | **Landed upstream** | five PRs on the engine, all measured, one of them a correction to another |
@@ -46,30 +46,60 @@ of three sweeps, with the throughput range beside it.
 
 | clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | kernels |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 5 760 | 1.00 | 340 (339-341) | 5 ms | 8 ms | 2.75 | 2.66 | 177 |
-| 2 | 3 134 | 1.84 | 621 (618-628) | 8 ms | 10 ms | 2.92 | 2.83 | 177 |
-| 4 | 1 546 | 3.73 | 765 (761-782) | 10 ms | 13 ms | 4.81 | 4.71 | 177 |
-| 8 | 756 | 7.62 | 1 215 (1213-1222) | 11 ms | 14 ms | 6.08 | 6.02 | 177 |
-| 16 | 380 | 15.16 | 1 900 (1887-1943) | 15 ms | 18 ms | 7.82 | 7.57 | 177 |
-| 32 | 192 | 30.00 | 2 569 (2451-2582) | 23 ms | 32 ms | 11.50 | 11.06 | 177 |
-| 64 | 96 | 60.00 | **3 003** (2835-3016) | 42 ms | 68 ms | 19.45 | 18.33 | 177 |
-| 128 | 94 | 61.28 | 2 862 (2745-2893) | **684 ms** | 738 ms | 21.14 | 19.77 | 177 |
+| 1 | 5 760 | 1.00 | 321 (320-327) | 6 ms | 8 ms | 2.93 | 2.83 | 177 |
+| 2 | 3 126 | 1.84 | 587 (582-592) | 8 ms | 11 ms | 3.07 | 2.98 | 177 |
+| 4 | 1 547 | 3.72 | 740 (732-748) | 10 ms | 14 ms | 4.92 | 4.82 | 177 |
+| 8 | 756 | 7.62 | 1 178 (1177-1180) | 11 ms | 13 ms | 6.31 | 6.23 | 177 |
+| 16 | 376 | 15.32 | 1 869 (1867-1917) | 16 ms | 20 ms | 7.99 | 7.77 | 177 |
+| 32 | 190 | 30.32 | 2 433 (2385-2496) | 26 ms | 35 ms | 12.28 | 11.86 | 177 |
+| 64 | 98 | 58.78 | **2 698** (2618-2722) | 50 ms | 67 ms | 21.34 | 19.96 | 177 |
+| 128 | 95 | 60.63 | 2 791 (2677-2805) | **694 ms** | 744 ms | 21.56 | 20.34 | 177 |
 
-**Batching is worth 8.8x here, and the peak is at sixty-four clients.** Past that
-the batch is as full as `MaxBatch` allows — 61.3 against a limit of 64 — so the
-extra clients queue and the time to first token goes from 42 ms to 684 ms while
-the throughput does not move.
+![Throughput against the p99 time to first token, labelled by concurrency: the curve climbs steeply to about 2 700 tokens per second and then turns over, with the 128-client point far to the right at nearly 700 ms.](docs/img/throughput-vs-tail.svg)
 
-The kernel count is **177 on every row**. Every discontinuity this page used to
-have a section about is gone, and the last one to go is
-[two sections down](#the-thresholds-came-back-to-life-on-the-wrong-side).
+**The turn is the whole picture.** Every point up to sixty-four clients buys
+throughput for tens of milliseconds of tail. The last one buys nothing and costs
+most of a second: the batch is as full as `MaxBatch` allows — 60.6 against a
+limit of 64 — so the extra clients are not being served slowly, they are queuing.
 
-**One client needs 5 760 forward passes for 5 760 tokens, sixty-four need 96.**
-Sixty times fewer trips through the model for nine times the throughput.
+**Batching is worth 8.7x here.** The kernel count is **177 on every row**: every
+dispatch discontinuity this page used to have a section about is gone, and the
+last one to go is [two sections down](#the-thresholds-came-back-to-life-on-the-wrong-side).
+
+**One client needs 5 760 forward passes for 5 760 tokens, sixty-four need 98.**
+Fifty-nine times fewer trips through the model for eight times the throughput.
+
+### The part of it anybody is waiting for
+
+Throughput counts every token the server produced. It does not ask whether
+anybody was still waiting for it, and past the knee that difference is the whole
+story:
+
+![Throughput and goodput against concurrent clients. The two curves are identical up to sixty-four clients; at a hundred and twenty-eight the total keeps rising while the part served within a hundred milliseconds collapses to nothing.](docs/img/goodput.svg)
+
+**Goodput** is the same tokens counted only when the request that asked for them
+saw its first token inside 100 ms. The two lines are the same line until the
+queue starts, and then they part completely: at a hundred and twenty-eight
+clients the server is producing 2 791 tokens a second and **serving none of them
+inside the deadline**. A throughput figure alone would have called that the best
+row in the table.
+
+The threshold is a flag (`-slo-ms`) rather than a constant, because the right one
+belongs to whoever is being served and not to the server.
+
+### What a percentile is a summary of
+
+![Cumulative distribution of the time to first token at 1, 8, 32 and 128 clients. The first three curves rise steeply within tens of milliseconds; the 128-client curve is displaced far to the right and rises almost vertically near 700 ms.](docs/img/latency-cdf.svg)
+
+A p95 is one number off one of these curves. The shape is what says whether the
+tail is a few unlucky requests or the whole population moved — and at a hundred
+and twenty-eight clients it is plainly the second: the curve does not have a
+tail, it *is* the tail. Every request waited about the same long time, which is
+what a queue looks like from the inside.
 
 That multiplier has now fallen three times while the server got faster: 7.5x on
 the small model, 2.5x on the big one, 12.3x once the padding stopped being
-computed, 8.8x once the dispatch floors were lowered. **It measures how much
+computed, 8.7x once the dispatch floors were lowered. **It measures how much
 fixed cost there is left to amortise, not how good the batching is.** A project
 that optimised for it would have been steering away from every real improvement
 on this page.
@@ -81,8 +111,11 @@ go run ./cmd/braid -worker ./build/braid_worker.exe -model models/charlm
 ```
 
 ```bash
-go run ./cmd/braidload -requests 192 -max-tokens 30 -repeat 3 -concurrency 1,2,4,8,16,32,64,128
+go run ./cmd/braidload -requests 192 -max-tokens 30 -repeat 3 -concurrency 1,2,4,8,16,32,64,128 -svg docs/img
 ```
+
+The charts above come out of that command: the same sweep that printed the table,
+so a figure and a curve never disagree about which run they came from.
 
 ---
 
@@ -222,7 +255,7 @@ is where they went.
 
 | | 172 728 params, 64 ctx | 10 758 289 params, 256 ctx |
 |---|---|---|
-| what batching buys | **7.5x** | **2.5x** → now 8.8x, and [that is not the improvement it looks like](#what-batching-buys-and-where-it-stops-paying) |
+| what batching buys | **7.5x** | **2.5x** → now 8.7x, and [that is not the improvement it looks like](#what-batching-buys-and-where-it-stops-paying) |
 | where throughput saturates | 32 clients | **16 clients** → now 64, and it is a peak |
 | forward, batch 1 -> 12 | 0.77 -> ~1.0 ms | **6.81 -> 30.36 ms** → now 2.7 at one, 6.0 at eight |
 | kernels per step | 0 to 60, discontinuous | **176, flat** → now 177, flat at every size |
@@ -436,6 +469,38 @@ The test asserts a **ceiling of 1%**, not zero, deliberately. Nothing in the
 engine promises the same reduction order at two batch sizes, so a test demanding
 identity would assert a property the code does not have and would eventually
 fail for being right. What it catches is the rate climbing.
+
+### A zero that was hiding its own denominator
+
+Counting flipped tokens has a blind spot, and it took a while to see it. The
+sampler walks an inverse CDF, so a difference in the last bits only changes the
+answer when it happens to fall across a boundary. **Counting flipped tokens
+therefore measures the probability that the noise mattered — which depends on the
+shape of the distribution — and not the noise.** A model with a confident peak
+would report zero divergences while carrying any amount of drift underneath.
+
+So the logits get compared too. Same window, same seed, alone and then as one row
+of a batch of *n*, every logit of the sampled row:
+
+| batch | max absolute | max relative | tokens differing |
+|---|---|---|---|
+| 2 | 1.907e-05 | 1.517e-05 | 0/40 |
+| 4 | 1.717e-05 | 1.281e-05 | 0/40 |
+| 8 | 2.766e-05 | 2.110e-05 | 0/40 |
+| 16 | 1.481e-05 | 1.481e-05 | 0/40 |
+| 32 | 1.955e-05 | 1.943e-05 | 0/40 |
+
+**About 2 × 10⁻⁵ relative, and it does not grow with the batch.** That is a
+better statement about invariance than a count of zero, and it explains the zero:
+float32 carries about 1e-7 of relative precision, six blocks of differently
+shaped matmuls accumulate it, and the result is a gap far narrower than the
+distance between the top two logits — so the CDF boundary is rarely anywhere
+near.
+
+Getting the logits out is a diagnostic and not a protocol change:
+`BRAID_EMIT_LOGITS` makes the worker append the sampled rows after the timings.
+Serving does not want them — *n* × vocab floats a step that nobody reads — so it
+costs the hot path nothing and stays off.
 
 `TestBatchingDoesNotChangeOutput` is the same property against the mock, whose
 next token is a hash of the sequence's real ids and its length: bit-exact by

@@ -106,7 +106,10 @@ func main() {
 		perLevel    = flag.Int("requests", 64, "completed generations to collect at each level")
 		maxTokens   = flag.Int("max-tokens", 100, "tokens per generation")
 		temperature = flag.Float64("temperature", 0.8, "sampling temperature")
-		repeat      = flag.Int("repeat", 1,
+		svgDir      = flag.String("svg", "", "directory to write the README's charts into")
+		sloFlag     = flag.Float64("slo-ms", 100,
+			"time to first token a request must beat to count towards goodput")
+		repeat = flag.Int("repeat", 1,
 			"how many times to measure each level; above one the table reports a median and a range")
 	)
 	flag.Parse()
@@ -121,6 +124,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Answered by %s.\n\n", first.backend())
+
+	var charted []level
 
 	// The last columns decompose one step: forward is the model's kernels, copy
 	// is pulling the result off the device, sample is the softmax and the draw,
@@ -167,10 +172,37 @@ func main() {
 				fmt.Fprintf(os.Stderr, "reading stats: %v\n", err)
 				os.Exit(1)
 			}
-			reps = append(reps, summarise(samples, before, after, elapsed))
+			reps = append(reps, summarise(samples, before, after, elapsed, *sloFlag))
 		}
 		report(n, reps)
+
+		// The median repetition, for the charts. Picking the median rather than
+		// averaging keeps every point on a curve from a run that actually
+		// happened, so a knee cannot be an artefact of two runs blended.
+		if *svgDir != "" {
+			chosen := medianRep(reps)
+			chosen.clients = n
+			charted = append(charted, chosen)
+		}
 	}
+
+	if *svgDir != "" {
+		if err := writeCharts(*svgDir, charted, *sloFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "writing charts: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("\ncharts written to %s\n", *svgDir)
+	}
+}
+
+// medianRep is the repetition whose throughput is the median of the set.
+func medianRep(reps []level) level {
+	if len(reps) == 1 {
+		return reps[0]
+	}
+	order := append([]level(nil), reps...)
+	sort.Slice(order, func(i, j int) bool { return order[i].rate < order[j].rate })
+	return order[len(order)/2]
 }
 
 // level is one measurement of one concurrency level: the scalars a row is made
@@ -182,15 +214,24 @@ type level struct {
 	steps     int64
 	meanBatch float64
 	rate      float64
+	clients   int
 	ttft50    float64
 	ttft95    float64
-	wall      float64
-	forward   float64
-	copyBack  float64
-	sample    float64
-	pipe      float64
-	kernels   float64
-	hasStep   bool
+	// p99 and goodput exist for the charts rather than the table. A p95 hides
+	// the shape of an overloaded server, and a throughput figure that counts
+	// tokens nobody waited for is not the throughput anybody is buying.
+	ttft99  float64
+	goodput float64
+	// The raw times behind the percentiles, kept only when charts are asked
+	// for: the distribution is the thing a percentile is a summary of.
+	ttfts    []time.Duration
+	wall     float64
+	forward  float64
+	copyBack float64
+	sample   float64
+	pipe     float64
+	kernels  float64
+	hasStep  bool
 }
 
 // sweep keeps n requests in flight until count of them have finished.
@@ -275,7 +316,7 @@ func generate(client *http.Client, addr string, maxTokens int, temp float32, see
 	return s
 }
 
-func summarise(samples []sample, before, after stats, elapsed time.Duration) level {
+func summarise(samples []sample, before, after stats, elapsed time.Duration, sloMS float64) level {
 	ttfts := make([]time.Duration, 0, len(samples))
 	var out level
 	var tokens int
@@ -297,6 +338,23 @@ func summarise(samples []sample, before, after stats, elapsed time.Duration) lev
 	out.rejected = after.Scheduler.Rejected - before.Scheduler.Rejected
 	out.ttft50 = pctMS(ttfts, 50)
 	out.ttft95 = pctMS(ttfts, 95)
+	out.ttft99 = pctMS(ttfts, 99)
+
+	// Goodput: the tokens that arrived inside the deadline, over the whole
+	// wall clock. A server past its knee keeps producing tokens at a fine rate
+	// while serving nobody in time, and the plain figure cannot tell the two
+	// apart.
+	var inTime int
+	for _, s := range samples {
+		if s.err != nil || s.toks == 0 {
+			continue
+		}
+		if float64(s.ttft.Microseconds())/1000 <= sloMS {
+			inTime += s.toks
+		}
+	}
+	out.goodput = float64(inTime) / elapsed.Seconds()
+	out.ttfts = ttfts
 
 	wallA, fwdA, copyA, sampA, kernA, stepsA := after.totals()
 	wallB, fwdB, copyB, sampB, kernB, stepsB := before.totals()
