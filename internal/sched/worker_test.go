@@ -254,14 +254,14 @@ func TestKernelsByBatchSize(t *testing.T) {
 
 		// Warm, so the first call's allocations are not charged to the sample.
 		for range 5 {
-			if _, err := w.Step(context.Background(), windows, lengths, temps, seeds); err != nil {
+			if _, err := w.Step(context.Background(), windows, lengths, nil, temps, seeds); err != nil {
 				t.Fatalf("step at n=%d: %v", n, err)
 			}
 		}
 
 		before := w.Timings()
 		for range repeats {
-			if _, err := w.Step(context.Background(), windows, lengths, temps, seeds); err != nil {
+			if _, err := w.Step(context.Background(), windows, lengths, nil, temps, seeds); err != nil {
 				t.Fatalf("step at n=%d: %v", n, err)
 			}
 		}
@@ -312,7 +312,7 @@ func TestWorkerRoundTripsTheAlphabet(t *testing.T) {
 	copy(window, prompt)
 	length := []int32{int32(len(prompt))}
 
-	out, err := w.Step(context.Background(), [][]int32{window}, length, []float32{0.7}, []uint64{1})
+	out, err := w.Step(context.Background(), [][]int32{window}, length, nil, []float32{0.7}, []uint64{1})
 	if err != nil {
 		t.Fatalf("step: %v", err)
 	}
@@ -325,7 +325,7 @@ func TestWorkerRoundTripsTheAlphabet(t *testing.T) {
 
 	// And the same window twice must give the same id: sampling is seeded per
 	// sequence, so a repeat is not a coin flip.
-	again, err := w.Step(context.Background(), [][]int32{window}, length, []float32{0.7}, []uint64{1})
+	again, err := w.Step(context.Background(), [][]int32{window}, length, nil, []float32{0.7}, []uint64{1})
 	if err != nil {
 		t.Fatalf("step: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestTheWorkerAgreesAboutTheWindow(t *testing.T) {
 	// or misread there. Either way it must not come back looking like a success.
 	narrow := make([][]int32, 1)
 	narrow[0] = make([]int32, w.SeqLen()-1)
-	if _, err := w.Step(context.Background(), narrow, []int32{1}, []float32{0.7}, []uint64{1}); err == nil {
+	if _, err := w.Step(context.Background(), narrow, []int32{1}, nil, []float32{0.7}, []uint64{1}); err == nil {
 		t.Error("a window of the wrong width was accepted")
 	}
 
@@ -373,7 +373,7 @@ func TestTheWorkerAgreesAboutTheWindow(t *testing.T) {
 	right := make([][]int32, 1)
 	right[0] = make([]int32, w.SeqLen())
 	out, err := w.Step(context.Background(), right, []int32{int32(w.SeqLen())},
-		[]float32{0.7}, []uint64{1})
+		nil, []float32{0.7}, []uint64{1})
 	if err != nil {
 		t.Fatalf("a window of %d ids was refused by the worker, so the two constants "+
 			"disagree: %v", w.SeqLen(), err)

@@ -126,7 +126,7 @@ func (p *Pool) Decode(ids []int32) string {
 // caller's context bounds the whole sequence of attempts rather than any single
 // one, which is why a hang is transparent when there is somebody to fail over
 // to and fatal to the batch when there is not.
-func (p *Pool) Step(ctx context.Context, windows [][]int32, lengths []int32,
+func (p *Pool) Step(ctx context.Context, windows [][]int32, lengths []int32, slots []int32,
 	temperatures []float32, seeds []uint64) ([]int32, error) {
 	var first error
 
@@ -144,7 +144,7 @@ func (p *Pool) Step(ctx context.Context, windows [][]int32, lengths []int32,
 			break
 		}
 
-		out, err := w.Step(ctx, windows, lengths, temperatures, seeds)
+		out, err := w.Step(ctx, windows, lengths, slots, temperatures, seeds)
 		if err == nil {
 			return out, nil
 		}

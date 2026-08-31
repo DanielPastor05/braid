@@ -35,7 +35,7 @@ type Backend interface {
 	// A batch of n sequences must produce the same n results as n batches of
 	// one -- the sequences share a tensor, not a computation. The scheduler's
 	// tests hold implementations to that.
-	Step(ctx context.Context, windows [][]int32, lengths []int32,
+	Step(ctx context.Context, windows [][]int32, lengths []int32, slots []int32,
 		temperatures []float32, seeds []uint64) ([]int32, error)
 
 	// SeqLen is the fixed context width the model was built with. The engine's

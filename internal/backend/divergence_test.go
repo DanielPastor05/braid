@@ -89,8 +89,7 @@ func TestBatchInvarianceDivergenceRate(t *testing.T) {
 			seed := rng.Uint64()
 			temp := float32(0.5 + rng.Float64())
 
-			alone, err := w.Step(ctx, [][]int32{window}, []int32{length},
-				[]float32{temp}, []uint64{seed})
+			alone, err := w.Step(ctx, [][]int32{window}, []int32{length}, nil, []float32{temp}, []uint64{seed})
 			if err != nil {
 				t.Fatalf("batch 1, trial %d: %v", trial, err)
 			}
@@ -114,7 +113,7 @@ func TestBatchInvarianceDivergenceRate(t *testing.T) {
 				seeds[i] = rng.Uint64()
 			}
 
-			together, err := w.Step(ctx, windows, lengths, temps, seeds)
+			together, err := w.Step(ctx, windows, lengths, nil, temps, seeds)
 			if err != nil {
 				t.Fatalf("batch %d, trial %d: %v", n, trial, err)
 			}

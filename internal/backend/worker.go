@@ -92,7 +92,7 @@ type Timings struct {
 }
 
 const (
-	frameMagic  uint32 = 0x36445242 // 'BRD6'
+	frameMagic  uint32 = 0x37445242 // 'BRD7'
 	statusOK    uint32 = 0
 	statusError uint32 = 1
 
@@ -289,10 +289,21 @@ func (w *Worker) Decode(ids []int32) string {
 	return string(out)
 }
 
-func (w *Worker) Step(ctx context.Context, windows [][]int32, lengths []int32,
+// Step runs one batch. `slots` names each row's key/value cache slot in the
+// worker, or -1 for a row that should not be cached; a nil slice means none of
+// them are, which is what every caller wanted before the cache existed.
+//
+// The windows are sent whole even when slots are given. The cache is an
+// optimisation a worker may or may not have -- a replacement started after a
+// failover has none -- so the frame carries enough for it to recompute, and
+// failover stays a retry of the same bytes somewhere else.
+func (w *Worker) Step(ctx context.Context, windows [][]int32, lengths []int32, slots []int32,
 	temperatures []float32, seeds []uint64) ([]int32, error) {
 	if len(windows) != len(temperatures) || len(windows) != len(seeds) ||
 		len(windows) != len(lengths) {
+		return nil, errRagged
+	}
+	if slots != nil && len(slots) != len(windows) {
 		return nil, errRagged
 	}
 	if len(windows) == 0 {
@@ -327,7 +338,7 @@ func (w *Worker) Step(ctx context.Context, windows [][]int32, lengths []int32,
 	started := time.Now()
 
 	n := len(windows)
-	size := 4 + 4 + n*w.seqLen*4 + n*4 + n*4 + n*8
+	size := 4 + 4 + n*w.seqLen*4 + n*4 + n*4 + n*4 + n*8
 	if cap(w.frame) < size {
 		w.frame = make([]byte, size)
 	}
@@ -344,6 +355,14 @@ func (w *Worker) Step(ctx context.Context, windows [][]int32, lengths []int32,
 	}
 	for _, length := range lengths {
 		binary.LittleEndian.PutUint32(frame[at:], uint32(length))
+		at += 4
+	}
+	for i := 0; i < n; i++ {
+		slot := int32(-1)
+		if slots != nil {
+			slot = slots[i]
+		}
+		binary.LittleEndian.PutUint32(frame[at:], uint32(slot))
 		at += 4
 	}
 	for _, t := range temperatures {

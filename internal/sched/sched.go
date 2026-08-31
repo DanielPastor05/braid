@@ -122,6 +122,16 @@ type sequence struct {
 	admitted  time.Time
 	first     time.Time
 	generated int
+
+	// Which key/value cache slot in the worker this sequence owns, or -1 for
+	// none. Held for the sequence's whole life and returned on the way out, so
+	// that a slot's contents stay the history of one sequence and the worker can
+	// tell "this cache is yours and current" from "refill it".
+	//
+	// A slot is not authority over anything: the scheduler still sends the whole
+	// window every step, so a worker without the cache -- a replacement after a
+	// failover -- recomputes and is right.
+	slot int32
 }
 
 // window writes the model's fixed-width view of the sequence into dst -- the
@@ -168,6 +178,11 @@ type Scheduler struct {
 
 	stats   Stats
 	latency *latencies
+
+	// Free key/value cache slots in the worker, one per row of MaxBatch. Only
+	// the loop goroutine touches it, which is why it needs no lock -- the same
+	// reason nothing else in the scheduler's hot path has one.
+	freeSlots []int32
 }
 
 // New starts the loop. Close stops it.
@@ -182,14 +197,22 @@ func New(b backend.Backend, cfg Config) (*Scheduler, error) {
 		return nil, fmt.Errorf("sched: MaxTokensLimit must be at least 1, got %d", cfg.MaxTokensLimit)
 	}
 
+	// Handed out from the end, so the first sequence gets slot 0 and the
+	// numbering a worker sees starts where a person would expect it to.
+	free := make([]int32, cfg.MaxBatch)
+	for i := range free {
+		free[i] = int32(cfg.MaxBatch - 1 - i)
+	}
+
 	s := &Scheduler{
-		cfg:      cfg,
-		backend:  b,
-		seqLen:   b.SeqLen(),
-		incoming: make(chan *sequence, cfg.QueueDepth),
-		stop:     make(chan struct{}),
-		stopped:  make(chan struct{}),
-		latency:  newLatencies(),
+		cfg:       cfg,
+		backend:   b,
+		seqLen:    b.SeqLen(),
+		freeSlots: free,
+		incoming:  make(chan *sequence, cfg.QueueDepth),
+		stop:      make(chan struct{}),
+		stopped:   make(chan struct{}),
+		latency:   newLatencies(),
 	}
 	go s.loop()
 	return s, nil

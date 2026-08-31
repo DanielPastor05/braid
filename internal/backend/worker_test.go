@@ -30,7 +30,7 @@ func TestWorkerSpeaksTheProtocol(t *testing.T) {
 
 	windows := [][]int32{oneWindow(1, 2, 3), oneWindow(9, 9, 9)}
 	lengths := []int32{3, 3}
-	out, err := w.Step(context.Background(), windows, lengths, []float32{0.7, 0.9}, []uint64{1, 2})
+	out, err := w.Step(context.Background(), windows, lengths, nil, []float32{0.7, 0.9}, []uint64{1, 2})
 	if err != nil {
 		t.Fatalf("step: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestWorkerSurfacesAnErrorFrame(t *testing.T) {
 	}
 	defer w.Close()
 
-	_, err = w.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
+	_, err = w.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, nil, []float32{0.7}, []uint64{1})
 	if err == nil {
 		t.Fatal("a refusing worker was reported as a success")
 	}
@@ -94,7 +94,7 @@ func TestWorkerRejectsAStatusThatIsNotOne(t *testing.T) {
 	}
 	defer w.Close()
 
-	_, err = w.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
+	_, err = w.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, nil, []float32{0.7}, []uint64{1})
 	if err == nil {
 		t.Fatal("a status of 99 was accepted")
 	}
@@ -133,14 +133,14 @@ func TestWorkerChecksItsArgumentsBeforeTheWire(t *testing.T) {
 			nil, []float32{0.7}, []uint64{1}},
 	}
 	for _, c := range cases {
-		if _, err := w.Step(context.Background(), c.windows, c.lengths, c.temps, c.seeds); err == nil {
+		if _, err := w.Step(context.Background(), c.windows, c.lengths, nil, c.temps, c.seeds); err == nil {
 			t.Errorf("%s was accepted", c.name)
 		}
 	}
 
 	// And the worker is still usable afterwards: a rejected call must not have
 	// written a partial frame.
-	if _, err := w.Step(context.Background(), [][]int32{oneWindow(5)}, []int32{1}, []float32{0.7}, []uint64{1}); err != nil {
+	if _, err := w.Step(context.Background(), [][]int32{oneWindow(5)}, []int32{1}, nil, []float32{0.7}, []uint64{1}); err != nil {
 		t.Errorf("a rejected call left the pipe in a bad state: %v", err)
 	}
 }

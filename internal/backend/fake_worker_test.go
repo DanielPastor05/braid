@@ -81,7 +81,11 @@ func fakeWorkerMain(mode string) {
 		// The whole request has to come off the pipe before anything is decided,
 		// or a misbehaviour would leave a half-read frame behind and the next
 		// test would see a protocol bug that this file invented.
-		body := make([]byte, int(n)*workerSeqLen*4+int(n)*4+int(n)*4+int(n)*8)
+		// ids + lengths + slots + temperatures + seeds. The slots are read and
+		// ignored: this worker has no cache, which is exactly the case the
+		// protocol has to keep working -- a replacement after a failover is a
+		// worker that knows nothing and recomputes.
+		body := make([]byte, int(n)*workerSeqLen*4+int(n)*4+int(n)*4+int(n)*4+int(n)*8)
 		if _, err := io.ReadFull(os.Stdin, body); err != nil {
 			os.Exit(1)
 		}

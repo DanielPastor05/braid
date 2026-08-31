@@ -16,7 +16,7 @@ func step(t *testing.T, p *Pool, ids ...int32) error {
 
 	window := oneWindow(ids...)
 	out, err := p.Step(context.Background(), [][]int32{window},
-		[]int32{int32(len(ids))}, []float32{0.7}, []uint64{1})
+		[]int32{int32(len(ids))}, nil, []float32{0.7}, []uint64{1})
 	if err != nil {
 		return err
 	}
@@ -117,7 +117,7 @@ func TestPoolWithEveryWorkerDeadReturnsAnError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := pool.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
+		_, err := pool.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, nil, []float32{0.7}, []uint64{1})
 		done <- err
 	}()
 
@@ -146,7 +146,7 @@ func TestPoolOfOneHasNowhereToFailOver(t *testing.T) {
 	}
 	defer pool.Close()
 
-	_, err = pool.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
+	_, err = pool.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, nil, []float32{0.7}, []uint64{1})
 	if err == nil {
 		t.Fatal("a pool of one reported a success while its only worker refused")
 	}
@@ -224,7 +224,7 @@ func TestAHungWorkerIsKilledRatherThanWaitedFor(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := w.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
+		_, err := w.Step(context.Background(), [][]int32{oneWindow(1)}, []int32{1}, nil, []float32{0.7}, []uint64{1})
 		done <- err
 	}()
 
@@ -329,7 +329,7 @@ func TestClosingAHungWorkerDoesNotBlockTheCloser(t *testing.T) {
 	// than by waiting out an hour.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, _ = w.Step(ctx, [][]int32{oneWindow(1)}, []int32{1}, []float32{0.7}, []uint64{1})
+	_, _ = w.Step(ctx, [][]int32{oneWindow(1)}, []int32{1}, nil, []float32{0.7}, []uint64{1})
 
 	closed := make(chan error, 1)
 	go func() { closed <- w.Close() }()

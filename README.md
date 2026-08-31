@@ -887,9 +887,51 @@ guessed "about a quarter of the step, and then the fused attention kernel has a
 baseline to beat"; measured it is a tenth, and the baseline to beat is the
 attention over capacity rather than the movement.
 
-**None of this is wired into the serving path yet, and saying otherwise would be
-the fifth correction on this page.** It is arithmetic and a block allocator with
-tests; what it is waiting for is the per-row cache in the worker, which is
+### It is wired in now, and it is slower
+
+The worker holds the cache, the protocol carries a slot per row (BRD7), and the
+scheduler hands slots out of a free list of `MaxBatch` and takes them back when
+a sequence ends. `BRAID_CACHE=1` turns it on. Same harness, same weights, one
+worker:
+
+| clients | without the cache | with it | kernels |
+|---|---|---|---|
+| 1 | 311 tok/s | **336** | 177 → 177 |
+| 4 | 714 | 787 | 177 → 194 |
+| 16 | **1 838** | 1 136 | 177 → **263** |
+| 64 | **2 346** | 1 076 | 177 → **558** |
+
+It wins where the batch is small and loses badly where it is not, which is the
+opposite of what the component benchmark predicted, and the kernel count says
+why: a step is launching three times the kernels it used to.
+
+**Two of those were my own bugs, and both are the same bug.** The first ordering
+of gather-and-narrow moved 1.2 GB a step instead of 4.7 MB -- 125 tokens a
+second, fifteen times *worse* than no cache. The second was the prefill
+allocating a cache at the full context to write forty positions, which is
+[exactly the finding above](#the-cache-is-built-and-what-it-costs-is-the-room-you-gave-it)
+committed in the one place the finding was not looking. Fixing them took 125 →
+889 → 1 136.
+
+**What is left is not a bug.** Each arriving sequence needs its prompt in the
+cache, which is one extra forward pass, and at thirty-token generations that is
+one prefill for every thirty cached steps: 0.52 prefills a step at sixteen
+clients, times 177 kernels, is the 263. And the step itself still narrows the
+whole pool -- sixty-four slots at width forty-eight -- to serve sixteen active
+rows, because `select_rows` gives sixteen rows at the *full context* and `slice`
+gives sixty-four slots at the *right width*, and the thing actually wanted is
+sixteen by forty-eight. Four times less than the better of the two.
+
+So the next primitive is a gather that takes a width, and this is the third one
+this phase has needed and not found after
+[#11](https://github.com/DanielPastor05/cpp-ai-engine/pull/11) and
+[#12](https://github.com/DanielPastor05/cpp-ai-engine/pull/12). Until it exists
+the flag stays **off by default**, because a server that is slower with its cache
+than without it should not ship with the cache on, however much work went into
+it.
+
+**`internal/kvmem` is still not wired into the serving path.** It is arithmetic
+and a block allocator with tests; what it is waiting for is the per-row cache in the worker, which is
 waiting on three engine pull requests --
 [#7 `copy_into_rows`](https://github.com/DanielPastor05/cpp-ai-engine/pull/7),
 [#8 a fill and a mask per row](https://github.com/DanielPastor05/cpp-ai-engine/pull/8),

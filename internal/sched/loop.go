@@ -28,6 +28,7 @@ func (s *Scheduler) loop() {
 	flat := make([]int32, s.cfg.MaxBatch*s.seqLen)
 	windows := make([][]int32, 0, s.cfg.MaxBatch)
 	lengths := make([]int32, 0, s.cfg.MaxBatch)
+	slots := make([]int32, 0, s.cfg.MaxBatch)
 	temps := make([]float32, 0, s.cfg.MaxBatch)
 	seeds := make([]uint64, 0, s.cfg.MaxBatch)
 
@@ -57,12 +58,14 @@ func (s *Scheduler) loop() {
 
 		windows = windows[:0]
 		lengths = lengths[:0]
+		slots = slots[:0]
 		temps = temps[:0]
 		seeds = seeds[:0]
 		for i, seq := range active {
 			w := flat[i*s.seqLen : (i+1)*s.seqLen]
 			lengths = append(lengths, int32(seq.window(w)))
 			windows = append(windows, w)
+			slots = append(slots, seq.slot)
 			temps = append(temps, seq.req.Temperature)
 			// The seed advances with the sequence, so a sequence is
 			// reproducible on its own and two sequences sharing a seed do not
@@ -70,7 +73,7 @@ func (s *Scheduler) loop() {
 			seeds = append(seeds, seq.req.Seed+uint64(seq.generated))
 		}
 
-		ids, err := s.backend.Step(stepCtx, windows, lengths, temps, seeds)
+		ids, err := s.backend.Step(stepCtx, windows, lengths, slots, temps, seeds)
 		if err != nil {
 			s.stats.stepErrors.Add(1)
 			s.failAll(active, err)
@@ -169,6 +172,7 @@ func (s *Scheduler) begin(seq *sequence) *sequence {
 	}
 
 	seq.admitted = now
+	seq.slot = s.takeSlot()
 	return seq
 }
 
@@ -180,6 +184,7 @@ func (s *Scheduler) failAll(seqs []*sequence, err error) {
 
 // finish closes a sequence's stream and reports it exactly once.
 func (s *Scheduler) finish(seq *sequence, err error) {
+	s.releaseSlot(seq)
 	close(seq.out)
 
 	end := time.Now()
@@ -199,4 +204,40 @@ func (s *Scheduler) finish(seq *sequence, err error) {
 	s.latency.record(res)
 	seq.done <- res
 	close(seq.done)
+}
+
+// Cache slots.
+//
+// A slot is a row of the worker's key/value cache, and there are MaxBatch of
+// them because that is the most sequences that can share a step. A sequence
+// takes one when it is admitted and gives it back when it ends, so a slot's
+// contents belong to one sequence for that sequence's whole life -- which is
+// what lets the worker tell "this cache is current" from "refill it" by
+// comparing what it holds against the row's length.
+//
+// Handing them out in reverse order is not a preference, it is what makes the
+// free list a stack: pop from the end, push to the end. Which slot a sequence
+// gets does not matter, only that no two hold the same one at once.
+//
+// -1 means no slot, and the worker recomputes that row. It happens when more
+// sequences are somehow live than there are slots, and it is a slower answer
+// rather than a wrong one.
+func (s *Scheduler) takeSlot() int32 {
+	if len(s.freeSlots) == 0 {
+		return -1
+	}
+	slot := s.freeSlots[len(s.freeSlots)-1]
+	s.freeSlots = s.freeSlots[:len(s.freeSlots)-1]
+	return slot
+}
+
+func (s *Scheduler) releaseSlot(seq *sequence) {
+	if seq.slot < 0 {
+		return
+	}
+	s.freeSlots = append(s.freeSlots, seq.slot)
+	// Cleared so that a double release -- which would hand the same slot to two
+	// sequences and quietly give one of them the other's history -- is a bug
+	// that cannot happen rather than one that is unlikely.
+	seq.slot = -1
 }

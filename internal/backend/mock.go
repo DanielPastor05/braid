@@ -60,7 +60,7 @@ func (m *Mock) Close() error   { return nil }
 func (m *Mock) Steps() int64     { return m.steps.Load() }
 func (m *Mock) Sequences() int64 { return m.sequence.Load() }
 
-func (m *Mock) Step(ctx context.Context, windows [][]int32, lengths []int32,
+func (m *Mock) Step(ctx context.Context, windows [][]int32, lengths []int32, slots []int32,
 	temperatures []float32, seeds []uint64) ([]int32, error) {
 	if len(windows) != len(temperatures) || len(windows) != len(seeds) ||
 		len(windows) != len(lengths) {

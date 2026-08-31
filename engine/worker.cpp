@@ -13,12 +13,26 @@
 //
 // The protocol is length-free because every frame's size follows from n:
 //
-//   request   u32 magic 'B','R','D','6'
+//   request   u32 magic 'B','R','D','7'
 //             u32 n                        sequences in this batch
 //             i32 ids[n * kSeqLen]         windows, row-major, right-padded
 //             i32 length[n]                real ids in each row, 1..kSeqLen
+//             i32 slot[n]                  cache slot, or -1 for none
 //             f32 temperature[n]
 //             u64 seed[n]
+//
+// The window is sent in full even when a slot is given, and that is deliberate
+// rather than left over. The cache is an optimisation the worker may or may not
+// have -- a worker that has just started after a failover has none -- and a frame
+// carrying the whole history means it can always fall back to recomputing. The
+// scheduler stays the only authority on what a sequence has said, so failover is
+// still a retry of the same bytes on another worker, which is the property this
+// whole design rests on.
+//
+// A slot of -1 means do not cache this row. A slot whose cache has not reached
+// length-1 is refilled from the window first, in one forward pass rather than one
+// per position: that covers a sequence arriving with a prompt, a slot being
+// handed to somebody new, and a worker that has never seen this sequence.
 //
 //   response  u32 status                   0 ok, 1 error
 //     ok      i32 next[n]
@@ -95,7 +109,7 @@
 
 namespace {
 
-constexpr std::uint32_t kMagic = 0x36445242;  // 'BRD6' little-endian
+constexpr std::uint32_t kMagic = 0x37445242;  // 'BRD7' little-endian
 constexpr std::uint32_t kStatusOK = 0;
 constexpr std::uint32_t kStatusError = 1;
 
@@ -255,8 +269,47 @@ int main(int argc, char** argv) {
 
     engine::autograd::NoGradGuard no_grad;
 
+    // The key/value cache, off unless BRAID_CACHE is set, because whether it is
+    // worth having is a measured question with a mixed answer.
+    //
+    // braid_bench_decode sweeps it. With the capacity rounded to a block of the
+    // history rather than to the whole context, a step is 2.4x at a batch of
+    // sixteen and twenty-nine positions of history, 4.1x at thirty-two, and 9.6x
+    // at four hundred and fifty. At a batch of **one** it is 0.9x -- slower --
+    // because a step that short is already at the ~2.4 ms floor of 177 kernel
+    // launches, and a cache makes kernels smaller rather than fewer while adding
+    // a gather to pay for. So a batch of one recomputes even when the cache is
+    // on.
+    //
+    // Off by default until the server has been measured both ways end to end. A
+    // change that costs the single-client number to buy the loaded one is a
+    // trade, and this repository publishes trades rather than the flattering
+    // half of them.
+    const bool cache_enabled = std::getenv("BRAID_CACHE") != nullptr;
+
+    // Blocks of sixteen positions: internal/kvmem's default, chosen there for
+    // under six percent internal fragmentation. Rounding the step's width up to
+    // one of these instead of up to the context is the whole reason the cache
+    // pays -- an over-allocated cache is measurably slower than no cache.
+    constexpr std::size_t kBlock = 16;
+
+    // One pool per block, each (max_slots, heads, kSeqLen, head_dim), allocated
+    // on the first frame that names a slot because the server decides how many
+    // there are. `filled` in each says how far every slot has been written.
+    std::vector<engine::nn::KVCache> pool;
+    std::size_t pool_slots = 0;
+    const auto ensure_pool = [&](std::size_t slots) {
+        if (pool_slots >= slots) return;
+        // Growing means starting over: the slots are being renumbered by the
+        // server, so nothing in the old pool is addressable any more. It happens
+        // once, on the first frame.
+        pool = model.make_caches(slots, braid::kSeqLen);
+        pool_slots = slots;
+    };
+
     std::vector<std::int32_t> windows;
     std::vector<std::int32_t> lengths;
+    std::vector<std::int32_t> slots;
     std::vector<float> temperatures;
     std::vector<std::uint64_t> seeds;
     std::vector<std::int32_t> next;
@@ -280,10 +333,12 @@ int main(int argc, char** argv) {
         const std::size_t ids_count = static_cast<std::size_t>(n) * braid::kSeqLen;
         windows.resize(ids_count);
         lengths.resize(n);
+        slots.resize(n);
         temperatures.resize(n);
         seeds.resize(n);
         if (!read_exact(windows.data(), ids_count * sizeof(std::int32_t)) ||
             !read_exact(lengths.data(), n * sizeof(std::int32_t)) ||
+            !read_exact(slots.data(), n * sizeof(std::int32_t)) ||
             !read_exact(temperatures.data(), n * sizeof(float)) ||
             !read_exact(seeds.data(), n * sizeof(std::uint64_t))) {
             std::cerr << "truncated frame\n";
@@ -335,9 +390,138 @@ int main(int argc, char** argv) {
             // two a change in kernel count actually was.
             const auto transfers_before = engine::cuda::transfer_stats();
 
-            // The one forward pass. n rows in, n rows of logits out, and the
-            // model has no way of knowing the rows belong to different callers.
-            const engine::Tensor logits = model.forward(ids, mask_for(width));  // (n, W, vocab)
+            // Cached only above a batch of one. At a batch of one the step is
+            // already launch-bound and the cache measures 0.9x -- see the note
+            // where cache_enabled is read.
+            bool cached = cache_enabled && n > 1;
+            if (cached) {
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    if (slots[i] < 0) cached = false;
+                }
+            }
+
+            // Positions per row in `logits`, and which of them a row samples.
+            // The uncached path returns the whole window and samples at
+            // length-1; the cached one returns the single new position.
+            std::size_t pitch = width;
+            bool sample_at_length = true;
+
+            engine::Tensor logits;
+            if (!cached) {
+                // The one forward pass. n rows in, n rows of logits out, and the
+                // model has no way of knowing the rows belong to different
+                // callers.
+                logits = model.forward(ids, mask_for(width));  // (n, W, vocab)
+            } else {
+                std::size_t highest = 0;
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    highest = std::max(highest, static_cast<std::size_t>(slots[i]));
+                }
+                ensure_pool(highest + 1);
+
+                // The width of the step, rounded up to a block. Rounding to the
+                // context instead is what makes a cache slower than no cache.
+                const std::size_t cap =
+                    std::min(braid::kSeqLen, ((width + kBlock - 1) / kBlock) * kBlock);
+
+                // Any row whose slot has not reached length-1 is refilled from
+                // the window: a sequence arriving, a slot reassigned, or this
+                // worker having never seen it. One forward pass over the prompt,
+                // not one per position.
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    const std::size_t slot = static_cast<std::size_t>(slots[i]);
+                    const std::size_t have = static_cast<std::size_t>(lengths[i]) - 1;
+                    if (pool.front().filled[slot] == have) continue;
+
+                    for (auto& block : pool) block.filled[slot] = 0;
+                    if (have == 0) continue;
+
+                    const std::int32_t* row =
+                        windows.data() + static_cast<std::size_t>(i) * braid::kSeqLen;
+                    engine::Tensor prompt({1, have}, 0.0f, false);
+                    for (std::size_t j = 0; j < have; ++j) {
+                        prompt.data()[j] = static_cast<float>(row[j]);
+                    }
+                    // Rounded to a block, not to the context. A cached forward
+                    // attends over its whole capacity, so a prefill into a
+                    // 1024-wide cache is a 1024-wide step to write forty
+                    // positions -- which is the same mistake this file's own
+                    // capacity note is about, made in the one place the note
+                    // was not looking. It cost the server half its throughput.
+                    const std::size_t room =
+                        std::min(braid::kSeqLen, ((have + kBlock - 1) / kBlock) * kBlock);
+                    auto one = model.make_caches(1, room);
+                    (void)model.forward_cached(prompt, {0}, one);
+                    for (std::size_t b = 0; b < braid::kBlocks; ++b) {
+                        pool[b].keys.scatter_rows(one[b].keys.slice(2, 0, have), 2, {slot}, {0});
+                        pool[b].values.scatter_rows(one[b].values.slice(2, 0, have), 2, {slot}, {0});
+                        pool[b].filled[slot] = have;
+                    }
+                }
+
+                std::vector<std::size_t> active(n), at(n), zero(n, 0);
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    active[i] = static_cast<std::size_t>(slots[i]);
+                    at[i] = static_cast<std::size_t>(lengths[i]) - 1;
+                }
+
+                // Gather the active slots, narrowed to the step's width -- and
+                // the order of those two decides the step.
+                //
+                // Narrowing first touches every slot at the new width;
+                // gathering first touches the active slots at the full context.
+                // So it is `pool_slots * cap` against `n * kSeqLen`, and neither
+                // wins everywhere: a small batch out of a large pool wants the
+                // gather first, a full batch at a short width wants the slice.
+                //
+                // Getting this backwards is not a missed optimisation. Serving
+                // thirty-token generations from sixty-four slots, the wrong
+                // order moves 1.2 GB a step instead of 4.7 MB, and the server
+                // measured **fifteen times slower with the cache than without
+                // it** -- 125 tokens a second against 1 964. That is how this
+                // condition came to be here rather than a comment claiming one
+                // order was generally better.
+                const bool narrow_first = pool_slots * cap < static_cast<std::size_t>(n) * braid::kSeqLen;
+
+                std::vector<engine::nn::KVCache> compact;
+                compact.reserve(braid::kBlocks);
+                for (std::size_t b = 0; b < braid::kBlocks; ++b) {
+                    engine::nn::KVCache one(1, braid::kHeads, 1, braid::kDModel / braid::kHeads);
+                    if (narrow_first) {
+                        one.keys = pool[b].keys.slice(2, 0, cap).select_rows(active);
+                        one.values = pool[b].values.slice(2, 0, cap).select_rows(active);
+                    } else {
+                        one.keys = pool[b].keys.select_rows(active).slice(2, 0, cap);
+                        one.values = pool[b].values.select_rows(active).slice(2, 0, cap);
+                    }
+                    one.filled.assign(at.begin(), at.end());
+                    compact.push_back(std::move(one));
+                }
+
+                // One new id per row: the position each is actually asking about.
+                engine::Tensor fresh({n, 1}, 0.0f, false);
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    const std::int32_t* row =
+                        windows.data() + static_cast<std::size_t>(i) * braid::kSeqLen;
+                    fresh.data()[i] = static_cast<float>(row[at[i]]);
+                }
+
+                logits = model.forward_cached(fresh, at, compact);  // (n, 1, vocab)
+                pitch = 1;
+                sample_at_length = false;
+
+                // And back to the slots they came from. The whole compact cache
+                // rather than each row's one new position: extracting a
+                // different column per row would need another gather, and at
+                // this width the extra bytes are a tenth of a millisecond.
+                for (std::size_t b = 0; b < braid::kBlocks; ++b) {
+                    pool[b].keys.scatter_rows(compact[b].keys, 2, active, zero);
+                    pool[b].values.scatter_rows(compact[b].values, 2, active, zero);
+                    for (std::uint32_t i = 0; i < n; ++i) {
+                        pool[b].filled[active[i]] = at[i] + 1;
+                    }
+                }
+            }
 
             // The kernels are asynchronous, so forward() returning says only
             // that they were launched. Synchronising here ends the compute and
@@ -362,8 +546,10 @@ int main(int argc, char** argv) {
                 // The last *real* position of this row, not the last position
                 // of the window. Everything past it is padding, which the
                 // causal mask makes unreachable from here.
-                const std::size_t last = static_cast<std::size_t>(lengths[i]) - 1;
-                const float* row = data + (static_cast<std::size_t>(i) * width + last) * vocab_size;
+                const std::size_t last = sample_at_length
+                                             ? static_cast<std::size_t>(lengths[i]) - 1
+                                             : 0;
+                const float* row = data + (static_cast<std::size_t>(i) * pitch + last) * vocab_size;
                 if (emit_logits) {
                     std::copy_n(row, vocab_size, sampled.begin() + static_cast<std::size_t>(i) * vocab_size);
                 }
