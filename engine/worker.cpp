@@ -327,6 +327,21 @@ int main(int argc, char** argv) {
         pool_slots = slots;
     };
 
+    // Allocated at start rather than on the first frame that names a slot, when
+    // the server says how many there will be.
+    //
+    // The pool is (slots, heads, kSeqLen, head_dim) twice over for every block:
+    // 1.2 GB at sixty-four slots, and another 1.2 transiently while it is being
+    // put on the card. Doing that lazily charges the whole thing to whichever
+    // request happens to arrive first, and it showed up as a TTFT p95 of 194 ms
+    // against a step of six -- a cold start wearing the costume of a latency
+    // regression.
+    if (cache_enabled) {
+        const char* slots_env = std::getenv("BRAID_CACHE_SLOTS");
+        const long wanted = slots_env ? std::strtol(slots_env, nullptr, 10) : 0;
+        if (wanted > 0) ensure_pool(static_cast<std::size_t>(wanted));
+    }
+
     std::vector<std::int32_t> windows;
     std::vector<std::int32_t> lengths;
     std::vector<std::int32_t> slots;
@@ -444,10 +459,25 @@ int main(int argc, char** argv) {
                 const std::size_t cap =
                     std::min(braid::kSeqLen, ((width + kBlock - 1) / kBlock) * kBlock);
 
-                // Any row whose slot has not reached length-1 is refilled from
-                // the window: a sequence arriving, a slot reassigned, or this
-                // worker having never seen it. One forward pass over the prompt,
-                // not one per position.
+                // Any row whose slot has not reached length-1 is refilled
+                // from the window: a sequence arriving with a prompt, a slot
+                // handed to somebody new, or this worker having never seen it.
+                //
+                // All of them in **one** forward pass, not one each. Rows that
+                // arrive together otherwise serialise their prefills inside the
+                // step, and every other row in the batch waits behind them --
+                // which is what a TTFT p50 of 66 ms against a 6 ms step looks
+                // like from outside.
+                //
+                // They are padded to the longest prompt among them, and the
+                // padding is safe for the same reason the window's is: each row
+                // writes `take` positions into its cache, but `filled` is then
+                // set to its own real length and every later mask reaches only
+                // that far. What the padding computed is unreachable.
+                std::vector<std::size_t> refill;      // rows of this batch
+                std::vector<std::size_t> refill_slot;
+                std::vector<std::size_t> refill_have;
+                std::size_t longest = 0;
                 for (std::uint32_t i = 0; i < n; ++i) {
                     const std::size_t slot = static_cast<std::size_t>(slots[i]);
                     const std::size_t have = static_cast<std::size_t>(lengths[i]) - 1;
@@ -456,26 +486,45 @@ int main(int argc, char** argv) {
                     for (auto& block : pool) block.filled[slot] = 0;
                     if (have == 0) continue;
 
-                    const std::int32_t* row =
-                        windows.data() + static_cast<std::size_t>(i) * braid::kSeqLen;
-                    engine::Tensor prompt({1, have}, 0.0f, false);
-                    for (std::size_t j = 0; j < have; ++j) {
-                        prompt.data()[j] = static_cast<float>(row[j]);
+                    refill.push_back(i);
+                    refill_slot.push_back(slot);
+                    refill_have.push_back(have);
+                    longest = std::max(longest, have);
+                }
+
+                if (!refill.empty()) {
+                    const std::size_t k = refill.size();
+                    engine::Tensor prompts({k, longest}, 0.0f, false);
+                    for (std::size_t r = 0; r < k; ++r) {
+                        const std::int32_t* row =
+                            windows.data() + refill[r] * braid::kSeqLen;
+                        float* out = prompts.data() + r * longest;
+                        for (std::size_t j = 0; j < refill_have[r]; ++j) {
+                            out[j] = static_cast<float>(row[j]);
+                        }
                     }
                     // Rounded to a block, not to the context. A cached forward
-                    // attends over its whole capacity, so a prefill into a
+                    // attends over its whole capacity, so prefilling into a
                     // 1024-wide cache is a 1024-wide step to write forty
-                    // positions -- which is the same mistake this file's own
-                    // capacity note is about, made in the one place the note
-                    // was not looking. It cost the server half its throughput.
+                    // positions -- the same mistake this file's capacity note is
+                    // about, made where the note was not looking. It cost the
+                    // server half its throughput.
                     const std::size_t room =
-                        std::min(braid::kSeqLen, ((have + kBlock - 1) / kBlock) * kBlock);
-                    auto one = model.make_caches(1, room);
-                    (void)model.forward_cached(prompt, {0}, one);
+                        std::min(braid::kSeqLen, ((longest + kBlock - 1) / kBlock) * kBlock);
+                    auto fresh = model.make_caches(k, room);
+                    const std::vector<std::size_t> from_zero(k, 0);
+                    (void)model.forward_cached(prompts, from_zero, fresh);
+
                     for (std::size_t b = 0; b < braid::kBlocks; ++b) {
-                        pool[b].keys.scatter_rows(one[b].keys.slice(2, 0, have), 2, {slot}, {0});
-                        pool[b].values.scatter_rows(one[b].values.slice(2, 0, have), 2, {slot}, {0});
-                        pool[b].filled[slot] = have;
+                        // One scatter for the whole set, at `longest` positions
+                        // each: the tails past a row's own length are unread.
+                        pool[b].keys.scatter_rows(fresh[b].keys.slice(2, 0, longest), 2,
+                                                  refill_slot, from_zero);
+                        pool[b].values.scatter_rows(fresh[b].values.slice(2, 0, longest), 2,
+                                                    refill_slot, from_zero);
+                        for (std::size_t r = 0; r < k; ++r) {
+                            pool[b].filled[refill_slot[r]] = refill_have[r];
+                        }
                     }
                 }
 

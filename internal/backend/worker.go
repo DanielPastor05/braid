@@ -165,6 +165,12 @@ type WorkerOptions struct {
 	// call.
 	Cache bool
 
+	// CacheSlots is how many rows the worker's cache holds, and should be the
+	// scheduler's MaxBatch: a slot per row that can be in a step at once.
+	// Zero leaves the worker to allocate on its first frame, which works and
+	// makes the first request pay for a gigabyte.
+	CacheSlots int
+
 	// MinLayerNormElements is the third of the engine's thresholds, and the one
 	// that decided whether a small forward chained across the card or came home
 	// at every normalisation.
@@ -231,6 +237,14 @@ func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*W
 	}
 	if opts.Cache {
 		w.cmd.Env = append(w.cmd.Env, "BRAID_CACHE=1")
+		// How many slots to allocate at start. The pool is over a gigabyte at
+		// sixty-four, and allocating it lazily charges the whole thing to
+		// whichever request arrives first -- a cold start that reads as a
+		// latency regression.
+		if opts.CacheSlots > 0 {
+			w.cmd.Env = append(w.cmd.Env,
+				fmt.Sprintf("BRAID_CACHE_SLOTS=%d", opts.CacheSlots))
+		}
 	}
 
 	stdin, err := w.cmd.StdinPipe()

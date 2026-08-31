@@ -24,8 +24,8 @@ answer, and this page tries hard not to blur the two.
 |---|---|
 | **Model** | the Transformer from `cpp-ai-engine`, **10 759 058 parameters**, 6 blocks, 384 wide, **1024-id context**, 146-symbol byte alphabet, 1.51 bits/char |
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
-| **Throughput** | 322 tokens/s at one client, **2 686 at sixty-four** - median of three |
-| **What batching buys** | **8.7x** in tokens, and [none of it past the knee](#the-part-of-it-anybody-is-waiting-for) in goodput |
+| **Throughput** | 328 tokens/s at one client, **5 394 at sixty-four** - median of three |
+| **What batching buys** | **16.4x** in tokens, and [none of it past the knee](#the-part-of-it-anybody-is-waiting-for) in goodput |
 | **Under real arrivals** | offered 300/s instead of 150, throughput *rises* to 2 963 and [goodput falls to 200](#the-harness-could-not-overload-anything-and-said-so-by-never-trying) |
 | **Where a step goes at batch 64** | 20.0 ms model, 0.39 ms copy back, 0.10 ms sampling, 0.89 ms pipe |
 | **Batching invariance** | 0 divergences in 25 000 draws, and the logits behind them [drift 2e-5](#a-zero-that-was-hiding-its-own-denominator) - which is the number that means something |
@@ -47,37 +47,46 @@ of three sweeps, with the throughput range beside it.
 
 | clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | kernels |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 5 760 | 1.00 | 322 (316-328) | 5 ms | 8 ms | 2.92 | 2.82 | 177 |
-| 2 | 3 109 | 1.85 | 543 (526-561) | 8 ms | 12 ms | 3.34 | 3.22 | 177 |
-| 4 | 1 546 | 3.73 | 743 (727-754) | 10 ms | 14 ms | 4.92 | 4.82 | 177 |
-| 8 | 756 | 7.62 | 1 168 (1160-1173) | 11 ms | 16 ms | 6.36 | 6.26 | 177 |
-| 16 | 378 | 15.24 | 1 876 (1838-1882) | 15 ms | 19 ms | 7.99 | 7.68 | 177 |
-| 32 | 191 | 30.16 | 2 453 (2404-2453) | 25 ms | 37 ms | 12.13 | 11.04 | 177 |
-| 64 | 97 | 59.38 | **2 686** (2615-2728) | 42 ms | 62 ms | 21.67 | 18.51 | 177 |
-| 128 | 94 | 61.28 | 2 608 (2568-2649) | **729 ms** | 780 ms | 22.65 | 19.60 | 177 |
+| 1 | 5 760 | 1.00 | 328 (306-329) | 6 ms | 8 ms | 2.86 | 2.76 | 177 |
+| 2 | 3 119 | 1.85 | 531 (522-537) | 12 ms | 16 ms | 3.40 | 3.32 | 218 |
+| 4 | 1 534 | 3.75 | 1 084 (1081-1084) | 12 ms | 19 ms | 3.38 | 3.30 | 223 |
+| 8 | 762 | 7.56 | 1 894 (1876-1943) | 16 ms | 22 ms | 3.90 | 3.75 | 224 |
+| 16 | 376 | 15.32 | 3 211 (3187-3257) | 21 ms | 29 ms | 4.63 | 4.33 | 224 |
+| 32 | 189 | 30.48 | 4 367 (4240-4487) | 36 ms | 45 ms | 6.82 | 5.57 | 225 |
+| 64 | 95 | 60.63 | **5 394** (5276-5423) | 56 ms | 70 ms | 10.89 | 8.01 | 227 |
+| 128 | 92 | 62.61 | 5 271 (5149-5491) | **374 ms** | 439 ms | 11.42 | 8.05 | 232 |
 
-Those are measured at a **1024-id context**, and they are the same numbers the
-256-id model produced to within the noise: 322 against 321 at one client, 2 686
-against 2 698 at sixty-four. **Quadrupling the context changed nothing here, and
-that is the correct result** -- a step runs at the width of its longest row, the
-load harness asks for thirty tokens, and forty-one positions is forty-one
-positions whatever the model could have held. What the context changed is what a
-key/value cache would have to hold, which is
-[the reason it was raised](#what-the-context-is-for-and-what-it-costs).
+Measured with the key/value cache on, which is the default since it stopped
+costing anything — [it is worth 1.98x at sixty-four clients](#it-is-wired-in-and-it-is-worth-198x)
+and the four bugs on the way there are the most useful thing in this file. The
+kernel count is no longer flat at 177 because a step now sometimes carries a
+prefill as well.
 
-![Throughput against the p99 time to first token, labelled by concurrency: the curve climbs steeply to about 2 700 tokens per second and then turns over, with the 128-client point far to the right at nearly 700 ms.](docs/img/throughput-vs-tail.svg)
+Measured at a **1024-id context**. Raising it there from 256 changed these
+numbers by nothing at all -- 322 against 321 at one client, 2 686 against 2 698
+at sixty-four, before the cache existed -- and **that was the correct result**: a
+step runs at the width of its longest row, the harness asks for thirty tokens,
+and forty-one positions is forty-one positions whatever the model could hold.
+
+What the wider context changed was what a key/value cache would have to hold,
+and [that argument](#what-the-context-is-for-and-what-it-costs) is the one that
+eventually doubled the table above.
+
+![Throughput against the p99 time to first token, labelled by concurrency: the curve climbs steeply to about 5 400 tokens per second and then turns over, with the 128-client point far to the right at several hundred milliseconds.](docs/img/throughput-vs-tail.svg)
 
 **The turn is the whole picture.** Every point up to sixty-four clients buys
 throughput for tens of milliseconds of tail. The last one buys nothing and costs
 most of a second: the batch is as full as `MaxBatch` allows — 60.6 against a
 limit of 64 — so the extra clients are not being served slowly, they are queuing.
 
-**Batching is worth 8.7x here.** The kernel count is **177 on every row**: every
-dispatch discontinuity this page used to have a section about is gone, and the
-last one to go is [two sections down](#the-thresholds-came-back-to-life-on-the-wrong-side).
+**Batching is worth 16.4x here**, and that multiplier has now been 7.5x, 2.5x,
+12.3x, 8.8x and 8.7x on this page. It has fallen every time the server got
+faster and risen every time the *step* got cheaper, because what it measures is
+fixed cost left to amortise rather than anything about batching. Optimising for
+it would have steered away from most of the improvements here.
 
-**One client needs 5 760 forward passes for 5 760 tokens, sixty-four need 98.**
-Fifty-nine times fewer trips through the model for eight times the throughput.
+**One client needs 5 760 forward passes for 5 760 tokens, sixty-four need 95.**
+Sixty times fewer trips through the model for sixteen times the throughput.
 
 ### The part of it anybody is waiting for
 
@@ -107,12 +116,14 @@ and twenty-eight clients it is plainly the second: the curve does not have a
 tail, it *is* the tail. Every request waited about the same long time, which is
 what a queue looks like from the inside.
 
-That multiplier has now fallen three times while the server got faster: 7.5x on
+That multiplier has now moved five times while the server got faster: 7.5x on
 the small model, 2.5x on the big one, 12.3x once the padding stopped being
-computed, 8.7x once the dispatch floors were lowered. **It measures how much
-fixed cost there is left to amortise, not how good the batching is.** A project
-that optimised for it would have been steering away from every real improvement
-on this page.
+computed, 8.7x once the dispatch floors were lowered, 16.4x once the key/value
+cache made the step itself cheap. **It measures how much fixed cost there is left
+to amortise, not how good the batching is** -- it falls when the server gets
+faster at one client and rises when the per-step work gets smaller. A project
+that optimised for it would have been steering away from most of the real
+improvements on this page.
 
 Reproduce it:
 
@@ -149,10 +160,14 @@ So `MaxBatch` is two knobs at once. Below the peak it buys throughput; at the
 peak it stops; above it, it costs. **The default is now 64**, measured rather
 than round, and that is where all three rows agree the card is happiest.
 
-The earlier version of this section, taken before the dispatch floors were
-lowered, put the peak at 2 750 tok/s and called it the card. It was the card
-*plus* a step that went home to the host for its normalisations. The card turned
-out to have another 9% in it.
+This section has called the card's ceiling twice and been wrong twice. Before
+the dispatch floors were lowered it put the peak at 2 750 tok/s; that was the
+card *plus* a step going home to the host for its normalisations, and there was
+another 9% in it. Then it said 2 750 again with the floors down, and that was the
+card *plus* recomputing every position of every sequence on every step -- the
+key/value cache found another 96%. **The peak is now 5 394**, and the honest
+version of this paragraph is that a measured ceiling is a statement about the
+current code and not about the hardware.
 
 ---
 
@@ -304,7 +319,7 @@ is where they went.
 
 | | 172 728 params, 64 ctx | 10 758 289 params, 256 ctx |
 |---|---|---|
-| what batching buys | **7.5x** | **2.5x** → now 8.7x, and [that is not the improvement it looks like](#what-batching-buys-and-where-it-stops-paying) |
+| what batching buys | **7.5x** | **2.5x** → now 16.4x, and [that is not the improvement it looks like](#what-batching-buys-and-where-it-stops-paying) |
 | where throughput saturates | 32 clients | **16 clients** → now 64, and it is a peak |
 | forward, batch 1 -> 12 | 0.77 -> ~1.0 ms | **6.81 -> 30.36 ms** → now 2.7 at one, 6.0 at eight |
 | kernels per step | 0 to 60, discontinuous | **176, flat** → now 177, flat at every size |
@@ -887,80 +902,89 @@ guessed "about a quarter of the step, and then the fused attention kernel has a
 baseline to beat"; measured it is a tenth, and the baseline to beat is the
 attention over capacity rather than the movement.
 
-### It is wired in, and it buys throughput with tail latency
+### It is wired in, and it is worth 1.98x
 
 The worker holds the cache, the protocol carries a slot per row (BRD7), and the
 scheduler hands slots out of a free list of `MaxBatch`, taking them back when a
-sequence ends. `BRAID_CACHE=1` turns it on. Same harness, same weights, one
-worker:
+sequence ends. It is **on by default**. Same harness, same weights, one worker:
 
-| clients | tokens/s off | on | | TTFT p95 off | on |
+| clients | tokens/s off | on | | TTFT p50 off | on |
 |---|---|---|---|---|---|
-| 1 | 318 | 326 | 1.03x | 8 ms | 8 ms |
-| 4 | 720 | **1 014** | **1.41x** | 15 ms | 29 ms |
-| 16 | 1 811 | **2 327** | **1.29x** | 24 ms | **194 ms** |
-| 32 | 2 469 | **2 775** | 1.12x | 35 ms | **326 ms** |
-| 64 | 2 735 | 2 695 | 0.99x | 59 ms | **678 ms** |
+| 1 | 312 | 326 | 1.04x | 6 ms | 5 ms |
+| 4 | 715 | **1 084** | **1.52x** | 11 ms | 12 ms |
+| 16 | 1 890 | **3 078** | **1.63x** | 18 ms | 22 ms |
+| 32 | 2 475 | **4 394** | **1.78x** | 27 ms | 35 ms |
+| 64 | 2 654 | **5 252** | **1.98x** | 50 ms | 57 ms |
 
-**Throughput up to 1.41x, and the tail eight times worse.** Both halves are the
-same cause and it is worth naming: a sequence arriving has to get its prompt into
-the cache, which is an extra forward pass, and the worker does those one at a
-time inside the step. Every other row in that batch waits behind them. That is
-**prefill interfering with decode**, the problem real serving systems answer with
-chunked prefill or by disaggregating the two, and neither is a two-line change.
+**Nothing is traded away.** An earlier version of this section published a real
+trade -- 1.29x the throughput for a TTFT p95 of 194 ms against 24 -- and argued
+the flag should stay off because which half mattered was the operator's call.
+That was honest and it was also a bug wearing the costume of a trade-off. Two
+more fixes removed the tail cost entirely and doubled the throughput win.
 
-So the flag stays **off by default**. A server whose p95 goes from 24 ms to 194
-for 1.29x the tokens has not obviously been improved, and which half matters is
-the operator's call rather than mine.
+### Four bugs, and the two that a component benchmark could never find
 
-**What the cache does not cost is correctness under failover.** A worker with it
-on holds state -- the keys and values of every sequence in its slots -- and the
-claim the protocol makes is that this state is never authoritative: the whole
-window is sent every step, so a replacement worker refills a slot it has never
-seen and carries on.
+Getting from *fifteen times slower than no cache* to 1.98x faster took six
+fixes. The order matters more than the total:
+
+| | tokens/s at 16 clients |
+|---|---|
+| gather and narrow in the wrong order | 125 |
+| the prefill allocating at the full context | 889 |
+| gather and narrow as two operations | 1 239 |
+| **the pool never reached the device** | 2 327 |
+| the pool allocated lazily, not at startup | 2 416 |
+| **prefills batched into one forward** | **3 078** |
+
+The first three are ordinary. Picking one gather order and writing a comment
+calling it generally cheaper, which
+[this repository's own benchmark](#and-the-other-one-found-the-same-way) had
+already contradicted. Allocating a prefill at the full context to write forty
+positions, which is
+[the capacity finding](#the-cache-is-built-and-what-it-costs-is-the-room-you-gave-it)
+committed in the one place that finding was not looking. Wanting a primitive
+that did not exist, now
+[#13](https://github.com/DanielPastor05/cpp-ai-engine/pull/13).
+
+**The fourth and the sixth are the ones worth the section.**
+
+Every device path in this engine is admitted on *residency*. `select_rows_window`
+needs the pool on the card to read it, `scatter_rows` needs it there to write it,
+and both fall back to the host **silently** when it is not. A pool built by
+`make_caches` has only ever existed on the host — so nothing ever put it on the
+card, and the cache spent its whole life on the wrong side of PCIe: gather on the
+host, upload, step, download, scatter on the host. The fix is adding zeros to
+zeros once, which looks like a no-op and is the opposite of one. That trap has
+now produced four wrong results in one day. **If a number here is within an order
+of magnitude of PCIe, check residency before believing it.**
+
+And the prefills. A sequence arriving has to get its prompt into the cache, and
+the worker was doing one forward pass per arriving row, inside the step, with
+every other row in the batch waiting behind it. Padding them to the longest and
+doing all of them in **one** pass took a step from 598 kernels to 232. The
+padding is safe for the same reason the window's is: each row's `filled` is set
+to its own real length afterwards, and every later mask reaches only that far, so
+what the padding computed is unreachable.
+
+That one change is worth remembering as a shape rather than a number: **the two
+things a cache adds to a step are a per-row gather and a per-arrival prefill, and
+both of them are only expensive if you do them one row at a time.**
+
+### What the cache is not allowed to cost
+
+A worker with the cache on holds state — the keys and values of every sequence in
+its slots — and the claim the protocol makes is that this state is **never
+authoritative**: the whole window is sent every step, so a replacement worker
+refills a slot it has never seen and carries on.
 
 `TestAKilledWorkerLosesItsCacheAndNotItsAnswer` is that claim as a test rather
 than a paragraph. Six clients, a hundred and twenty tokens each, temperature low
 enough that the sampler lands on the argmax, generated twice: once undisturbed
 and once with a worker killed a second and a half in, when every slot is warm.
 **The two runs agree character for character.** Not "it did not crash" and not
-"the text is plausible" -- the same characters, because a cache that came back
+"the text is plausible" — the same characters, because a cache that came back
 subtly wrong would produce fluent text that differs, and that is the failure
 worth catching.
-
-### Four bugs on the way, and three were the same bug
-
-Getting from *fifteen times slower* to 1.29x took four fixes, and the pattern in
-them is worth more than the number:
-
-| | throughput at 16 clients |
-|---|---|
-| gather-and-narrow in the wrong order | 125 tok/s |
-| prefill allocating at the full context | 889 |
-| gather and narrow as two operations | 1 136 → 1 239 |
-| **the pool never reached the device** | **2 327** |
-
-The first was picking one order and writing a comment calling it generally
-cheaper, which
-[this repository's own benchmark](#and-the-other-one-found-the-same-way) had
-already contradicted. The second was
-[the capacity finding](#the-cache-is-built-and-what-it-costs-is-the-room-you-gave-it)
-committed in the one place that finding was not looking. The third wanted a
-primitive that did not exist and is now
-[#13](https://github.com/DanielPastor05/cpp-ai-engine/pull/13).
-
-**The fourth is the one to remember.** Every device path in this engine is
-admitted on *residency*: `select_rows_window` needs the pool on the card to read
-it, `scatter_rows` needs it there to write it, and both fall back to the host
-silently when it is not. A pool built by `make_caches` has only ever existed on
-the host — so nothing ever put it on the card, and the cache spent its whole life
-on the wrong side of PCIe. The fix is adding zeros to zeros once, which looks
-like a no-op and is the opposite of one.
-
-That trap has now produced four wrong results in one day: a gather benchmark
-reporting PCIe bandwidth, a write-back that looked faster than the kernel
-replacing it, and this. **If a number here is within an order of magnitude of
-PCIe, check residency before believing it.**
 
 **`internal/kvmem` is still not wired into the serving path.** It is arithmetic
 and a block allocator with tests; what it is waiting for is the per-row cache in the worker, which is

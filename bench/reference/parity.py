@@ -40,12 +40,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 import charlm  # noqa: E402
 
-FRAME_MAGIC = 0x36445242  # 'BRD6'
+FRAME_MAGIC = 0x37445242  # 'BRD7'
 STATUS_OK = 0
 
 
 class Worker:
-    """braid_worker over BRD6, for one batch at a time.
+    """braid_worker over BRD7, for one batch at a time.
 
     The protocol only returns sampled ids, not logits, which is the right thing
     for a server and an awkward thing for a parity check. It is also enough: at
@@ -75,6 +75,10 @@ class Worker:
         frame += struct.pack("<II", FRAME_MAGIC, n)
         frame += windows.to(torch.int32).numpy().tobytes()
         frame += struct.pack(f"<{n}i", *lengths)
+        # Slots, all -1: this harness wants the worker to recompute, because what
+        # it is comparing against is a PyTorch forward over the whole window and
+        # a cached step would be comparing two different things.
+        frame += struct.pack(f"<{n}i", *([-1] * n))
         frame += struct.pack(f"<{n}f", *([temperature] * n))
         frame += struct.pack(f"<{n}Q", *seeds)
         self.proc.stdin.write(bytes(frame))
