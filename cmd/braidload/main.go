@@ -107,7 +107,15 @@ func main() {
 		maxTokens   = flag.Int("max-tokens", 100, "tokens per generation")
 		temperature = flag.Float64("temperature", 0.8, "sampling temperature")
 		svgDir      = flag.String("svg", "", "directory to write the README's charts into")
-		sloFlag     = flag.Float64("slo-ms", 100,
+		// Open loop. The default sweep is closed -- n clients, each starting a new
+		// request when its last one finishes -- and a closed loop cannot overload
+		// anything, because the arrival rate is throttled by the completion rate.
+		// Every tail this harness has ever printed is the tail of a system that
+		// was never pushed. These two make it possible to push.
+		arrivals = flag.String("arrivals", "",
+			"open loop: comma-separated requests per second to offer, instead of -concurrency")
+		forEach = flag.Duration("for", 20*time.Second, "how long to hold each arrival rate")
+		sloFlag = flag.Float64("slo-ms", 100,
 			"time to first token a request must beat to count towards goodput")
 		repeat = flag.Int("repeat", 1,
 			"how many times to measure each level; above one the table reports a median and a range")
@@ -126,6 +134,16 @@ func main() {
 	fmt.Printf("Answered by %s.\n\n", first.backend())
 
 	var charted []level
+
+	// Open loop, if asked for: arrivals at a fixed rate rather than a fixed
+	// number of clients. It has its own table because the columns mean different
+	// things -- the offered rate is the input and the completions are the output,
+	// which is the reverse of the closed loop.
+	if *arrivals != "" {
+		runOpenLoop(client, *addr, *arrivals, *forEach, *maxTokens,
+			float32(*temperature), *sloFlag)
+		return
+	}
 
 	// The last columns decompose one step: forward is the model's kernels, copy
 	// is pulling the result off the device, sample is the softmax and the draw,
@@ -224,7 +242,12 @@ type level struct {
 	goodput float64
 	// The raw times behind the percentiles, kept only when charts are asked
 	// for: the distribution is the thing a percentile is a summary of.
-	ttfts    []time.Duration
+	ttfts []time.Duration
+	// offered and refused belong to the open-loop mode. At overload the arrival
+	// rate is the independent variable and the completed count is what depends
+	// on it, which is the opposite of the closed loop's arrangement.
+	offered  float64
+	refused  int
 	wall     float64
 	forward  float64
 	copyBack float64

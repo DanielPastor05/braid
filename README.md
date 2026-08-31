@@ -26,6 +26,7 @@ answer, and this page tries hard not to blur the two.
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
 | **Throughput** | 321 tokens/s at one client, **2 698 at sixty-four** - median of three |
 | **What batching buys** | **8.7x** in tokens, and [none of it past the knee](#the-part-of-it-anybody-is-waiting-for) in goodput |
+| **Under real arrivals** | offered 300/s instead of 150, throughput *rises* to 2 963 and [goodput falls to 200](#the-harness-could-not-overload-anything-and-said-so-by-never-trying) |
 | **Where a step goes at batch 64** | 20.0 ms model, 0.39 ms copy back, 0.10 ms sampling, 0.89 ms pipe |
 | **Batching invariance** | 0 divergences in 25 000 draws, and the logits behind them [drift 2e-5](#a-zero-that-was-hiding-its-own-denominator) - which is the number that means something |
 | **A worker killed mid-load** | 0 requests failed; workers hold no state |
@@ -143,6 +144,45 @@ The earlier version of this section, taken before the dispatch floors were
 lowered, put the peak at 2 750 tok/s and called it the card. It was the card
 *plus* a step that went home to the host for its normalisations. The card turned
 out to have another 9% in it.
+
+---
+
+### The harness could not overload anything, and said so by never trying
+
+Every latency figure above comes from a **closed loop**: *n* clients, each
+starting a new request when its last one finishes. A closed loop cannot overload
+a server. The arrival rate is throttled by the completion rate, so as the server
+slows down the load politely slows down with it, and every tail this page has
+ever printed is the tail of a system that was never pushed.
+
+Real traffic does not wait. `-arrivals` offers requests at a fixed rate with
+exponential gaps — a Poisson process — and does not care whether the last one
+came back. Against the mock backend, so this is about the scheduler and not the
+model:
+
+| offered/s | sent | completed | refused | tokens/s | goodput/s | TTFT p50 | mean batch |
+|---|---|---|---|---|---|---|---|
+| 150 | 1 064 | 1 064 | 0 | 2 573 | **2 556** | 35 ms | 45.9 |
+| 300 | 1 794 | 1 480 | 314 | 2 963 | **200** | **1 382 ms** | 61.2 |
+| 600 | 3 187 | 1 474 | 1 713 | 2 963 | 129 | 1 706 ms | 61.3 |
+| 1 200 | 5 052 | 1 472 | 3 580 | 2 993 | 130 | 1 715 ms | 63.2 |
+
+**Throughput goes up across the cliff.** 2 573 tokens a second at 150 offered,
+2 963 at 300 — and in between, the goodput falls from 2 556 to 200 and the
+median time to first token goes from 35 ms to 1.4 seconds. The server is
+producing *more* tokens and serving almost nobody, and the number that has always
+been quoted is the one that improved.
+
+The completions flatten at about 1 474 in the window and stay there however much
+is offered, which is the queue doing its job: past capacity the extra arrivals
+are refused in single-digit milliseconds rather than admitted into a queue that
+would answer them in a minute. **Refusals are a result here and not an error** —
+a run that counted a 429 as a failure would report the well-behaved server as the
+broken one.
+
+```bash
+go run ./cmd/braidload -arrivals 150,300,600,1200 -for 8s -max-tokens 20
+```
 
 ---
 
