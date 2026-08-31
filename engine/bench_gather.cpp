@@ -17,7 +17,20 @@
 // only the read, not the write back, and it gathers a contiguous prefix rather
 // than the scattered order a real batch produces.
 //
-//   braid_bench_gather [repeats]
+//   ENGINE_CUDA_MIN_FLOPS=1 ENGINE_CUDA_MIN_ELEMENTS=1 ENGINE_CUDA_MIN_LAYERNORM=1 \
+//       braid_bench_gather [repeats]
+//
+// **All three, every time.** Every device path here is admitted on residency, and
+// a tensor only becomes resident by having a kernel write it -- which is what the
+// `x + x` before each timing loop is for. Leave one floor at its default and that
+// elementwise add stays on the host, the tensor never reaches the card, and every
+// operation below silently measures the host path instead.
+//
+// This has produced three wrong tables in one afternoon. The first read 3-9 GB/s
+// for a gather, which is PCIe rather than a card with 448 GB/s of bandwidth; the
+// last made a 192-launch write-back look nine times *faster* than the single
+// kernel that replaces it. Both looked plausible. If a number here is within an
+// order of magnitude of PCIe, check the environment before believing it.
 
 #include "engine/cuda.hpp"
 #include "engine/tensor.hpp"
@@ -179,5 +192,87 @@ int main(int argc, char** argv) {
     }
     std::cout << "\nBoth columns are keys and values for every block, which is what one step "
                  "of a slot-indexed cache would pay before the model runs.\n";
+
+    // ---- and putting the answer back ------------------------------------
+    //
+    // After the step, each row's new key and value have to reach the slot they
+    // came from, at that row's own position. That is a gather's inverse and the
+    // engine has neither half of it in one call: select_rows takes indices and
+    // no offset, copy_into_rows takes an offset per row and no indices.
+    //
+    // So the write-back is one copy_into_rows per slot, per block, per tensor --
+    // 192 calls at a batch of sixteen -- each moving heads * head_dim floats,
+    // which is nothing. The question is whether the launches cost more than the
+    // bytes, and at this size they plainly will; what matters is how much,
+    // against a cached step of three to four milliseconds.
+    std::cout << "\n| active | one-at-a-time | ms | per write us | scatter_rows ms | saved |\n";
+    std::cout << "|---|---|---|---|---|---|\n";
+
+    for (std::size_t active : {std::size_t{1}, std::size_t{8}, std::size_t{16}, std::size_t{32}}) {
+        // One tensor per slot, which is what makes copy_into_rows usable at all:
+        // its offsets index axis 0, so a per-slot cache has the one row it needs.
+        std::vector<engine::Tensor> slots_k;
+        slots_k.reserve(active);
+        for (std::size_t r = 0; r < active; ++r) {
+            engine::Tensor one({1, kHeads, kContext, kHeadDim}, 0.0f, false);
+            const engine::Tensor onto_the_card = one + one;
+            engine::cuda::synchronize();
+            slots_k.push_back(one);
+        }
+        engine::Tensor fresh({1, kHeads, 1, kHeadDim}, 1.0f, false);
+        {
+            const engine::Tensor onto_the_card = fresh + fresh;
+            engine::cuda::synchronize();
+        }
+
+        const std::size_t writes = active * 2 * kBlocks;
+        for (int i = 0; i < 3; ++i) {
+            for (std::size_t w = 0; w < writes; ++w) {
+                slots_k[w % active].copy_into_rows(fresh, 2, {17});
+            }
+            engine::cuda::synchronize();
+        }
+
+        const auto started = clock_type::now();
+        for (int i = 0; i < repeats; ++i) {
+            for (std::size_t w = 0; w < writes; ++w) {
+                slots_k[w % active].copy_into_rows(fresh, 2, {17});
+            }
+            engine::cuda::synchronize();
+        }
+        const double per_step = ms_since(started) / repeats;
+
+        // The same write-back through scatter_rows: twelve launches instead of
+        // `writes` of them, carrying exactly the same bytes.
+        engine::Tensor pool({active, kHeads, kContext, kHeadDim}, 0.0f, false);
+        engine::Tensor batch({active, kHeads, 1, kHeadDim}, 1.0f, false);
+        {
+            const engine::Tensor a = pool + pool;
+            const engine::Tensor b = batch + batch;
+            engine::cuda::synchronize();
+        }
+        std::vector<std::size_t> into(active), at(active);
+        for (std::size_t r = 0; r < active; ++r) {
+            into[r] = r;
+            at[r] = 17 + r;
+        }
+        for (int i = 0; i < 3; ++i) {
+            for (std::size_t b = 0; b < 2 * kBlocks; ++b) pool.scatter_rows(batch, 2, into, at);
+            engine::cuda::synchronize();
+        }
+        const auto scatter_started = clock_type::now();
+        for (int i = 0; i < repeats; ++i) {
+            for (std::size_t b = 0; b < 2 * kBlocks; ++b) pool.scatter_rows(batch, 2, into, at);
+            engine::cuda::synchronize();
+        }
+        const double with_scatter = ms_since(scatter_started) / repeats;
+
+        std::cout << "| " << active << " | " << writes << " | " << std::fixed
+                  << std::setprecision(3) << per_step << " | " << std::setprecision(1)
+                  << (per_step * 1000.0 / static_cast<double>(writes)) << " | "
+                  << std::setprecision(3) << with_scatter << " | " << std::setprecision(1)
+                  << (per_step / (with_scatter > 0.0 ? with_scatter : 1.0)) << "x |\n";
+        std::cout.flush();
+    }
     return 0;
 }

@@ -856,6 +856,31 @@ and a cache makes the kernels smaller rather than fewer while adding a gather.
 The cache is an optimisation for loaded servers, which is the opposite of how it
 is usually introduced.
 
+### And the other one, found the same way
+
+Putting the answer back is the gather's inverse: each row's new key and value
+return to a different slot, at a different position. `select_rows` takes indices
+and no offset; `copy_into_rows` takes an offset per row and no indices. Neither
+does both, so the write-back was one call per row per block -- 192 launches at a
+batch of sixteen, none of them carrying more than 384 floats.
+
+| batch | one call per row | one `scatter_rows` | |
+|---|---|---|---|
+| 8 | 0.94 ms | 0.12 | 7.7x |
+| 16 | 1.63 | **0.11** | **14.4x** |
+| 32 | 3.62 | **0.11** | **33.6x** |
+
+Nine microseconds a write, which is a kernel launch and not a copy. The bytes
+were never the problem, and 1.6 ms of launches sat against a cached step of three
+to four.
+[Sent upstream as #12](https://github.com/DanielPastor05/cpp-ai-engine/pull/12),
+where two rows naming the same slot are refused rather than ordered -- on the
+device they would race, and which won would be whichever block finished last.
+
+**Both of these were found by needing the operation, not by reading the source**,
+which is the difference between the six engine pull requests this server has sent
+and the three it sent before it had a workload.
+
 The gather is the cheap part, which is the one thing that did go as predicted:
 0.62 ms at batch 16 and capacity 512, against a 9.47 ms cached step. The plan
 guessed "about a quarter of the step, and then the fused attention kernel has a
