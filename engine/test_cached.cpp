@@ -137,6 +137,54 @@ int run(int argc, char** argv) {
         check(worst < 1e-2, "one row decoded a position at a time matches recomputation");
     }
 
+    // ---- 1b. many new positions at once, which is a prefill --------------
+    //
+    // A sequence arriving with a prompt has to get that prompt into the cache,
+    // and doing it a position at a time is one forward pass per character. One
+    // call with `take` new positions is the whole point -- but it only works if
+    // a new position may attend to the new positions before it in the same
+    // call, which is a property of the mask this file builds rather than of the
+    // engine. Untested, it is exactly the kind of thing that produces fluent
+    // wrong text.
+    {
+        std::vector<std::int32_t> ids(18);
+        for (auto& id : ids) id = pick(rng);
+
+        auto caches = model.make_caches(1, kCapacity);
+        engine::Tensor prompt({1, 12}, 0.0f, false);
+        for (std::size_t i = 0; i < 12; ++i) prompt.data()[i] = static_cast<float>(ids[i]);
+
+        // Twelve positions in one call, starting from an empty cache.
+        const engine::Tensor got = model.forward_cached(prompt, {0}, caches);
+
+        // Every one of them should match what recomputing that prefix gives.
+        double worst = 0.0;
+        for (std::size_t t = 0; t < 12; ++t) {
+            const std::vector<float> want = uncached_last(model, ids, t + 1, V);
+            engine::Tensor want_t({V}, 0.0f, false);
+            std::copy(want.begin(), want.end(), want_t.data());
+            engine::Tensor got_t({V}, 0.0f, false);
+            std::copy_n(got.data() + t * V, V, got_t.data());
+            worst = std::max(worst, worst_gap(got_t, want_t, V));
+        }
+        std::printf("  worst logit gap, 12 positions in one call: %.3e\n", worst);
+        check(worst < 1e-2, "a multi-position prefill matches recomputation at every position");
+
+        // And decoding on afterwards has to continue from where the prefill
+        // left the cache, not from where a fresh one would.
+        double after = 0.0;
+        for (std::size_t t = 12; t < ids.size(); ++t) {
+            engine::Tensor step({1, 1}, static_cast<float>(ids[t]), false);
+            const engine::Tensor one = model.forward_cached(step, {t}, caches);
+            const std::vector<float> want = uncached_last(model, ids, t + 1, V);
+            engine::Tensor want_t({V}, 0.0f, false);
+            std::copy(want.begin(), want.end(), want_t.data());
+            after = std::max(after, worst_gap(one, want_t, V));
+        }
+        std::printf("  worst logit gap, decoding on from a prefill: %.3e\n", after);
+        check(after < 1e-2, "and decoding continues correctly from a prefilled cache");
+    }
+
     // ---- 2. a batch with every row at the same position ------------------
     {
         constexpr std::size_t kRows = 4;
