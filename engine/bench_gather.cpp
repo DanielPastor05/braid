@@ -111,5 +111,73 @@ int main(int argc, char** argv) {
     std::cout << "\nThe last column is the read alone, one block. `whole model ms` is that "
                  "times two for keys and values and times six for the blocks -- still only "
                  "the read, and still in slot order rather than a real batch's.\n";
+
+    // ---- getting a *narrow* cache out of a wide pool ---------------------
+    //
+    // A cached step costs what its capacity is, so the compact cache handed to
+    // the model should be as narrow as the batch's history requires -- rounded
+    // up to a block, not up to the context. The pool, though, has to be as wide
+    // as the context, because a sequence may run that far.
+    //
+    // So the per-step read is "the active slots, but only their first W
+    // positions", and the engine has no such primitive. It has whole-row gather
+    // and it has slice, and they compose two ways round with very different
+    // amounts of copying:
+    //
+    //   slice the pool to W, then gather n of its rows: touches all `slots`
+    //   gather n whole rows, then slice them to W:      touches the full context
+    //
+    // Which is cheaper depends on n/slots against W/context, and both ratios are
+    // real at serving. Measured rather than reasoned about, because the arithmetic
+    // for this has been wrong twice today.
+    std::cout << "\n| slots | active | context | width | slice+gather ms | gather+slice ms |\n";
+    std::cout << "|---|---|---|---|---|---|\n";
+
+    constexpr std::size_t kContext = 1024;
+    for (std::size_t slots : {std::size_t{32}, std::size_t{64}}) {
+        for (std::size_t active : {std::size_t{8}, std::size_t{16}, std::size_t{32}}) {
+            if (active > slots) continue;
+            for (std::size_t width : {std::size_t{144}, std::size_t{464}}) {
+                // The pool as a slot-indexed cache holds it: a row per slot,
+                // (heads, context, head_dim) flattened behind it. Kept as
+                // (slots, heads, context, head_dim) so axis 2 is the position
+                // and slice can narrow it.
+                engine::Tensor pool({slots, kHeads, kContext, kHeadDim}, 0.0f, false);
+                {
+                    const engine::Tensor onto_the_card = pool + pool;
+                    engine::cuda::synchronize();
+                }
+                std::vector<std::size_t> take(active);
+                for (std::size_t i = 0; i < active; ++i) take[i] = (i * 7) % slots;
+
+                for (int i = 0; i < 3; ++i) {
+                    (void)pool.slice(2, 0, width).select_rows(take);
+                    (void)pool.select_rows(take).slice(2, 0, width);
+                    engine::cuda::synchronize();
+                }
+
+                auto started = clock_type::now();
+                for (int i = 0; i < repeats; ++i) {
+                    (void)pool.slice(2, 0, width).select_rows(take);
+                    engine::cuda::synchronize();
+                }
+                const double slice_first = (ms_since(started) / repeats) * 2.0 * kBlocks;
+
+                started = clock_type::now();
+                for (int i = 0; i < repeats; ++i) {
+                    (void)pool.select_rows(take).slice(2, 0, width);
+                    engine::cuda::synchronize();
+                }
+                const double gather_first = (ms_since(started) / repeats) * 2.0 * kBlocks;
+
+                std::cout << "| " << slots << " | " << active << " | " << kContext << " | " << width
+                          << " | " << std::fixed << std::setprecision(2) << slice_first << " | "
+                          << gather_first << " |\n";
+                std::cout.flush();
+            }
+        }
+    }
+    std::cout << "\nBoth columns are keys and values for every block, which is what one step "
+                 "of a slot-indexed cache would pay before the model runs.\n";
     return 0;
 }

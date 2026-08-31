@@ -842,6 +842,36 @@ allocates in blocks of sixteen for [under six percent
 waste](#what-the-context-is-for-and-what-it-costs); 453 positions round to 464
 rather than to 1024, and the 512 row above is the nearest thing measured to it.
 
+### And the operation that was missing
+
+If a cached step costs what its capacity is, the fix is to hand the model a cache
+cut to the width the batch has actually reached -- 464 rather than 1024 -- and
+cutting one is a slice, every step, of something living on the card.
+
+`Tensor::slice` had no device path. It was a `std::copy_n` loop, and slicing a
+resident cache therefore pulled it down, cut it on the host, and left the result
+there for the next operation to upload again. Reading sixteen slots of a
+(64, 6, 1024, 64) pool at width 464, keys and values for six blocks:
+
+| | host-only slice | with a device slice |
+|---|---|---|
+| slice the pool, then gather the rows | 199.34 ms | **4.20 ms** |
+| gather the rows, then slice them | 148.93 ms | **2.75 ms** |
+
+Fifty times, and all of it PCIe. The engine had given **slice's inverse** a
+device path when the cache landed -- `copy_into`, on the argument that a cache
+living on the card should be appended to on the card -- and left the read side
+on the host. That is
+[the fifth pull request](https://github.com/DanielPastor05/cpp-ai-engine/pull/11)
+this server has sent upstream, and the first one found by needing the operation
+rather than by reading the source.
+
+With both sides on the device the two orderings become comparable, and which one
+is cheaper stops being "whichever avoids the host" and starts depending on the
+ratios: eight active slots of sixty-four favours gathering first (1.70 against
+3.58, because eight rows are less to move than sixty-four), thirty-two of
+thirty-two reverses it (3.45 against 5.41). A scheduler can pick on the numbers.
+
 The gather is the cheap part, which is the one thing that did go as predicted:
 0.62 ms at batch 16 and capacity 512, against a 9.47 ms cached step. The plan
 guessed "about a quarter of the step, and then the fused attention kernel has a
