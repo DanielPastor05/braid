@@ -243,7 +243,7 @@ int main(int argc, char** argv) {
     std::cout << "|---|---|---|---|---|---|---|\n";
 
     for (std::size_t n : {std::size_t{1}, std::size_t{8}, std::size_t{16}, std::size_t{32}}) {
-      for (std::size_t history : {std::size_t{128}, std::size_t{453}}) {
+      for (std::size_t history : {std::size_t{29}, std::size_t{128}, std::size_t{453}}) {
         // The capacity sweep is the point of this table.
         //
         // A cached forward attends over the whole capacity rather than over the
@@ -256,7 +256,14 @@ int main(int argc, char** argv) {
         // Rounding the allocation up to a block instead of up to the context is
         // exactly what a block table buys. This is where that stops being an
         // assertion and becomes a column.
-        for (std::size_t capacity : {std::size_t{256}, std::size_t{512}, braid::kSeqLen}) {
+        // 48 and 64 are what a block allocator of sixteen gives a short
+        // history: the harness asks for thirty tokens, so a row that has
+        // reached 29 rounds to 48 rather than to the context. That is the
+        // regime this server actually serves, and it was missing from the
+        // sweep -- which measured only histories long enough to make the
+        // cache look good.
+        for (std::size_t capacity :
+             {std::size_t{48}, std::size_t{64}, std::size_t{256}, std::size_t{512}, braid::kSeqLen}) {
             if (history + n >= capacity) continue;
 
             std::vector<std::size_t> at(n);

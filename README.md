@@ -812,65 +812,49 @@ positions prefilled to five different depths. All three agree to **0.000e+00**.
 Not within tolerance: the same floats.
 
 Then it was measured against the step it replaces, and the answer was not the
-one the arithmetic promised. I expected something like 26x. What came back:
+one the arithmetic promised. I expected something like 26x. What the sweep says
+is that **a cache is worth what its capacity lets it be worth**, and that a
+carelessly sized one is not slow, it is *slower than not having it*.
 
-| batch | history | capacity | uncached | cached + gather | speedup |
+The same history, the same batch, only the room allocated changing:
+
+| batch | history | capacity 48-64 | 256 | 512 | 1024 |
 |---|---|---|---|---|---|
-| 16 | 128 | 256 | 22.49 ms | 6.48 | **3.5x** |
-| 16 | 128 | 512 | 22.31 | 10.12 | 2.2x |
-| 16 | 128 | 1024 | 22.38 | 17.62 | **1.3x** |
-| 32 | 453 | 512 | 180.31 | 19.20 | **9.4x** |
-| 32 | 453 | 1024 | 182.05 | 30.87 | 5.9x |
-| 8 | 128 | 1024 | 12.39 | 11.21 | **1.1x** |
+| 1 | 29 | 0.9x | 0.8x | 0.7x | 0.8x |
+| 8 | 29 | **1.8x** | 1.4x | 0.9x | **0.6x** |
+| 16 | 29 | **2.4x** | 1.3x | 0.8x | **0.5x** |
+| 32 | 29 | **4.1x** | 1.8x | 1.0x | **0.6x** |
 
-**Read the first three rows together: the history is the same in all of them.**
-Only the capacity changes, and the cost doubles with it. A cached forward attends
-over the whole capacity rather than over the part filled so far, because slicing
-the cache down to its length would copy it every step -- which is the cost the
-cache exists to avoid. So what a step costs is set by the room *allocated*, not
-by the history *held*.
+A cached forward attends over its whole capacity rather than over the part
+filled so far, because slicing the cache down every step would copy it -- which
+is the cost the cache exists to avoid. So a step costs what was *allocated*, not
+what is *held*, and allocating the context to hold twenty-nine positions makes
+the cache **half the speed of recomputing**. The penalty gets worse as the batch
+grows, because every row pays it.
 
-Allocate the full context to hold four hundred positions and you pay for the
-full context, every step, forever. That is the last row: a cache that wins 1.1x
-is not a cache, it is a memory bill.
+With the capacity tracking the history instead, the picture inverts:
 
-**This is the measured argument for a block table, and it was an assertion until
-now.** Rounding a reservation up to a block instead of up to the context is
-worth 5.9x → 9.4x at the batch and history this server actually reaches — a 60%
-improvement from allocation alone, with no kernel touched. `internal/kvmem`
-allocates in blocks of sixteen for [under six percent
-waste](#what-the-context-is-for-and-what-it-costs); 453 positions round to 464
-rather than to 1024, and the 512 row above is the nearest thing measured to it.
+| batch | history 29 | history 128 | history 453 |
+|---|---|---|---|
+| 1 | 0.9x | 2.0x | 2.1x |
+| 8 | 1.8x | 2.5x | 6.8x |
+| 16 | 2.4x | 3.4x | 7.9x |
+| 32 | 4.1x | 4.5x | **9.6x** |
 
-### And the operation that was missing
+Two things fall out of that, and both are design decisions rather than
+observations:
 
-If a cached step costs what its capacity is, the fix is to hand the model a cache
-cut to the width the batch has actually reached -- 464 rather than 1024 -- and
-cutting one is a slice, every step, of something living on the card.
+**The capacity has to be rounded to a block, not to the context.** That is what
+`internal/kvmem` is for, and it was an assertion in this file until this table
+existed. Sixteen-position blocks put a 29-position row in 48 and a 453-position
+row in 464.
 
-`Tensor::slice` had no device path. It was a `std::copy_n` loop, and slicing a
-resident cache therefore pulled it down, cut it on the host, and left the result
-there for the next operation to upload again. Reading sixteen slots of a
-(64, 6, 1024, 64) pool at width 464, keys and values for six blocks:
-
-| | host-only slice | with a device slice |
-|---|---|---|
-| slice the pool, then gather the rows | 199.34 ms | **4.20 ms** |
-| gather the rows, then slice them | 148.93 ms | **2.75 ms** |
-
-Fifty times, and all of it PCIe. The engine had given **slice's inverse** a
-device path when the cache landed -- `copy_into`, on the argument that a cache
-living on the card should be appended to on the card -- and left the read side
-on the host. That is
-[the fifth pull request](https://github.com/DanielPastor05/cpp-ai-engine/pull/11)
-this server has sent upstream, and the first one found by needing the operation
-rather than by reading the source.
-
-With both sides on the device the two orderings become comparable, and which one
-is cheaper stops being "whichever avoids the host" and starts depending on the
-ratios: eight active slots of sixty-four favours gathering first (1.70 against
-3.58, because eight rows are less to move than sixty-four), thirty-two of
-thirty-two reverses it (3.45 against 5.41). A scheduler can pick on the numbers.
+**At a batch of one the server should not use the cache at all.** 0.9x is not
+noise, it is the [~2.4 ms floor of 177 kernel
+launches](#first-what-it-could-win): a step that short is already launch-bound,
+and a cache makes the kernels smaller rather than fewer while adding a gather.
+The cache is an optimisation for loaded servers, which is the opposite of how it
+is usually introduced.
 
 The gather is the cheap part, which is the one thing that did go as predicted:
 0.62 ms at batch 16 and capacity 512, against a 9.47 ms cached step. The plan
