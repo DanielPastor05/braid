@@ -105,7 +105,7 @@ const (
 	// unnecessary: it asks a real worker and fails if the two ever part. Growing
 	// the model from a 64-id context to 256 is exactly the change that would
 	// have broken this quietly.
-	workerSeqLen = 256
+	workerSeqLen = 1024
 
 	// defaultStepTimeout is four orders of magnitude above a real step, so it
 	// fires only for a process that has stopped answering rather than one

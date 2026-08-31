@@ -34,7 +34,7 @@ namespace braid {
 // thirty-two sequences -- about 164 GFLOP -- against a 3060 Ti's ~16 TFLOPS.
 // That is tens of milliseconds of real work, and the profile stops being a
 // story about overhead.
-constexpr std::size_t kSeqLen = 256;
+constexpr std::size_t kSeqLen = 1024;
 constexpr std::size_t kDModel = 384;
 constexpr std::size_t kHeads = 6;  // 64 per head
 constexpr std::size_t kFeedForward = 1536;

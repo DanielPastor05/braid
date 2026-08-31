@@ -31,7 +31,7 @@ import torch.nn.functional as F
 # Geometry, from engine/charmodel.hpp. Kept as constants rather than inferred
 # from the checkpoint so that a checkpoint from a different model is rejected by
 # the shape check rather than quietly reshaping this one.
-SEQ_LEN = 256
+SEQ_LEN = 1024
 D_MODEL = 384
 HEADS = 6
 FEED_FORWARD = 1536
@@ -213,8 +213,11 @@ def load(prefix: str | Path, device: torch.device) -> tuple[CharModel, bytes]:
         raise RuntimeError(f"the checkpoint brought parameters with no slot: {unexpected}")
 
     total = sum(p.numel() for p in model.parameters())
-    if total != 10_758_289:
-        raise RuntimeError(f"{total} parameters, expected 10 758 289 -- the geometry has drifted")
+    expected = parameter_count(len(alphabet))
+    if total != expected:
+        raise RuntimeError(
+            f"{total} parameters, and the geometry above implies {expected} -- "
+            "one of the two has drifted")
 
     return model.to(device).eval(), alphabet
 
@@ -242,3 +245,24 @@ def _weight(tensors: dict[str, torch.Tensor], prefix_text: str) -> torch.Tensor:
 def _bias(tensors: dict[str, torch.Tensor], prefix_text: str) -> torch.Tensor:
     """Stored (1, out); PyTorch wants (out,)."""
     return _matching(tensors, prefix_text, ".1").squeeze(0)
+
+
+def parameter_count(vocab: int) -> int:
+    """What the constants at the top of this file add up to.
+
+    Derived rather than pinned. A hard-coded total is a guard that fires for the
+    right reason once and for the wrong reason every time after: this model's
+    alphabet is whatever distinct bytes the corpus happened to contain, so it
+    moves when a file is added to the repository, and a check that breaks on that
+    trains you to edit the number rather than read it.
+
+    What is still caught is the thing worth catching -- a width, a head count or
+    a block count that this file and engine/charmodel.hpp no longer agree on,
+    which loads without complaint and computes something else.
+    """
+    embedding = vocab * D_MODEL
+    layer_norms = 2 * (2 * D_MODEL)  # gamma and beta, twice a block
+    attention = 4 * (D_MODEL * D_MODEL + D_MODEL)  # q, k, v, out, each with a bias
+    feed_forward = (D_MODEL * FEED_FORWARD + FEED_FORWARD) + (FEED_FORWARD * D_MODEL + D_MODEL)
+    head = D_MODEL * vocab + vocab
+    return embedding + BLOCKS * (layer_norms + attention + feed_forward) + head
