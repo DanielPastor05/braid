@@ -152,12 +152,18 @@ int main(int argc, char** argv) {
 
     engine::autograd::NoGradGuard no_grad;
 
-    const std::size_t widths[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+    // Out to the full 1024-id context. The list stopped at 256 when the model
+    // did, which made the last column a ratio against a width the server can now
+    // exceed by four times.
+    const std::size_t widths[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
 
-    std::cout << "| batch | window | forward ms | kernels | to_device | to_host | vs 256 |\n";
+    // "vs full" rather than "vs 256": the ratio divides by the last width in the
+    // sweep, so it followed the context out to 1024 on its own and the header
+    // did not.
+    std::cout << "| batch | window | forward ms | kernels | to_device | to_host | vs full |\n";
     std::cout << "|---|---|---|---|---|---|---|\n";
 
-    for (std::size_t n : {std::size_t{1}, std::size_t{8}, std::size_t{32}}) {
+    for (std::size_t n : {std::size_t{1}, std::size_t{8}, std::size_t{16}, std::size_t{32}}) {
         std::vector<Row> rows;
         for (std::size_t seq : widths) {
             // The window's positional slice and its mask, built once. The worker

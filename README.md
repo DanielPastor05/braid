@@ -22,9 +22,9 @@ answer, and this page tries hard not to blur the two.
 
 | | |
 |---|---|
-| **Model** | the Transformer from `cpp-ai-engine`, **10 758 289 parameters**, 6 blocks, 384 wide, 256-id context, 145-symbol byte alphabet, 0.97 bits/char |
+| **Model** | the Transformer from `cpp-ai-engine`, **10 759 058 parameters**, 6 blocks, 384 wide, **1024-id context**, 146-symbol byte alphabet, 1.51 bits/char |
 | **Card** | RTX 3060 Ti, CUDA 13.3, engine built with `-DENGINE_CUDA=ON` |
-| **Throughput** | 321 tokens/s at one client, **2 698 at sixty-four** - median of three |
+| **Throughput** | 322 tokens/s at one client, **2 686 at sixty-four** - median of three |
 | **What batching buys** | **8.7x** in tokens, and [none of it past the knee](#the-part-of-it-anybody-is-waiting-for) in goodput |
 | **Under real arrivals** | offered 300/s instead of 150, throughput *rises* to 2 963 and [goodput falls to 200](#the-harness-could-not-overload-anything-and-said-so-by-never-trying) |
 | **Where a step goes at batch 64** | 20.0 ms model, 0.39 ms copy back, 0.10 ms sampling, 0.89 ms pipe |
@@ -47,14 +47,23 @@ of three sweeps, with the throughput range beside it.
 
 | clients | forward passes | mean batch | tokens/s | TTFT p50 | TTFT p95 | wall ms | forward ms | kernels |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 5 760 | 1.00 | 321 (320-327) | 6 ms | 8 ms | 2.93 | 2.83 | 177 |
-| 2 | 3 126 | 1.84 | 587 (582-592) | 8 ms | 11 ms | 3.07 | 2.98 | 177 |
-| 4 | 1 547 | 3.72 | 740 (732-748) | 10 ms | 14 ms | 4.92 | 4.82 | 177 |
-| 8 | 756 | 7.62 | 1 178 (1177-1180) | 11 ms | 13 ms | 6.31 | 6.23 | 177 |
-| 16 | 376 | 15.32 | 1 869 (1867-1917) | 16 ms | 20 ms | 7.99 | 7.77 | 177 |
-| 32 | 190 | 30.32 | 2 433 (2385-2496) | 26 ms | 35 ms | 12.28 | 11.86 | 177 |
-| 64 | 98 | 58.78 | **2 698** (2618-2722) | 50 ms | 67 ms | 21.34 | 19.96 | 177 |
-| 128 | 95 | 60.63 | 2 791 (2677-2805) | **694 ms** | 744 ms | 21.56 | 20.34 | 177 |
+| 1 | 5 760 | 1.00 | 322 (316-328) | 5 ms | 8 ms | 2.92 | 2.82 | 177 |
+| 2 | 3 109 | 1.85 | 543 (526-561) | 8 ms | 12 ms | 3.34 | 3.22 | 177 |
+| 4 | 1 546 | 3.73 | 743 (727-754) | 10 ms | 14 ms | 4.92 | 4.82 | 177 |
+| 8 | 756 | 7.62 | 1 168 (1160-1173) | 11 ms | 16 ms | 6.36 | 6.26 | 177 |
+| 16 | 378 | 15.24 | 1 876 (1838-1882) | 15 ms | 19 ms | 7.99 | 7.68 | 177 |
+| 32 | 191 | 30.16 | 2 453 (2404-2453) | 25 ms | 37 ms | 12.13 | 11.04 | 177 |
+| 64 | 97 | 59.38 | **2 686** (2615-2728) | 42 ms | 62 ms | 21.67 | 18.51 | 177 |
+| 128 | 94 | 61.28 | 2 608 (2568-2649) | **729 ms** | 780 ms | 22.65 | 19.60 | 177 |
+
+Those are measured at a **1024-id context**, and they are the same numbers the
+256-id model produced to within the noise: 322 against 321 at one client, 2 686
+against 2 698 at sixty-four. **Quadrupling the context changed nothing here, and
+that is the correct result** -- a step runs at the width of its longest row, the
+load harness asks for thirty tokens, and forty-one positions is forty-one
+positions whatever the model could have held. What the context changed is what a
+key/value cache would have to hold, which is
+[the reason it was raised](#what-the-context-is-for-and-what-it-costs).
 
 ![Throughput against the p99 time to first token, labelled by concurrency: the curve climbs steeply to about 2 700 tokens per second and then turns over, with the 128-client point far to the right at nearly 700 ms.](docs/img/throughput-vs-tail.svg)
 
@@ -591,13 +600,62 @@ batch, 2.7x to a single client, and 256x to nobody.
 Those rows compare a 256-position step to a 1-position step. **This server does
 not run 256-position steps any more** — it runs at the width of the longest
 sequence in the batch, and `/stats` puts the mean of that at **29** under the
-load harness. The honest remaining win is 29 → 1, not 256 → 1: interpolating the
-same table between its 16- and 32-position rows, roughly 4x at a batch of
+load harness (re-measured at 29.9 after the context went to 1024 — the model got
+four times wider and the served width did not move, which is the whole point of
+the next section). The honest remaining win is 29 → 1, not 256 → 1: interpolating
+the same table between its 16- and 32-position rows, roughly 4x at a batch of
 thirty-two rather than 33x.
 
-It grows with the generation, of course. A server whose clients ask for a
-thousand tokens rather than thirty would run near the full context and get most
-of the 33x back. This one does not.
+**That 29 is a fact about the harness, not about the server.** It asks for thirty
+tokens; a client that asks for nine hundred gets a mean width of 453 and a very
+different machine.
+
+It grows with the generation, and that sentence used to end here as a guess.
+It is now measured, and it is the strongest argument on this page.
+
+### Ask for nine hundred tokens and the server falls over
+
+The load harness asks for thirty tokens, so a row *ends* about forty positions
+wide — mean 29.9 over the whole generation — however large the context is.
+Asking for **nine hundred** is the regime the 1024 context was raised for, and it
+is a different machine:
+
+| clients | tokens/s | forward ms | mean batch | | at 30 tokens |
+|---|---|---|---|---|---|
+| 1 | **100** | 9.77 | 1.00 | | 322 |
+| 4 | 143 | 27.20 | 3.99 | | 743 |
+| 16 | **159** | 98.65 | 15.98 | | 1 876 |
+
+Mean width 453 rather than 41. Two things happen at once, and the second is the
+one that matters:
+
+**Throughput drops 11.8x** at sixteen clients — 1 876 tokens/s to 159 — because
+every step is recomputing four hundred and fifty positions to produce one token.
+
+**And batching stops paying.** Sixteen clients buy **1.59x** the throughput of
+one (100 → 159), against 5.8x at short generations. The forward goes 9.77 → 27.20
+→ 98.65 ms: **ten times the work for sixteen times the batch**, which is what
+saturation looks like. There is no fixed cost left to amortise, because the cost
+is no longer fixed — it is quadratic in a window that keeps growing.
+
+This is the measurement the whole memory phase needed. The 33x ceiling earlier on
+this page was divided by a synthetic 256-position step that serving never ran;
+this one divides a step the server **actually performs**, at a width it actually
+reaches. Against `braid_bench_decode`'s ~2.4 ms floor plus roughly 0.35 ms of
+attention over a 453-position cache at this batch, a cached step would be about
+2.8 ms against the 98.65 ms measured — a **~36x ceiling**, and this time the
+denominator is a serving number rather than waste.
+
+It is still a ceiling and still not a win: nothing here has a per-row cache yet.
+What changed is that the reason to build one is no longer arithmetic about a
+hypothetical workload. It is a workload this server takes eleven times longer to
+serve.
+
+One honest wart in that table: `pipe ms` reads −0.09 and −0.18, which is the
+component timers summing a fraction of a percent above the wall clock at a step
+this long. It is timer granularity, not a negative duration, and it is left in
+rather than clamped because a clamped zero would hide the same noise everywhere
+else.
 
 That is the fourth number this page has had to take back, and the cause is the
 same each time: **a ratio is only as honest as its denominator.** The benchmark
@@ -639,6 +697,122 @@ sequence's cache growing at its own rate, in blocks, with a table saying where
 each row's blocks live. That is PagedAttention, and it is the next phase rather
 than a footnote to this one. The useful thing is that the reason for it is now a
 measurement — two percent — rather than a citation.
+
+### What the context is for, and what it costs
+
+The 256-id context was raised to **1024** for exactly one reason: at 256 a cache
+is 300 MB and the machine does not care. `internal/kvmem` does that arithmetic
+rather than asserting it -- 6 blocks x 6 heads x 64 head-dim x 4 B x 2 for K and
+V is 18 KB a position, so:
+
+| | at 1024 positions |
+|---|---|
+| one sequence | **18.0 MB** |
+| sixty-four sequences | **1.12 GB** |
+| what a 4 GB budget buys | 14 563 blocks of 16 -- **227 sequences** at full context |
+
+On an 8 GB card holding 43 MB of weights, 1.12 GB is the difference between a
+detail and the thing that decides who gets admitted. That is the premise the
+whole memory phase needs, and at 256 it was false.
+
+**Blocks, and what they waste.** A fixed block size means the last block of every
+sequence is partly empty, and that waste is the price of not fragmenting the
+pool. Measured over a realistic spread of lengths:
+
+| block size | wasted | blocks held |
+|---|---|---|
+| 4 | 0.9% | 232 |
+| 16 | **5.7%** | 61 |
+| 32 | 10.2% | 32 |
+| 64 | 15.4% | 17 |
+
+Sixteen is the default: under six percent lost, and a quarter of the block table
+that four would need to describe the same sequences.
+
+**Eviction, and the trade nobody states.** When the pool is full something has to
+give, and the three obvious policies are not ordered -- they trade victims against
+recomputation, which is the cost of bringing an evicted sequence back:
+
+| policy | victims | positions to recompute |
+|---|---|---|
+| longest | 2 | 240 |
+| newest | 2 | 240 |
+| **shortest** | **4** | **160** |
+
+Taking the shortest evicts twice as many sequences and recomputes a third less.
+Which one is right depends on whether the server is optimising for how many
+clients are disturbed or for how much work is thrown away, and the point of
+measuring it is that the answer is not obvious from the names.
+
+Two properties are tested rather than assumed, because both are the difference
+between eviction and collapse: **the sequence that triggered the eviction is
+never its victim** (a policy that can choose the requester will, under pressure,
+spend its whole time evicting whoever just arrived), and **a request that cannot
+be satisfied by evicting everything is refused rather than emptying the pool**
+first and failing anyway.
+
+### The memory that is already there, and the diagnosis that was wrong
+
+Before any cache exists, the 1024-id context put a limit on this card that
+nothing in the admission path can see.
+
+`braid_bench_decode` out to the full context, with every operation forced onto
+the device:
+
+| batch | window 1 | 256 | 512 | 1024 | vs full |
+|---|---|---|---|---|---|
+| 1 | 6.53 ms | 16.25 | 24.52 | **50.67** | 7.8x |
+| 8 | 6.65 | 57.74 | 128.63 | **348.12** | 52.3x |
+| 16 | 6.15 | 111.05 | 258.72 | **680.16** | 110.6x |
+| 32 | 7.09 | 215.12 | 506.16 | **2 763.36** | 389.9x |
+
+Doubling the window from 512 to 1024 costs between 2.1x and 2.7x on every row —
+except the last, which costs **5.5x**. That is not arithmetic, it is the card: at a batch of thirty-two and a
+full window the process sits at 7 854 MiB of 8 192.
+
+Watched over a long run of decodes at *varying* widths — the arrangement
+continuous batching actually produces — one worker climbs from 1.6 GB after
+warmup to a peak of **6 825 MiB**, alone on the card. Nothing is leaked; that is
+what the activations of a batch of thirty-two at a thousand positions cost.
+
+**And here is a diagnosis this page got wrong, kept because the wrong turn is the
+useful part.** The engine sets the CUDA memory pool's release threshold to
+`UINT64_MAX` — never give memory back — with a comment claiming *"the pool still
+bounds itself: it reuses rather than grows"*. That claim was measured on MNIST
+training, where every iteration asks for the same buffer. Varying widths reuse
+badly, so the retained pool looked like the obvious culprit.
+
+It was tested rather than assumed: the threshold was made finite at 1 GiB and the
+same run re-measured. **The sampled peak went from 6 825 MiB to 7 530 — it did
+not fall, it rose.** Bounding what the pool retains changed nothing worth having,
+which means almost none of that memory was retained: it is *live* activation, and
+the engine's comment was right where the hypothesis was wrong.
+
+(Both figures are the largest of a sampled series rather than a true peak, so the
+rise is as likely to be sampling as effect. What is not in doubt is the direction
+the change was supposed to move it, and it did not.)
+
+The change was reverted rather than kept for looking like progress. The only
+thing that bounds live activation is admitting fewer or narrower rows — which is
+what `internal/kvmem` is for and what the scheduler still cannot do.
+
+The immediate casualty is the test suite: `go test ./internal/...` runs packages
+in parallel, three of them start real workers, and two processes wanting 6.8 GB
+do not fit on 8. Hence [`-p 1`](#building-it), and a symptom that reads like a
+hang rather than an out-of-memory.
+
+**None of this is wired into the serving path yet, and saying otherwise would be
+the fifth correction on this page.** It is arithmetic and a block allocator with
+tests; what it is waiting for is the per-row cache in the worker, which is
+waiting on three engine pull requests --
+[#7 `copy_into_rows`](https://github.com/DanielPastor05/cpp-ai-engine/pull/7),
+[#8 a fill and a mask per row](https://github.com/DanielPastor05/cpp-ai-engine/pull/8),
+[#9 a device path for `select_rows`](https://github.com/DanielPastor05/cpp-ai-engine/pull/9)
+-- stacked in that order and all green.
+
+```bash
+go test ./internal/kvmem/ -v
+```
 
 ```bash
 cmake --build build --target braid_bench_decode
@@ -686,6 +860,12 @@ is which token each row picks:
 500 rows compared over 200 batches
 argmax disagreements: 0
 ```
+
+Re-run against the retrained 1024-id model rather than carried over: same 500
+rows, same zero. It is the check that says the context change broke nothing, and
+it is also where the parameter count in the table at the top comes from — the
+reference reports `10,759,058 parameters, 146 symbols` after parsing the
+checkpoint itself, so the two numbers cannot drift apart without this failing.
 
 ### Then speed
 
@@ -973,12 +1153,46 @@ cmake -B build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build bu
 ./build/braid_train . models/charlm 6000
 ```
 
-Training is about 24 minutes on a 3060 Ti and lands at 0.97 bits/char. The
-corpus is both repositories' own sources and documentation — a megabyte, which is
-far too little for ten million parameters: the model memorises it rather than
-learns from it, and what it writes is worth reading as evidence that the
-machinery runs and nothing more. The serving measurements this checkpoint exists
-for do not care what it learned, only how much arithmetic it takes to run.
+The tests that need a GPU take the worker and the checkpoint from the
+environment, and they want the card to themselves:
+
+```bash
+BRAID_WORKER="$PWD/build/braid_worker.exe" BRAID_MODEL="$PWD/models/charlm" go test -p 1 ./internal/... -count=1
+```
+
+**`-p 1` is not decoration.** Go runs separate packages in parallel by default,
+`internal/backend` and `internal/sched` both start real workers, and
+`internal/sched`'s failover tests start a *pool* of them. At a 256-id context
+they fitted on one card together. At 1024 they do not, and the symptom is not an
+out-of-memory message but a worker that stops answering and a test that reports
+`did not answer within 30s` — which reads like a hang and is a queue for memory.
+
+
+Training is about 35 minutes on a 3060 Ti and lands at **1.51 bits/char** — worse
+than the 0.97 the same model reached at a 256-id context, and worth saying
+plainly rather than swapping the number and moving on.
+
+The cause is in `engine/train.cpp`: attention keeps `(batch, heads, S, S)` scores
+alive for the backward pass, so at 1024 that is 100 MB a block against 25 MB at
+256, and `kBatch` had to come down from 16 to 4 to fit on an 8 GB card. Four
+sequences of 1024 is the same 4 096 tokens a step that sixteen of 256 was — but
+it is a quarter as many *independent draws* from the corpus, and over the same
+6 000 steps that is 24 000 windows seen rather than 96 000. On a corpus this
+small the loss is largely measuring how much of it the model has memorised, and
+it saw a quarter as many places to memorise.
+
+That is the arithmetic; the attribution is inference from it, not a controlled
+result — testing it properly means a second 35-minute run at 6 000 steps and
+`kBatch` 4 against one at 24 000, and the serving measurements this checkpoint
+exists for do not depend on the answer.
+
+The corpus is both repositories' own sources and documentation — a megabyte,
+which is far too little for ten million parameters either way: the model
+memorises it rather than learns from it, and what it writes is worth reading as
+evidence that the machinery runs and nothing more. **What the checkpoint is for
+is arithmetic, not prose** — the serving measurements do not care what it
+learned, only how much work it takes to run, and 1.51 bits/char costs exactly the
+same number of FLOPs as 0.97 would.
 
 The checkpoint is 43 MB and is not committed, because `braid_train` is seeded and
 reproduces it.
@@ -997,9 +1211,22 @@ Ordered by what a measurement says.
    itself is [built, merged and unusable here](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one):
    one write offset is shared by the whole batch, and only 2% of steps have every
    row at the same position. Each sequence needs its cache growing at its own
-   rate, in blocks, with a table saying where each row's blocks are. That is the
-   same change as the memory-accounting item below, approached from the other
-   side, and the two should be done together.
+   rate, in blocks, with a table saying where each row's blocks are.
+
+   The Go half of that exists — `internal/kvmem` is a block allocator with
+   budgets, eviction policies and
+   [measured fragmentation](#what-the-context-is-for-and-what-it-costs) — and it
+   is **not wired into the serving path**. What it waits on is the worker-side
+   cache, which waits on three engine pull requests: [#7](https://github.com/DanielPastor05/cpp-ai-engine/pull/7),
+   [#8](https://github.com/DanielPastor05/cpp-ai-engine/pull/8),
+   [#9](https://github.com/DanielPastor05/cpp-ai-engine/pull/9), stacked in that
+   order, all green, none merged. The submodule here deliberately points at
+   merged `main` instead, so this repository builds from code that exists rather
+   than from a branch.
+
+   The measurement that says to do it is now
+   [the 900-token collapse](#ask-for-nine-hundred-tokens-and-the-server-falls-over)
+   rather than arithmetic about a workload nobody ran.
 2. **Server against server, not forward against forward.**
    [The comparison that exists](#against-pytorch-on-the-same-card) puts the two
    forwards side by side and deliberately leaves the serving layer out, because
@@ -1025,7 +1252,15 @@ it does not fit. Decoding is autoregressive — step *n+1* takes step *n*'s toke
 as input — so within one batch there is no independent work to overlap with. A
 second stream needs a second batch, which needs a second card.
 
-Also not here, deliberately: authentication, TLS, rate limiting, Kubernetes,
-Prometheus. This serves a character model on a desk. The honest version is that
-it should not be exposed to anything, and that is a sentence rather than a
-feature.
+**That paragraph used to say authentication, rate limiting and Prometheus were
+deliberately absent.** They are now present — a bearer token, a per-IP token
+bucket, and `/metrics` in the Prometheus text format written by hand — and the
+old sentence is left described rather than deleted because "we chose not to" and
+"we had not got to it" are different claims and this page has confused them
+before.
+
+Still deliberately absent: **TLS** (terminate it in front; a server that
+implements its own is a server with its own certificate bugs) and **Kubernetes**.
+This serves a character model on a desk, and without `-auth-token` it now refuses
+to listen on anything but loopback rather than trusting a sentence in a README to
+keep it safe.
