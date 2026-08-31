@@ -32,6 +32,22 @@ type Stats struct {
 	// computed to the same width.
 	alignedSteps atomic.Int64
 	widthSum     atomic.Int64
+
+	// cached counts sequences admitted with a key/value cache slot, uncached
+	// those admitted without one. **uncached is expected to stay at zero, and
+	// that is the point of it.**
+	//
+	// There are MaxBatch slots; a sequence takes one in begin(); begin() is only
+	// reached while fewer than MaxBatch are active; and every active sequence
+	// holds exactly one until it finishes. Live slots therefore equal the active
+	// count, which is below MaxBatch, so the free list is never empty and the
+	// no-slot path is a safety net rather than something load can reach.
+	//
+	// It is counted anyway because the alternative to a counter here is
+	// believing the paragraph above. If it moves, that reasoning has broken and
+	// sequences are quietly recomputing what they could have had.
+	cached   atomic.Int64
+	uncached atomic.Int64
 }
 
 // Snapshot is Stats at one instant, safe to serialise.
@@ -54,6 +70,13 @@ type Snapshot struct {
 	// sequence in it and not the model's full context.
 	MeanWidth float64 `json:"mean_width"`
 
+	// Cached and Uncached are sequences admitted with and without a key/value
+	// cache slot. Uncached should be zero -- see the note on the counters, where
+	// the invariant that makes it zero is written down, which is why it is worth
+	// exporting a number that never changes.
+	Cached   int64 `json:"cached_sequences"`
+	Uncached int64 `json:"uncached_sequences"`
+
 	// Latency over a recent window, not since boot. A p99 measured over every
 	// request a long-lived process ever served is a number an hour of good
 	// service cannot move.
@@ -71,6 +94,8 @@ type Snapshot struct {
 // skew rather than a mutex on the hot path.
 func (s *Scheduler) Stats() Snapshot {
 	snap := Snapshot{
+		Cached:     s.stats.cached.Load(),
+		Uncached:   s.stats.uncached.Load(),
 		Steps:      s.stats.steps.Load(),
 		Advanced:   s.stats.advanced.Load(),
 		Tokens:     s.stats.tokens.Load(),

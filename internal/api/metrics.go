@@ -49,9 +49,18 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	gauge("braid_mean_batch", "Sequences advanced per forward pass.", snap.MeanBatch)
 	gauge("braid_mean_width", "Positions a step ran over: the longest sequence in it.", snap.MeanWidth)
 	// Not a performance metric. It is the fraction of steps a position-keyed
-	// key/value cache could serve at all, and it is why this server does not
-	// have one.
+	// key/value cache could serve at all, and it is why the cache this server
+	// does have is indexed by slot instead.
 	gauge("braid_aligned_step_share", "Steps whose sequences were all the same length.", snap.AlignedShare)
+
+	// The second of these should never move. There are MaxBatch slots and at
+	// most MaxBatch sequences active, so one is always free -- and a sequence
+	// that somehow went without would still be served correctly, by
+	// recomputing, which is exactly why nothing else would notice. Alert on it
+	// being non-zero rather than on a rate.
+	counter("braid_sequences_cached_total", "Sequences admitted with a cache slot.", snap.Cached)
+	counter("braid_sequences_uncached_total",
+		"Sequences admitted without a cache slot. Expected to stay at zero.", snap.Uncached)
 
 	if l := snap.Latency; l.Samples > 0 {
 		gauge("braid_latency_samples", "Completions in the latency window.", float64(l.Samples))

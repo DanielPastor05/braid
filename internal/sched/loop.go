@@ -173,6 +173,11 @@ func (s *Scheduler) begin(seq *sequence) *sequence {
 
 	seq.admitted = now
 	seq.slot = s.takeSlot()
+	if seq.slot < 0 {
+		s.stats.uncached.Add(1)
+	} else {
+		s.stats.cached.Add(1)
+	}
 	return seq
 }
 

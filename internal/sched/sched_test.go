@@ -508,3 +508,73 @@ func TestRejectionsStayOutOfTheLatencyWindow(t *testing.T) {
 		t.Error("a percentile of zero: rejections are being counted as instant successes")
 	}
 }
+
+// TestEverySequenceGetsACacheSlot is an invariant, and writing it is what
+// turned a metric I was about to ship into one I understood.
+//
+// It was going to be a degradation curve: slots run out, the sequences that go
+// without are served by recomputing rather than refused, and the ratio says how
+// much slower the server got. That is a good failure mode and it is not this
+// server's, because it cannot happen here.
+//
+// There are MaxBatch slots. A sequence takes one in begin(), begin() is only
+// reached while len(active) < MaxBatch, and every active sequence holds exactly
+// one until finish() gives it back. So live slots equal len(active), which is
+// below MaxBatch, so the free list is never empty. The -1 branch is a safety
+// net over an invariant rather than a path load can reach.
+//
+// The counter stays, and what it is for is this: if it ever moves, the
+// invariant above has broken and a sequence is quietly running slower than it
+// should. Zero is the assertion.
+func TestEverySequenceGetsACacheSlot(t *testing.T) {
+	const slots = 3
+	const clients = 8
+
+	s, err := New(fastMock(), Config{MaxBatch: slots, QueueDepth: 64, MaxTokensLimit: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var wg sync.WaitGroup
+	texts := make([]string, clients)
+	for i := range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			text, res := run(t, s, Request{
+				Prompt: "slots", MaxTokens: 12, Temperature: 0.7, Seed: uint64(i),
+			})
+			if res.Err != nil {
+				t.Errorf("client %d: %v", i, res.Err)
+				return
+			}
+			texts[i] = text
+		}()
+	}
+	wg.Wait()
+
+	for i, text := range texts {
+		if len(text) == 0 {
+			t.Errorf("client %d generated nothing", i)
+		}
+	}
+
+	snap := s.Stats()
+	if snap.Uncached != 0 {
+		t.Errorf("%d sequences ran without a cache slot; with MaxBatch slots and at "+
+			"most MaxBatch active, that should be impossible", snap.Uncached)
+	}
+	if snap.Cached != int64(clients) {
+		t.Errorf("%d clients were served but %d were counted as taking a slot",
+			clients, snap.Cached)
+	}
+
+	// And the slots come back. A leak here would not fail anything above -- the
+	// free list would just drain and later sequences would run uncached, which
+	// is slower and correct and would go unnoticed without this.
+	if len(s.freeSlots) != slots {
+		t.Errorf("%d of %d slots came back after everything finished",
+			len(s.freeSlots), slots)
+	}
+}
