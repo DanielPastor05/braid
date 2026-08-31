@@ -801,6 +801,53 @@ in parallel, three of them start real workers, and two processes wanting 6.8 GB
 do not fit on 8. Hence [`-p 1`](#building-it), and a symptom that reads like a
 hang rather than an out-of-memory.
 
+### The cache is built, and what it costs is the room you gave it
+
+`CharModel::forward_cached` exists now: the engine's per-row fill, per-row mask
+and per-row write offsets assembled into this model, with the positional
+encoding gathered per row instead of sliced. `braid_test_cached` checks the only
+property a cache has -- that decoding through it gives what recomputing gives --
+in three arrangements, the last of which is five rows at five different
+positions prefilled to five different depths. All three agree to **0.000e+00**.
+Not within tolerance: the same floats.
+
+Then it was measured against the step it replaces, and the answer was not the
+one the arithmetic promised. I expected something like 26x. What came back:
+
+| batch | history | capacity | uncached | cached + gather | speedup |
+|---|---|---|---|---|---|
+| 16 | 128 | 256 | 22.49 ms | 6.48 | **3.5x** |
+| 16 | 128 | 512 | 22.31 | 10.12 | 2.2x |
+| 16 | 128 | 1024 | 22.38 | 17.62 | **1.3x** |
+| 32 | 453 | 512 | 180.31 | 19.20 | **9.4x** |
+| 32 | 453 | 1024 | 182.05 | 30.87 | 5.9x |
+| 8 | 128 | 1024 | 12.39 | 11.21 | **1.1x** |
+
+**Read the first three rows together: the history is the same in all of them.**
+Only the capacity changes, and the cost doubles with it. A cached forward attends
+over the whole capacity rather than over the part filled so far, because slicing
+the cache down to its length would copy it every step -- which is the cost the
+cache exists to avoid. So what a step costs is set by the room *allocated*, not
+by the history *held*.
+
+Allocate the full context to hold four hundred positions and you pay for the
+full context, every step, forever. That is the last row: a cache that wins 1.1x
+is not a cache, it is a memory bill.
+
+**This is the measured argument for a block table, and it was an assertion until
+now.** Rounding a reservation up to a block instead of up to the context is
+worth 5.9x → 9.4x at the batch and history this server actually reaches — a 60%
+improvement from allocation alone, with no kernel touched. `internal/kvmem`
+allocates in blocks of sixteen for [under six percent
+waste](#what-the-context-is-for-and-what-it-costs); 453 positions round to 464
+rather than to 1024, and the 512 row above is the nearest thing measured to it.
+
+The gather is the cheap part, which is the one thing that did go as predicted:
+0.62 ms at batch 16 and capacity 512, against a 9.47 ms cached step. The plan
+guessed "about a quarter of the step, and then the fused attention kernel has a
+baseline to beat"; measured it is a tenth, and the baseline to beat is the
+attention over capacity rather than the movement.
+
 **None of this is wired into the serving path yet, and saying otherwise would be
 the fifth correction on this page.** It is arithmetic and a block allocator with
 tests; what it is waiting for is the per-row cache in the worker, which is

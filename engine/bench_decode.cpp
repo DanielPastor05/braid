@@ -108,6 +108,10 @@ engine::Tensor forward_at(braid::CharModel& model, const engine::Tensor& ids,
     return model.head.forward(h);
 }
 
+// The cache geometry, for sizing the gather. Same numbers CharModel uses.
+constexpr std::size_t kHeadsHere = braid::kHeads;
+constexpr std::size_t kHeadDimHere = braid::kDModel / braid::kHeads;
+
 struct Row {
     std::size_t seq = 0;
     double ms = 0.0;
@@ -221,6 +225,119 @@ int main(int argc, char** argv) {
         }
         std::cout << "|---|---|---|---|---|---|---|\n";
         std::cout.flush();
+    }
+
+    // ---- what the cache actually wins -----------------------------------
+    //
+    // Everything above is the uncached step at various widths, which is a
+    // ceiling argued from a floor. This is the cached step measured against the
+    // uncached one it would replace, at the same batch and the same amount of
+    // history -- and it charges the cached side for the gather, because a
+    // slot-indexed cache has to collect its active rows before it can use them.
+    //
+    // The rows are deliberately misaligned: each starts one position after the
+    // last, so no two share an absolute position. That is what serving looks
+    // like, and an aligned benchmark would flatter the per-row mask by never
+    // exercising it.
+    std::cout << "\n| batch | history | capacity | uncached ms | cached ms | gather ms | speedup |\n";
+    std::cout << "|---|---|---|---|---|---|---|\n";
+
+    for (std::size_t n : {std::size_t{1}, std::size_t{8}, std::size_t{16}, std::size_t{32}}) {
+      for (std::size_t history : {std::size_t{128}, std::size_t{453}}) {
+        // The capacity sweep is the point of this table.
+        //
+        // A cached forward attends over the whole capacity rather than over the
+        // part filled so far, because slicing the cache down to its length would
+        // copy it every step -- which is the cost the cache exists to avoid. So
+        // what a cached step costs is set by the room *allocated*, not by the
+        // history *held*, and allocating the full context to hold four hundred
+        // positions means paying for the full context every step.
+        //
+        // Rounding the allocation up to a block instead of up to the context is
+        // exactly what a block table buys. This is where that stops being an
+        // assertion and becomes a column.
+        for (std::size_t capacity : {std::size_t{256}, std::size_t{512}, braid::kSeqLen}) {
+            if (history + n >= capacity) continue;
+
+            std::vector<std::size_t> at(n);
+            for (std::size_t r = 0; r < n; ++r) at[r] = history + r;
+            const std::size_t width = at.back() + 1;
+
+            // Uncached: the whole window, every step, which is what braid does
+            // today. Its width is the longest row, exactly as the server runs.
+            engine::Tensor whole({n, width}, 0.0f, false);
+            for (std::size_t i = 0; i < n * width; ++i) {
+                whole.data()[i] = static_cast<float>(i % vocab.size());
+            }
+            const engine::Tensor whole_positions = model.positions.slice(0, 0, width);
+            const engine::Tensor whole_mask = engine::nn::causal_mask(width);
+            for (int i = 0; i < 3; ++i) {
+                (void)forward_at(model, whole, whole_positions, whole_mask);
+                engine::cuda::synchronize();
+            }
+            auto started = clock_type::now();
+            for (int i = 0; i < repeats; ++i) {
+                (void)forward_at(model, whole, whole_positions, whole_mask);
+                engine::cuda::synchronize();
+            }
+            const double uncached = ms_since(started) / repeats;
+
+            // Cached: one new position per row, over caches already holding the
+            // history. The caches are not filled by decoding into them -- that
+            // would take `history` steps per cell -- but their `filled` counts
+            // are set, which is what the mask and the write offsets read.
+            auto caches = model.make_caches(n, capacity);
+            for (auto& cache : caches) {
+                for (std::size_t r = 0; r < n; ++r) cache.filled[r] = at[r];
+            }
+            engine::Tensor one({n, 1}, 0.0f, false);
+            for (std::size_t r = 0; r < n; ++r) one.data()[r] = static_cast<float>(r % vocab.size());
+
+            for (int i = 0; i < 3; ++i) {
+                auto warm = model.make_caches(n, capacity);
+                for (auto& cache : warm) {
+                    for (std::size_t r = 0; r < n; ++r) cache.filled[r] = at[r];
+                }
+                (void)model.forward_cached(one, at, warm);
+                engine::cuda::synchronize();
+            }
+            started = clock_type::now();
+            for (int i = 0; i < repeats; ++i) {
+                for (auto& cache : caches) {
+                    for (std::size_t r = 0; r < n; ++r) cache.filled[r] = at[r];
+                }
+                (void)model.forward_cached(one, at, caches);
+                engine::cuda::synchronize();
+            }
+            const double cached = ms_since(started) / repeats;
+
+            // The gather the worker would pay on top: keys and values, every
+            // block, read out of a slot pool into the batch's own order.
+            std::vector<std::size_t> take(n);
+            for (std::size_t r = 0; r < n; ++r) take[r] = r;
+            engine::Tensor pool({n, kHeadsHere * capacity * kHeadDimHere}, 0.0f, false);
+            {
+                const engine::Tensor onto_the_card = pool + pool;
+                engine::cuda::synchronize();
+            }
+            for (int i = 0; i < 3; ++i) {
+                (void)pool.select_rows(take);
+                engine::cuda::synchronize();
+            }
+            started = clock_type::now();
+            for (int i = 0; i < repeats; ++i) {
+                (void)pool.select_rows(take);
+                engine::cuda::synchronize();
+            }
+            const double gather = (ms_since(started) / repeats) * 2.0 * braid::kBlocks;
+
+            std::cout << "| " << n << " | " << history << " | " << capacity << " | " << std::fixed
+                      << std::setprecision(2) << uncached << " | " << cached << " | " << gather
+                      << " | " << std::setprecision(1)
+                      << (cached + gather > 0.0 ? uncached / (cached + gather) : 0.0) << "x |\n";
+            std::cout.flush();
+        }
+      }
     }
     return 0;
 }
