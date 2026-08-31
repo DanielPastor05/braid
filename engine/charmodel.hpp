@@ -15,7 +15,9 @@
 #include "engine/tensor.hpp"
 #include "engine/transformer.hpp"
 
+#include <algorithm>
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +76,97 @@ struct CharModel {
                            (take == kSeqLen ? positions : positions.slice(0, 0, take));
         for (engine::nn::TransformerBlock& block : blocks) h = block.forward(h, &mask);
         return head.forward(h);
+    }
+
+    // The same model over a cache, for decoding.
+    //
+    // `ids` is (B, S) of the *new* positions only -- one per row while
+    // generating, more on a prefill -- and `at` is where each row's first new
+    // position sits in its own sequence. `caches` is one KVCache per block, all
+    // (B, heads, capacity, head_dim), holding everything before them.
+    //
+    // Two things differ from the uncached path and both are about rows being at
+    // different positions, which is what continuous batching guarantees:
+    //
+    // The positional encoding is gathered per row rather than sliced. A slice
+    // takes the same rows of the table for the whole batch, which is only right
+    // when every row is at the same position -- the arrangement this server
+    // measured at 2% of steps.
+    //
+    // The mask is (B, heads, S, capacity), built from each row's own absolute
+    // position. Attention runs over the full capacity because slicing the cache
+    // would copy it every step, so the unwritten tail is zeros, and exp(0) is 1:
+    // the mask is the only thing keeping positions that do not exist yet out of
+    // the softmax.
+    //
+    // Inference only. The caches are written in place, so a backward through a
+    // value the next step overwrites would describe a forward that never
+    // happened; the engine throws rather than allow it.
+    engine::Tensor forward_cached(const engine::Tensor& ids, const std::vector<std::size_t>& at,
+                                  std::vector<engine::nn::KVCache>& caches) {
+        const std::size_t batch = ids.shape()[0];
+        const std::size_t take = ids.shape()[1];
+        if (caches.size() != kBlocks) {
+            throw std::invalid_argument("forward_cached needs one cache per block");
+        }
+        if (at.size() != batch) {
+            throw std::invalid_argument("forward_cached needs one position per row");
+        }
+        const std::size_t capacity = caches.front().capacity();
+
+        // Row r's new positions are at[r] .. at[r]+take-1, so its slice of the
+        // positional table starts in a different place from its neighbours'.
+        engine::Tensor pos({batch, take, kDModel}, 0.0f, false);
+        {
+            float* out = pos.data();
+            const float* table = positions.data();
+            for (std::size_t r = 0; r < batch; ++r) {
+                if (at[r] + take > kSeqLen) {
+                    throw std::out_of_range("a row would decode past the context");
+                }
+                std::copy_n(table + at[r] * kDModel, take * kDModel,
+                            out + r * take * kDModel);
+            }
+        }
+
+        engine::Tensor h = embedding.forward(ids) + pos;
+
+        // One mask per row, repeated per head because the engine broadcasts by
+        // suffix after dropping leading ones: a (B, 1, S, capacity) mask would
+        // be rejected rather than expanded across the heads.
+        // The mask is *additive*: it is added to the scores before the softmax,
+        // so a position that may be read contributes 0 and one that may not
+        // contributes -1e9. Filling it the other way round -- ones for what is
+        // allowed -- type-checks, runs, and answers a question nobody asked.
+        engine::Tensor mask({batch, kHeads, take, capacity}, -1e9f, false);
+        {
+            float* out = mask.data();
+            for (std::size_t r = 0; r < batch; ++r) {
+                for (std::size_t s = 0; s < take; ++s) {
+                    // Row r's new position s sits at at[r]+s and may read every
+                    // position up to and including itself.
+                    const std::size_t reach = std::min(at[r] + s, capacity - 1);
+                    for (std::size_t h_i = 0; h_i < kHeads; ++h_i) {
+                        float* row = out + ((r * kHeads + h_i) * take + s) * capacity;
+                        std::fill_n(row, reach + 1, 0.0f);
+                    }
+                }
+            }
+        }
+
+        for (std::size_t b = 0; b < kBlocks; ++b) h = blocks[b].forward(h, caches[b], mask);
+        return head.forward(h);
+    }
+
+    // Caches sized for this model, one per block.
+    std::vector<engine::nn::KVCache> make_caches(std::size_t rows,
+                                                 std::size_t capacity = kSeqLen) const {
+        std::vector<engine::nn::KVCache> out;
+        out.reserve(kBlocks);
+        for (std::size_t i = 0; i < kBlocks; ++i) {
+            out.emplace_back(rows, kHeads, capacity, kDModel / kHeads);
+        }
+        return out;
     }
 
     std::vector<engine::Tensor> parameters() {

@@ -38,3 +38,7 @@ target_include_directories(braid_bench_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 add_executable(braid_bench_gather bench_gather.cpp)
 target_link_libraries(braid_bench_gather PRIVATE engine)
 target_include_directories(braid_bench_gather PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(braid_test_cached test_cached.cpp)
+target_link_libraries(braid_test_cached PRIVATE engine)
+target_include_directories(braid_test_cached PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
