@@ -29,13 +29,15 @@ answer, and this page tries hard not to blur the two.
 | **Under real arrivals** | offered 300/s instead of 150, throughput *rises* to 2 963 and [goodput falls to 200](#the-harness-could-not-overload-anything-and-said-so-by-never-trying) |
 | **Where a step goes at batch 64** | 20.0 ms model, 0.39 ms copy back, 0.10 ms sampling, 0.89 ms pipe |
 | **Batching invariance** | 0 divergences in 25 000 draws, and the logits behind them [drift 2e-5](#a-zero-that-was-hiding-its-own-denominator) - which is the number that means something |
-| **A worker killed mid-load** | 0 requests failed; workers hold no state |
+| **A worker killed mid-load** | 0 requests failed, and with a warm cache the text is [character for character the same](#what-the-cache-is-not-allowed-to-cost) |
 | **A worker hung mid-step** | killed on a deadline and failed over; before that it stopped the server for good |
-| **Landed upstream** | five PRs on the engine, all measured, one of them a correction to another |
+| **Landed upstream** | **eleven PRs** on the engine, all measured, one a correction to another, and the last three found by *needing* an operation rather than by reading the source |
 | **The bug none of that caught** | every window was padded at the wrong end, and [no measurement here could have told me](#the-bug-no-number-could-have-shown-me) |
 | **The optimisation that mattered** | [not computing the padding](#the-two-hundred-and-fifteen-positions-nobody-read): 5.9x, and only possible once the padding moved |
 | **What it broke on the way** | it made a step small again, so [two dispatch floors came back to life on the wrong side](#the-thresholds-came-back-to-life-on-the-wrong-side) - worth another 1.66x at one client |
-| **The one that did not** | a KV cache keyed by position could serve [2% of steps](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one) - batching puts every row at a different position |
+| **The one that did not** | a KV cache *keyed by position* could serve [2% of steps](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one) - batching puts every row at a different position |
+| **What it took to make one that does** | a slot per row, three new engine primitives, and [four bugs](#four-bugs-and-the-two-that-a-component-benchmark-could-never-find) - two of which a per-operation benchmark could not have found. **1.98x** |
+| **Twice wrong about the ceiling** | this page called 2 750 tok/s "the card" [two separate times](#and-where-the-ceiling-actually-is). It was the code both times; the peak is now **5 394** |
 | **Against PyTorch** | same weights, same card, fp32 both sides: **[1.57x slower](#against-pytorch-on-the-same-card)** at the width it serves at, and **2.7x faster** on small work |
 
 ---
@@ -892,9 +894,11 @@ to four.
 where two rows naming the same slot are refused rather than ordered -- on the
 device they would race, and which won would be whichever block finished last.
 
-**Both of these were found by needing the operation, not by reading the source**,
-which is the difference between the six engine pull requests this server has sent
-and the three it sent before it had a workload.
+**Both of these were found by needing the operation, not by reading the source**
+— as was [the third](https://github.com/DanielPastor05/cpp-ai-engine/pull/13),
+which fused the two halves the other two had just made fast. That is the
+difference between the eleven engine pull requests this server has now sent and
+the three it sent before it had a workload to be wrong about.
 
 The gather is the cheap part, which is the one thing that did go as predicted:
 0.62 ms at batch 16 and capacity 512, against a 9.47 ms cached step. The plan
