@@ -78,9 +78,25 @@ jobs:
   # runner queues forever and reports as pending, which is worse than not
   # running: it looks like coverage.
   gpu:
+    # workflow_dispatch only. See the note above: a push trigger with no matching
+    # runner queues forever and reports as pending, which looks like coverage.
+    #
+    # It is also the security boundary. This repository is public, and a
+    # self-hosted runner will execute whatever a workflow tells it to on the
+    # machine it is registered from. Dispatch can only be started by someone with
+    # write access, so a fork cannot reach this job -- but a fork *can* propose a
+    # workflow of its own, which is why "Require approval for all external
+    # contributors" belongs on in the repository's Actions settings before a
+    # runner is ever registered.
     if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, gpu]
-    timeout-minutes: 45
+    timeout-minutes: 30
+    defaults:
+      run:
+        # The runner picks PowerShell on Windows and sh elsewhere; these steps
+        # are written once, in bash, and Git Bash ships with the toolchain this
+        # job already needs.
+        shell: bash
     steps:
       - uses: actions/checkout@v6
         with:
@@ -93,22 +109,52 @@ jobs:
       - name: Build the worker
         run: |
           cmake -B build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target braid_worker braid_train
+          cmake --build build --target braid_worker braid_train braid_test_cached
 
-      - name: Train a checkpoint
-        run: ./build/braid_train . models/charlm 6000
+      # The checkpoint lives outside the workspace and survives between runs.
+      #
+      # Training is thirty-five minutes and depends on the model's geometry, not
+      # on the commit, so doing it every push would spend the entire job on a
+      # file that almost never changes. It is regenerated when the geometry does:
+      # the key is a hash of charmodel.hpp, which is where kSeqLen and the block
+      # count live, and of train.cpp.
+      #
+      # RUNNER_TOOL_CACHE is the runner's own persistent directory. Using it
+      # rather than a path in the workspace is what makes "survives between runs"
+      # true -- the workspace is wiped.
+      - name: A checkpoint, trained only when the model changes
+        id: model
+        run: |
+          key=$(cat engine/charmodel.hpp engine/train.cpp | sha256sum | cut -c1-16)
+          dir="${RUNNER_TOOL_CACHE}/braid-model-${key}"
+          if [ ! -f "${dir}/charlm.bin" ]; then
+            echo "no checkpoint for geometry ${key}; training one (about 35 minutes)"
+            mkdir -p "${dir}"
+            ./build/braid_train* . "${dir}/charlm" 6000
+          else
+            echo "reusing the checkpoint for geometry ${key}"
+          fi
+          echo "dir=${dir}" >> "$GITHUB_OUTPUT"
 
-      # -p 1 is not decoration. Go runs packages in parallel, three of them
-      # start real workers, and two processes wanting seven gigabytes do not fit
-      # on eight. The symptom is "did not answer within 30s", which reads like a
+      # -p 1 is not decoration. Go runs packages in parallel, three of them start
+      # real workers, and two processes wanting seven gigabytes do not fit on
+      # eight. The symptom is "did not answer within 30s", which reads like a
       # hang and is a queue for memory.
       - name: The suite, against a real card
         env:
-          BRAID_WORKER: ${{ github.workspace }}/build/braid_worker
-          BRAID_MODEL: ${{ github.workspace }}/models/charlm
-        run: go test -p 1 -count=1 -timeout 40m ./internal/...
+          BRAID_MODEL: ${{ steps.model.outputs.dir }}/charlm
+        run: |
+          export BRAID_WORKER=$(ls build/braid_worker*)
+          go test -p 1 -count=1 -timeout 25m ./internal/...
 
       - name: Cached decode agrees with recomputation
         run: |
-          cmake --build build --target braid_test_cached
-          ENGINE_CUDA_MIN_FLOPS=1 ./build/braid_test_cached models/charlm
+          ENGINE_CUDA_MIN_FLOPS=1 ENGINE_CUDA_MIN_ELEMENTS=1 ENGINE_CUDA_MIN_LAYERNORM=1             ./build/braid_test_cached* "${{ steps.model.outputs.dir }}/charlm"
+
+      # The half of the container CI cannot otherwise reach. The server stage is
+      # built on every push by the job above; this stage pulls a five-gigabyte
+      # base and compiles four architectures, so it belongs where there is
+      # already a GPU toolchain and no hurry.
+      - name: The worker image builds
+        continue-on-error: true
+        run: docker build --target worker -t braid-worker-stage .
