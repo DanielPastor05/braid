@@ -73,7 +73,9 @@ func (s *Scheduler) loop() {
 			seeds = append(seeds, seq.req.Seed+uint64(seq.generated))
 		}
 
+		startedStep := time.Now()
 		ids, err := s.backend.Step(stepCtx, windows, lengths, slots, temps, seeds)
+		s.stats.stepNanos.Add(int64(time.Since(startedStep)))
 		if err != nil {
 			s.stats.stepErrors.Add(1)
 			s.failAll(active, err)

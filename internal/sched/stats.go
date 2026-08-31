@@ -48,6 +48,11 @@ type Stats struct {
 	// sequences are quietly recomputing what they could have had.
 	cached   atomic.Int64
 	uncached atomic.Int64
+
+	// stepNanos is the total time spent in Step, for estimating how long a
+	// queued request would wait. It is a sum rather than an average because two
+	// atomics cannot be read together and a ratio of two counters can be.
+	stepNanos atomic.Int64
 }
 
 // Snapshot is Stats at one instant, safe to serialise.
@@ -76,6 +81,11 @@ type Snapshot struct {
 	// exporting a number that never changes.
 	Cached   int64 `json:"cached_sequences"`
 	Uncached int64 `json:"uncached_sequences"`
+
+	// MeanStepMillis is how long a forward pass has been taking. It exists to
+	// predict queueing, and it is reported because a prediction whose inputs
+	// are invisible cannot be argued with.
+	MeanStepMillis float64 `json:"mean_step_ms"`
 
 	// Latency over a recent window, not since boot. A p99 measured over every
 	// request a long-lived process ever served is a number an hour of good
@@ -107,6 +117,7 @@ func (s *Scheduler) Stats() Snapshot {
 		StepErrors: s.stats.stepErrors.Load(),
 	}
 	if snap.Steps > 0 {
+		snap.MeanStepMillis = float64(s.stats.stepNanos.Load()) / float64(snap.Steps) / 1e6
 		snap.MeanBatch = float64(snap.Advanced) / float64(snap.Steps)
 		snap.AlignedShare = float64(s.stats.alignedSteps.Load()) / float64(snap.Steps)
 		snap.MeanWidth = float64(s.stats.widthSum.Load()) / float64(snap.Steps)

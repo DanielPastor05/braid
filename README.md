@@ -233,9 +233,22 @@ One thing this run says that the mock's does not. **Nothing is refused until
 250.** At 200 the queue is deep enough to swallow the whole overload, so every
 request is admitted and every request is late — a p99 of 1.3 seconds with a
 100 ms SLO, and not one 429 to tell anybody. `QueueDepth` is 256 by default and
-that is a decision to make everyone slow rather than tell anyone no. Past the
-cliff it is the wrong one, and the fix is admission on *predicted wait* rather
-than on queue length, which this server does not do.
+that is a decision to make everyone slow rather than tell anyone no.
+
+**So it now admits on predicted wait as well as on room.** A request that says
+what late means to it -- `max_wait_ms` -- is refused at submission when the queue
+ahead of it is longer than that, rather than admitted and answered too late. The
+estimate is one multiplication: at capacity the batch is full, so one sequence
+finishes every `tokens / MaxBatch` steps, and the nth in the queue waits about n
+of those. Wrong in detail, right in shape, and only ever compared against a
+deadline the caller volunteered.
+
+Queue depth answers *is there room*. A caller with a deadline asked *will I be
+served in time*, and those stopped being the same question at 200 requests a
+second.
+
+Both refusals are a 429, deliberately: from the client's side they both mean come
+back later, and which one it was is the server's business.
 
 ```bash
 go run ./cmd/braidload -arrivals 20,50,100,150,200,250 -for 15s -max-tokens 30
