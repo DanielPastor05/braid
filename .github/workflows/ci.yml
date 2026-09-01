@@ -195,6 +195,21 @@ jobs:
       # built on every push by the job above; this stage pulls a five-gigabyte
       # base and compiles four architectures, so it belongs where there is
       # already a GPU toolchain and no hurry.
+      #
+      # It was `continue-on-error` for one run and that was a mistake worth
+      # recording: docker is not installed on this runner, the step failed with
+      # `command not found`, and the job reported green. A step that always fails
+      # and always looks like it passed is worse than no step -- it is the same
+      # error as a queued job on a runner that does not exist, which the comment
+      # at the top of this job is about.
+      #
+      # So it announces instead. Where docker exists it builds and a failure is a
+      # failure; where it does not, the log says the stage is unverified and the
+      # README says the same thing.
       - name: The worker image builds
-        continue-on-error: true
-        run: docker build --target worker -t braid-worker-stage .
+        run: |
+          if ! command -v docker > /dev/null 2>&1; then
+            echo "::warning::docker is not installed on this runner, so the image's CUDA stage is not built here or anywhere"
+            exit 0
+          fi
+          docker build --target worker -t braid-worker-stage .

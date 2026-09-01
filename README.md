@@ -1478,10 +1478,16 @@ listens on every interface unauthenticated because it was convenient is how this
 goes wrong.
 
 **CI builds the Go stage on every push and not the CUDA one**, because that stage
-pulls a five-gigabyte base and compiles kernels for four architectures. So the
-image is verified to the extent that its server half compiles and its syntax
-holds; the worker stage has not been built anywhere but a machine with the
-toolkit.
+pulls a five-gigabyte base and compiles kernels for four architectures. The GPU
+job would build it, and does not: the machine that runs it has the CUDA toolkit
+and no Docker.
+
+So the honest state is that **the image's worker stage has never been built**.
+Its server stage is gated on every push, its syntax holds, and the half that
+matters is unverified. The step is there and says so in the log rather than
+being skipped quietly -- it was `continue-on-error` for exactly one run, which
+reported green while failing with `docker: command not found`, and a check that
+always passes without running is the thing this file keeps warning about.
 
 
 Training is about 35 minutes on a 3060 Ti and lands at **1.51 bits/char** — worse
