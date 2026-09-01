@@ -1,0 +1,33 @@
+# What never needs to reach the daemon.
+#
+# Without this the context is 136 MB, of which 109 MB is output: a 42 MB
+# checkpoint the image deliberately does not carry, and two build directories
+# from whatever was compiled here last. All of it copied on every build, and the
+# checkpoint in particular is the exact file the Dockerfile explains it is not
+# shipping.
+
+# Build output, on both sides.
+build/
+build-*/
+third_party/**/build/
+third_party/**/build-*/
+
+# The checkpoint. Reproducible from a seed by braid_train, and mounted at
+# runtime rather than baked in -- see the Dockerfile's header.
+models/
+
+# History, tooling, and the parts of the repository an image has no use for.
+.git/
+.github/
+.gitignore
+.gitmodules
+docs/
+bench/
+README.md
+Dockerfile
+.dockerignore
+
+# Go's own caches, if anyone has run a build outside a container.
+**/*.exe
+**/*.test
+**/testdata/fuzz/

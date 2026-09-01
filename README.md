@@ -1493,8 +1493,16 @@ project rather than to Ubuntu: the same CMake invocation, with the same
 `CMAKE_CUDA_ARCHITECTURES="75;80;86;89"`, run on the machine with the toolkit.
 It configures and links, and the compile line carries `compute_89` -- so the
 multi-architecture build the Dockerfile asks for is a real one and not a guess.
-What that does not check is the `apt-get` layer, the base image, or anything
-about Ubuntu. Half a verification, and worth knowing which half.
+The three base images were checked against Docker Hub and all exist, including
+`golang:1.27-bookworm`, which is the kind of thing that is wrong in a Dockerfile
+nobody has built.
+
+What remains unchecked is the `apt-get` layer and everything else about Ubuntu.
+Two thirds of a verification, and worth knowing which parts.
+
+A `.dockerignore` came out of looking: the context was **136 MB**, of which 116
+was build output and a 42 MB checkpoint — the exact file the header explains the
+image does not carry, copied to the daemon on every build. It is 20 MB now.
 
 
 Training is about 35 minutes on a 3060 Ti and lands at **1.51 bits/char** — worse
