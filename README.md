@@ -1500,11 +1500,24 @@ harness, the failover-with-a-warm-cache check and the cached-decode parity all
 skip on a runner with no card, which is every runner GitHub gives away. They run
 on one desk.
 
-The `gpu` job in `.github/workflows/ci.yml` is the fix and it is not enabled: it
-wants a self-hosted runner labelled `gpu` and is `workflow_dispatch` only, since
-a `push` trigger with no matching runner queues forever and reports as pending —
-which looks like coverage and is worse than nothing. Register a runner and it
-becomes real; until then this paragraph is the honest version of the badge.
+The `gpu` job in `.github/workflows/ci.yml` is the fix, and it runs: a
+self-hosted runner labelled `gpu` is registered, and the whole suite passes
+against the card from CI — api, backend, kvmem, sched, plus cached-decode
+parity. Three failures on the way there were findable no other way, and one of
+them was that the job had been picking its shell by luck rather than naming it.
+
+**It is still `workflow_dispatch` only, and there is no `schedule:`.** Both are
+deliberate. A `push` trigger with no matching runner queues forever and reports
+as pending, which looks like coverage and is worse than nothing — and the same
+argument applies to a cron on a runner that is somebody's desktop: with the
+machine off, a scheduled run waits up to twenty-four hours and then fails.
+Nobody has to *start* the runner any more (a logon task does that), but somebody
+still has to press the button, so a regression can sit on `main` until they do.
+That is the honest version of the badge.
+
+Not a Windows service, which is the obvious way to start a runner and the wrong
+one here: a service runs in session 0, and CUDA on a WDDM consumer card is not
+available there. It would start cleanly and run the GPU job without a GPU.
 
 ### In a container
 
