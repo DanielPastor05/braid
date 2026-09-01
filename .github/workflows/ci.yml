@@ -102,20 +102,29 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        # Git Bash by path, not by name.
+        # bash, with Git's bin put ahead of it by the toolchain step below.
         #
-        # `shell: bash` resolves through PATH, and on Windows several things
-        # answer to that name. Installing WSL puts a bash.exe stub in
+        # Two mistakes live here, and the repair for the first caused the
+        # second. `shell: bash` resolves through PATH, and on Windows more than
+        # one thing answers to that name: installing WSL puts a bash.exe stub in
         # WindowsApps ahead of Git's, and with no distribution behind it every
         # step printed "Windows Subsystem for Linux has no distributions
         # installed" and exited 1. Before that the job had been picking Git Bash
         # by luck rather than by choice.
         #
-        # Named outright, so which shell runs is a decision instead of a race
-        # between PATH entries. Git for Windows is a hard requirement for the
-        # runner and installs here; if it is somewhere else this fails at once
-        # and says so, which beats running a shell nobody chose.
-        shell: 'C:\Program Files\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        # Naming the interpreter by path is the obvious repair and does not
+        # work. The runner splits a custom shell string on its first space to
+        # separate the command from its arguments, so
+        # `C:\Program Files\Git\bin\bash.exe ...` becomes the command
+        # `C:\Program`, and the step dies inside the runner with "Second path
+        # fragment must not be a drive or UNC name" before any shell starts.
+        #
+        # So the name stays and the choice moves to PATH: the step below writes
+        # Git's bin to GITHUB_PATH, which is the channel the runner consults
+        # when it resolves a shell name. GITHUB_ENV is not -- that sets the
+        # environment a step runs in, which is decided after the interpreter has
+        # already been found.
+        shell: bash
     steps:
       - uses: actions/checkout@v6
         with:
@@ -188,6 +197,13 @@ jobs:
             exit /b 1
           )
 
+          rem GITHUB_PATH, and not only the PATH written below. The runner
+          rem resolves `shell: bash` against its own PATH plus what steps have
+          rem added through this file, and it does that before the step's
+          rem environment exists -- so a PATH written to GITHUB_ENV arrives too
+          rem late to decide which bash runs.
+          >>"%GITHUB_PATH%" echo %GITROOT%\bin
+
           >>"%GITHUB_ENV%" echo PATH=%PATH%
           >>"%GITHUB_ENV%" echo INCLUDE=%INCLUDE%
           >>"%GITHUB_ENV%" echo LIB=%LIB%
@@ -195,6 +211,8 @@ jobs:
 
       - name: Build the worker
         run: |
+          # Which bash actually ran, named in the log rather than assumed.
+          echo "shell: $BASH"
           cmake --version
           cmake -B build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target braid_worker braid_train braid_test_cached
