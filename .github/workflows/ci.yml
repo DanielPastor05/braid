@@ -7,6 +7,10 @@ on:
   # The GPU job below runs on nothing but this. See its comment for why a push
   # trigger would be worse than no trigger.
   workflow_dispatch:
+  # And the image job, which is twenty minutes and changes only when the
+  # Dockerfile or the engine does.
+  schedule:
+    - cron: '0 5 * * 1'
 
 jobs:
   test:
@@ -241,25 +245,60 @@ jobs:
         run: |
           ENGINE_CUDA_MIN_FLOPS=1 ENGINE_CUDA_MIN_ELEMENTS=1 ENGINE_CUDA_MIN_LAYERNORM=1             ./build/braid_test_cached* "${{ steps.model.outputs.dir }}/charlm"
 
-      # The half of the container CI cannot otherwise reach. The server stage is
-      # built on every push by the job above; this stage pulls a five-gigabyte
-      # base and compiles four architectures, so it belongs where there is
-      # already a GPU toolchain and no hurry.
-      #
-      # It was `continue-on-error` for one run and that was a mistake worth
-      # recording: docker is not installed on this runner, the step failed with
-      # `command not found`, and the job reported green. A step that always fails
-      # and always looks like it passed is worse than no step -- it is the same
-      # error as a queued job on a runner that does not exist, which the comment
-      # at the top of this job is about.
-      #
-      # So it announces instead. Where docker exists it builds and a failure is a
-      # failure; where it does not, the log says the stage is unverified and the
-      # README says the same thing.
-      - name: The worker image builds
+  # The image's CUDA stage, on a runner that can build it.
+  #
+  # This lived in the gpu job for a while, on the reasoning that a stage which
+  # compiles CUDA belongs where the CUDA toolchain is. That reasoning is wrong:
+  # the toolchain is *inside the container*, pulled with the base image, and what
+  # the build actually needs is Docker. The self-hosted runner is the one machine
+  # here that does not have it, so the step sat on the only host that could never
+  # run it -- and for one run it was `continue-on-error`, failing with `command
+  # not found` while the job reported green.
+  #
+  # A hosted runner has Docker and no GPU, which is exactly right: building an
+  # image does not need a card, and running the result is not what this checks.
+  #
+  # Not on every push. It pulls a five-gigabyte base and compiles for four
+  # architectures, which is twenty minutes to catch a class of error that changes
+  # only when the Dockerfile or the engine does. Weekly, and on demand.
+  image:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # The base image alone is most of a hosted runner's free space, so the
+      # preinstalled toolchains nothing here uses go first. Without this the
+      # build dies partway through nvcc with no disk left and an error that
+      # blames the compiler.
+      - name: Room for a five-gigabyte base image
         run: |
-          if ! command -v docker > /dev/null 2>&1; then
-            echo "::warning::docker is not installed on this runner, so the image's CUDA stage is not built here or anywhere"
-            exit 0
-          fi
-          docker build --target worker -t braid-worker-stage .
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h / | tail -1
+
+      - name: The worker stage builds
+        run: docker build --target worker -t braid-worker-stage .
+
+      # The whole thing, not just the stage that compiles. The runtime layer is
+      # where an image usually breaks in a way the build stage cannot show: a
+      # library the engine's CPU fallback needs and the runtime base does not
+      # carry, and the worker exits at load with a link error saying nothing
+      # about GPUs.
+      - name: And the whole image
+        run: |
+          docker build -t braid .
+          docker image inspect braid --format 'size: {{.Size}} bytes'
+
+      # Without a GPU the worker cannot serve, but it can still be asked whether
+      # it starts -- which is what proves the runtime layer carries what it needs.
+      # A missing libgomp1 fails here and nowhere else.
+      - name: The worker in the image starts
+        run: |
+          docker run --rm --entrypoint /usr/local/bin/braid_worker braid 2>&1 | head -5 || true
+          docker run --rm --entrypoint sh braid -c 'ldd /usr/local/bin/braid_worker | grep -c "not found" | grep -qx 0'
+          echo "every shared library the worker needs is present in the runtime image"
