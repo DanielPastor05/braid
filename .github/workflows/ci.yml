@@ -90,7 +90,12 @@ jobs:
     # runner is ever registered.
     if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, gpu]
-    timeout-minutes: 30
+    # Sixty, not thirty. A run that finds a checkpoint already in the tool cache
+    # takes about six minutes; one that has to train takes thirty-five, and the
+    # first run on any new runner is always the second kind. Thirty was set on
+    # the assumption the cache would be warm, which cancelled the first real run
+    # at exactly the training step.
+    timeout-minutes: 60
     defaults:
       run:
         # The runner picks PowerShell on Windows and sh elsewhere; these steps
