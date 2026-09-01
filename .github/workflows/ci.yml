@@ -102,10 +102,20 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        # The runner picks PowerShell on Windows and sh elsewhere; these steps
-        # are written once, in bash, and Git Bash ships with the toolchain this
-        # job already needs.
-        shell: bash
+        # Git Bash by path, not by name.
+        #
+        # `shell: bash` resolves through PATH, and on Windows several things
+        # answer to that name. Installing WSL puts a bash.exe stub in
+        # WindowsApps ahead of Git's, and with no distribution behind it every
+        # step printed "Windows Subsystem for Linux has no distributions
+        # installed" and exited 1. Before that the job had been picking Git Bash
+        # by luck rather than by choice.
+        #
+        # Named outright, so which shell runs is a decision instead of a race
+        # between PATH entries. Git for Windows is a hard requirement for the
+        # runner and installs here; if it is somewhere else this fails at once
+        # and says so, which beats running a shell nobody chose.
+        shell: 'C:\Program Files\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -156,6 +166,25 @@ jobs:
           where cmake >nul 2>&1
           if errorlevel 1 (
             echo CMake is not installed on this runner.
+            exit /b 1
+          )
+
+          rem Git Bash, ahead of anything else called bash.
+          rem
+          rem `shell: bash` resolves through PATH, and on Windows more than one
+          rem thing answers to that name. Installing WSL puts a bash.exe stub in
+          rem WindowsApps that comes first; with no distribution behind it, every
+          rem step below printed "Windows Subsystem for Linux has no distributions
+          rem installed" and exited 1. The job had been picking Git Bash by luck.
+          rem
+          rem Git is a hard requirement for the runner, so its location is a thing
+          rem that can be asked about rather than assumed.
+          for /f "usebackq tokens=*" %%g in (`where git`) do set "GITEXE=%%g"
+          if defined GITEXE for %%d in ("%GITEXE%\..\..") do set "GITROOT=%%~fd"
+          if exist "%GITROOT%\bin\bash.exe" (
+            set "PATH=%GITROOT%\bin;%PATH%"
+          ) else (
+            echo Git Bash was not found next to git, and these steps are written in bash.
             exit /b 1
           )
 
