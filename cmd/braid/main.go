@@ -174,6 +174,9 @@ func main() {
 			// A slot per row that can share a step. Sized here rather than in
 			// the worker because the scheduler is what decides MaxBatch.
 			CacheSlots: cacheSlots,
+			// And the batch itself, so the worker can refuse a frame claiming
+			// more rows than this server will ever send.
+			MaxBatch: *maxBatch,
 		}
 		// One worker is a Worker rather than a Pool of one. The pool's failover
 		// has nowhere to go with a single process, and a plain worker makes that

@@ -12,7 +12,14 @@ go.work.sum
 *.out
 
 # Build output
+#
+# build-*/ as well as build/: the engine's tests and the CUDA variants get their
+# own directories, they are gigabytes each, and .dockerignore has covered this
+# shape since the image existed. This file had not.
 /build/
+build-*/
+third_party/**/build/
+third_party/**/build-*/
 /models/
 
 # Python bytecode from the PyTorch reference

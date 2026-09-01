@@ -77,6 +77,15 @@
 //
 // A zero-length read on stdin is a clean shutdown, not a failure: it is what
 // the server closing the pipe looks like.
+//
+// Two numbers in a frame are bounded rather than believed, and the server states
+// both at start: BRAID_MAX_BATCH is the most rows a frame may carry, and
+// BRAID_CACHE_SLOTS the slot indices it may name. Both arrive as u32 and both
+// are used to size or subscript something, so a frame above either is refused
+// rather than served. Not because this pipe is reachable by anyone -- it is a
+// child process of the one thing that writes to it -- but because a scheduler
+// bug should arrive as a message with the number in it. Absent means unchecked,
+// which is what a worker run by hand gets.
 
 #include "charmodel.hpp"
 
@@ -137,6 +146,16 @@ void write_error(const std::string& message) {
     write_all(&length, sizeof length);
     write_all(message.data(), message.size());
     std::cout.flush();
+
+    // And to stderr, which the server forwards to its log.
+    //
+    // The reply above only reaches the server if the server gets as far as
+    // reading it, and a frame refused on its header is refused while the server
+    // is still writing the rest of it -- so the write fails with a broken pipe
+    // and the reason it broke never arrives. Saying it twice costs a line and is
+    // the difference between "the pipe has been ended" and a number.
+    std::cerr << "worker refused a frame: " << message << "\n";
+    std::cerr.flush();
 }
 
 std::string read_file(const std::string& path) {
@@ -336,10 +355,35 @@ int main(int argc, char** argv) {
     // request happens to arrive first, and it showed up as a TTFT p95 of 194 ms
     // against a step of six -- a cold start wearing the costume of a latency
     // regression.
+    std::size_t max_slots = 0;
     if (cache_enabled) {
         const char* slots_env = std::getenv("BRAID_CACHE_SLOTS");
         const long wanted = slots_env ? std::strtol(slots_env, nullptr, 10) : 0;
-        if (wanted > 0) ensure_pool(static_cast<std::size_t>(wanted));
+        if (wanted > 0) {
+            max_slots = static_cast<std::size_t>(wanted);
+            ensure_pool(max_slots);
+        }
+    }
+
+    // What the server said a frame may carry, and what it said a slot index may
+    // be. Both are checked below rather than believed.
+    //
+    // The row count arrives as a uint32 and every buffer here is sized from it:
+    // n times the context, five arrays over. A slot index arrives the same way
+    // and is used to subscript the pool. Nothing else on this machine writes to
+    // this pipe, so neither is an attack surface -- what they are is the
+    // difference between a scheduler bug arriving as a refusal that names the
+    // number and arriving as a multi-gigabyte allocation with no message. The
+    // same class was found by fuzzing on the reply side of this pipe and capped
+    // there; this is the request side, and it had no such cap.
+    //
+    // Zero means the server did not say, which is what a worker run by hand
+    // gets, and then nothing is checked -- an absent bound is not a bound of
+    // zero.
+    std::size_t max_batch = 0;
+    if (const char* batch_env = std::getenv("BRAID_MAX_BATCH")) {
+        const long wanted = std::strtol(batch_env, nullptr, 10);
+        if (wanted > 0) max_batch = static_cast<std::size_t>(wanted);
     }
 
     std::vector<std::int32_t> windows;
@@ -362,6 +406,11 @@ int main(int argc, char** argv) {
         if (!read_exact(&n, sizeof n)) break;
         if (n == 0) {
             write_error("a step with no sequences in it");
+            return 1;
+        }
+        if (max_batch > 0 && static_cast<std::size_t>(n) > max_batch) {
+            write_error("a step claiming " + std::to_string(n) + " rows, above the " +
+                        std::to_string(max_batch) + " this worker was started for");
             return 1;
         }
 
@@ -431,7 +480,21 @@ int main(int argc, char** argv) {
             bool cached = cache_enabled && n > 1;
             if (cached) {
                 for (std::uint32_t i = 0; i < n; ++i) {
-                    if (slots[i] < 0) cached = false;
+                    // Negative is the server saying this row has no slot and
+                    // should be recomputed, which is a decision rather than an
+                    // error. Above the number of slots it said it would use is
+                    // the error: the index subscripts the pool, and growing to
+                    // fit whatever arrives is how a bookkeeping bug becomes an
+                    // allocation instead of a message.
+                    if (slots[i] < 0) {
+                        cached = false;
+                    } else if (max_slots > 0 &&
+                               static_cast<std::size_t>(slots[i]) >= max_slots) {
+                        write_error("a row naming cache slot " + std::to_string(slots[i]) +
+                                    ", above the " + std::to_string(max_slots) +
+                                    " this worker allocated");
+                        return 1;
+                    }
                 }
             }
 

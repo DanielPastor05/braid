@@ -1253,6 +1253,49 @@ holds nothing. It needed a slow backend to hold a slot at all. A test that passe
 without reaching the code it names is worse than no test, because it also reports
 that the area is covered.
 
+### The request side of the pipe gets the cap the reply side got
+
+The worker read the row count off the wire as a `uint32` and sized five arrays
+from it — `n` times the context — and read slot indices the same way and
+subscripted the pool with them. Neither had a bound, and `ensure_pool` grew to
+fit whatever arrived.
+
+**This is not a vulnerability and it is worth fixing anyway.** Nothing but this
+server writes to that pipe; the worker is its child process and there is no
+network in between. What the bound buys is that a scheduler getting its
+bookkeeping wrong arrives as a refusal naming the number instead of as a
+multi-gigabyte allocation with no message — and the free-list bug above is
+exactly what a scheduler getting its slot bookkeeping wrong looks like.
+
+The asymmetry is the interesting part: **the same class was found by fuzzing on
+the *reply* side of this same pipe** and capped at 64 KiB there, with a comment
+saying that a length read at the wrong offset is a request to allocate. The
+lesson was not carried across to the request side.
+
+The server now sends `BRAID_MAX_BATCH` beside `BRAID_CACHE_SLOTS`, and the worker
+refuses a frame above either. Refusing rather than clamping is the choice worth
+defending: a row index the server should never have sent is a bug in the server,
+and quietly serving it is how the free-list bug survived.
+
+One detail that only showed up in the test. A frame refused on its *header* is
+refused while the server is still writing the rest of it, so the server's write
+fails with a broken pipe and never reads the reply — the caller sees
+`the pipe has been ended` and the reason is lost. So the refusal goes to stderr
+as well, which the server forwards to its log, and the test asserts the number
+reaches the log rather than that the call failed somehow.
+
+```bash
+go test -run TestTheWorkerRefusesAFrameAboveItsBounds -count=1 ./internal/backend/
+```
+
+Two smaller things from the same sweep. **A worker log line over 64 KiB used to
+silence the log for the rest of that worker's life**: `bufio.Scanner` stops at
+`ErrTooLong`, the forwarding loop exits, and nothing says so — an observability
+path failing quietly, which is the worst way for one to fail. The buffer is a
+megabyte now and the error is reported either way. And `.gitignore` did not cover
+`build-*/`, which `.dockerignore` has covered since the image existed; the
+engine's test builds land there and are gigabytes each.
+
 ---
 
 ## Against PyTorch, on the same card

@@ -175,6 +175,21 @@ type WorkerOptions struct {
 	// makes the first request pay for a gigabyte.
 	CacheSlots int
 
+	// MaxBatch is the most rows a frame will ever carry, and it is sent so that
+	// the worker can refuse one that carries more.
+	//
+	// The worker reads the row count off the wire as a uint32 and sizes its
+	// buffers from it -- n times the context, times five arrays. Nothing else on
+	// this machine writes to that pipe, so this is not an attack surface; it is
+	// that a scheduler bug arrives as a multi-gigabyte allocation with no
+	// message rather than as a refusal that names the number. The same class was
+	// found by fuzzing on the *reply* side of this pipe and capped there; this
+	// is the request side of it.
+	//
+	// Zero means the worker cannot check, which is what a worker run by hand
+	// gets.
+	MaxBatch int
+
 	// MinLayerNormElements is the third of the engine's thresholds, and the one
 	// that decided whether a small forward chained across the card or came home
 	// at every normalisation.
@@ -239,6 +254,10 @@ func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*W
 	if opts.EmitLogits {
 		w.cmd.Env = append(w.cmd.Env, "BRAID_EMIT_LOGITS=1")
 	}
+	// Sent whether or not the cache is on: it bounds the frame, not the pool.
+	if opts.MaxBatch > 0 {
+		w.cmd.Env = append(w.cmd.Env, fmt.Sprintf("BRAID_MAX_BATCH=%d", opts.MaxBatch))
+	}
 	if opts.Cache {
 		w.cmd.Env = append(w.cmd.Env, "BRAID_CACHE=1")
 		// How many slots to allocate at start. The pool is over a gigabyte at
@@ -273,8 +292,21 @@ func NewWorker(exePath, prefix string, opts WorkerOptions, log *slog.Logger) (*W
 	// the server's log rather than only in the numbers.
 	go func() {
 		scanner := bufio.NewScanner(stderr)
+		// A line longer than the scanner's default 64 KiB stops it with
+		// ErrTooLong, and the loop below then exits and never forwards another
+		// line for the rest of the worker's life. Nothing says so: the log
+		// simply goes quiet, which is the worst way for an observability path
+		// to fail. Raised to a megabyte, and the reason it stopped is reported
+		// either way -- a silent scanner is why this needed finding rather than
+		// noticing.
+		scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for scanner.Scan() {
 			log.Info("worker", "line", scanner.Text())
+		}
+		// io.EOF is not reported by Err; a nil here means the worker's stderr
+		// closed, which is what happens when it exits.
+		if err := scanner.Err(); err != nil {
+			log.Warn("stopped forwarding the worker's log", "error", err)
 		}
 	}()
 
