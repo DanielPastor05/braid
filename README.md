@@ -1482,12 +1482,19 @@ pulls a five-gigabyte base and compiles kernels for four architectures. The GPU
 job would build it, and does not: the machine that runs it has the CUDA toolkit
 and no Docker.
 
-So the honest state is that **the image's worker stage has never been built**.
-Its server stage is gated on every push, its syntax holds, and the half that
-matters is unverified. The step is there and says so in the log rather than
-being skipped quietly -- it was `continue-on-error` for exactly one run, which
-reported green while failing with `docker: command not found`, and a check that
-always passes without running is the thing this file keeps warning about.
+So the honest state is that **the image's worker stage has never been built as
+an image**. The step is there and says so in the log rather than being skipped
+quietly -- it was `continue-on-error` for exactly one run, which reported green
+while failing with `docker: command not found`, and a check that always passes
+without running is the thing this file keeps warning about.
+
+What *has* been verified is the part of that stage which is specific to this
+project rather than to Ubuntu: the same CMake invocation, with the same
+`CMAKE_CUDA_ARCHITECTURES="75;80;86;89"`, run on the machine with the toolkit.
+It configures and links, and the compile line carries `compute_89` -- so the
+multi-architecture build the Dockerfile asks for is a real one and not a guess.
+What that does not check is the `apt-get` layer, the base image, or anything
+about Ubuntu. Half a verification, and worth knowing which half.
 
 
 Training is about 35 minutes on a 3060 Ti and lands at **1.51 bits/char** — worse

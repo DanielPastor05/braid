@@ -111,8 +111,58 @@ jobs:
         with:
           go-version: '1.27'
 
+      # The toolchain, found rather than inherited.
+      #
+      # nvcc needs MSVC's headers and libraries, and those arrive only from
+      # vcvars64.bat -- which meant this job depended on *how the runner process
+      # was started*. Launched from a shell that had already sourced vcvars, the
+      # build worked; launched as a service or from a plain terminal it failed at
+      # `cstdint: No such file or directory`, with nothing in the error pointing
+      # at the cause.
+      #
+      # vswhere ships with the Visual Studio Installer at a fixed location and is
+      # the supported way to find an installation, so none of this is pinned to
+      # one machine's layout. Only the four variables that matter are exported:
+      # dumping the whole environment into GITHUB_ENV works right up until some
+      # variable contains a newline.
+      - name: MSVC and CMake on PATH
+        shell: cmd
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          if not exist "%VSWHERE%" (
+            echo The Visual Studio Installer is not present, so the C++ toolchain cannot be located.
+            exit /b 1
+          )
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          if not defined VSDIR (
+            echo No Visual Studio installation carries the x64 C++ tools.
+            exit /b 1
+          )
+          echo Using %VSDIR%
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+
+          rem CMake is a separate install and vcvars does not always bring one.
+          rem PATH first, then the two places installers put it, so this stays
+          rem free of any particular machine's directories.
+          where cmake >nul 2>&1
+          if errorlevel 1 (
+            for /d %%d in ("%LOCALAPPDATA%\Programs\cmake-*") do set "PATH=%%d\bin;%PATH%"
+            if exist "%ProgramFiles%\CMake\bin\cmake.exe" set "PATH=%ProgramFiles%\CMake\bin;%PATH%"
+          )
+          where cmake >nul 2>&1
+          if errorlevel 1 (
+            echo CMake is not installed on this runner.
+            exit /b 1
+          )
+
+          >>"%GITHUB_ENV%" echo PATH=%PATH%
+          >>"%GITHUB_ENV%" echo INCLUDE=%INCLUDE%
+          >>"%GITHUB_ENV%" echo LIB=%LIB%
+          >>"%GITHUB_ENV%" echo LIBPATH=%LIBPATH%
+
       - name: Build the worker
         run: |
+          cmake --version
           cmake -B build -S engine -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target braid_worker braid_train braid_test_cached
 
