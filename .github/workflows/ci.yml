@@ -149,7 +149,11 @@ jobs:
         env:
           BRAID_MODEL: ${{ steps.model.outputs.dir }}/charlm
         run: |
-          export BRAID_WORKER=$(ls build/braid_worker*)
+          # Absolute, and that is the whole point: go test runs each package
+          # from that package's own directory, so a relative path resolves
+          # against internal/sched rather than the repository root and every
+          # test that needs a worker reports "cannot find the path specified".
+          export BRAID_WORKER=$(ls "$GITHUB_WORKSPACE"/build/braid_worker*)
           go test -p 1 -count=1 -timeout 25m ./internal/...
 
       - name: Cached decode agrees with recomputation
