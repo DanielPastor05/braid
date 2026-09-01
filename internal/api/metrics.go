@@ -63,9 +63,25 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	// movement at all when it is not: at a slot per row, non-zero means the free
 	// list is leaking and sequences are quietly recomputing what they could have
 	// had.
+	//
+	// That is only half the failure, and it is the harmless half. These two
+	// notice a free list that *shrinks*. A list that *grows* is invisible to
+	// them -- everybody still gets a slot, uncached stays at zero -- and it
+	// means the same row was handed to several live sequences at once, which is
+	// not slower output but wrong output. That bug shipped here. The gauge below
+	// is the one that would have shown it.
 	counter("braid_sequences_cached_total", "Sequences admitted with a cache slot.", snap.Cached)
 	counter("braid_sequences_uncached_total",
 		"Sequences admitted without a cache slot, and served by recomputing.", snap.Uncached)
+
+	// Free plus live equals the number of slots that exist, always. So the alert
+	// is an equality rather than a threshold -- `braid_free_cache_slots >
+	// braid_cache_slots` is not a busy server, it is a bug -- and the total is
+	// exported beside it so the condition can be written without knowing how
+	// this server was configured.
+	gauge("braid_free_cache_slots", "Cache slots not held by any sequence right now.",
+		float64(snap.FreeSlots))
+	gauge("braid_cache_slots", "Cache slots that exist.", float64(snap.CacheSlots))
 
 	if l := snap.Latency; l.Samples > 0 {
 		gauge("braid_latency_samples", "Completions in the latency window.", float64(l.Samples))

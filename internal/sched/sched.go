@@ -195,8 +195,22 @@ type Scheduler struct {
 
 	// Free key/value cache slots in the worker, one per row of MaxBatch. Only
 	// the loop goroutine touches it, which is why it needs no lock -- the same
-	// reason nothing else in the scheduler's hot path has one.
+	// reason nothing else in the scheduler's hot path has one. Its length is
+	// mirrored into an atomic so that /metrics can watch it without racing;
+	// see stats.freeSlots for why watching it matters.
 	freeSlots []int32
+
+	// cacheSlots is how many exist, so that a reader of the gauge can tell a
+	// budget deliberately below MaxBatch from a free list that has grown past
+	// the number of rows there are.
+	cacheSlots int
+
+	// submitMu closes the window between Submit's check of stop and its send.
+	// Without it a request can be accepted after Close has already drained the
+	// queue, and nothing would ever answer it. Held for reading on the submit
+	// path and for writing by Close, so it is not contended in the steady state
+	// and never touches the loop goroutine at all.
+	submitMu sync.RWMutex
 }
 
 // New starts the loop. Close stops it.
@@ -223,15 +237,17 @@ func New(b backend.Backend, cfg Config) (*Scheduler, error) {
 	}
 
 	s := &Scheduler{
-		cfg:       cfg,
-		backend:   b,
-		seqLen:    b.SeqLen(),
-		freeSlots: free,
-		incoming:  make(chan *sequence, cfg.QueueDepth),
-		stop:      make(chan struct{}),
-		stopped:   make(chan struct{}),
-		latency:   newLatencies(),
+		cfg:        cfg,
+		backend:    b,
+		seqLen:     b.SeqLen(),
+		freeSlots:  free,
+		cacheSlots: slots,
+		incoming:   make(chan *sequence, cfg.QueueDepth),
+		stop:       make(chan struct{}),
+		stopped:    make(chan struct{}),
+		latency:    newLatencies(),
 	}
+	s.stats.freeSlots.Store(int64(slots))
 	go s.loop()
 	return s, nil
 }
@@ -295,6 +311,18 @@ func (s *Scheduler) Submit(ctx context.Context, req Request) (<-chan Token, <-ch
 		slot: -1,
 	}
 
+	// Held across both selects, and that is the whole point of it.
+	//
+	// Checking stop and then sending are two steps, and Close can run between
+	// them: the check passes, the loop exits, Close drains a queue this request
+	// is not in yet, and then the send succeeds into a channel nobody will ever
+	// read again. The caller waits on that stream for ever.
+	//
+	// Read-held, so concurrent submissions do not serialise on each other, and
+	// never touched by the loop goroutine -- the hot path still has no lock.
+	s.submitMu.RLock()
+	defer s.submitMu.RUnlock()
+
 	select {
 	case <-s.stop:
 		return nil, nil, ErrClosed
@@ -316,8 +344,31 @@ func (s *Scheduler) Submit(ctx context.Context, req Request) (<-chan Token, <-ch
 
 // Close stops the loop and fails everything still in flight. It returns once
 // the loop has exited.
+//
+// "Everything" used to mean everything the loop was holding, which left out the
+// requests still in the queue: the loop returns on stop without draining, so
+// their streams were never closed and no Result ever arrived. A caller ranging
+// over the token channel waited for ever. It did not bite the server -- main
+// shuts the listener down first, so the queue drains while handlers do, and the
+// process exits straight after -- but the promise in the line above was false
+// for anyone else, and a hang is a poor way to find that out.
 func (s *Scheduler) Close() error {
 	s.closeOne.Do(func() { close(s.stop) })
 	<-s.stopped
-	return s.backend.Close()
+
+	// The loop is gone, so nothing will read the queue again and this is the
+	// only place left that can answer what is in it. Taking the lock for writing
+	// waits out any Submit that has already passed its check of stop, and after
+	// that every later one sees a closed channel and is told so -- which is what
+	// makes this drain the last word rather than a race with the next arrival.
+	s.submitMu.Lock()
+	defer s.submitMu.Unlock()
+	for {
+		select {
+		case seq := <-s.incoming:
+			s.finish(seq, ErrClosed)
+		default:
+			return s.backend.Close()
+		}
+	}
 }

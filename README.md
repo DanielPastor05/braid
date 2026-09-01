@@ -1204,6 +1204,55 @@ never cancels a queued request, and the slot-accounting test checks that slots
 come back, not that they are not invented. Both were right about what they
 measured.
 
+**Neither did the metric, and that was the more useful discovery.** `/metrics`
+had exactly one signal aimed at this subsystem — `braid_sequences_uncached_total`
+— and the comment beside it said that at a slot per row, any movement means "the
+free list is leaking". It watches the list *shrinking*. This bug made it *grow*,
+so everybody still got a slot, uncached stayed at zero, and the server reported
+perfect health while handing the same row to six sequences.
+
+So there is now a gauge for the thing itself, and the alert on it is an equality
+rather than a threshold: free plus live equals the number of slots that exist,
+always, so `braid_free_cache_slots > braid_cache_slots` is not a busy server, it
+is a bug. The total is exported beside it so the condition can be written without
+knowing how the server was configured.
+
+### Close said it failed everything in flight, and left the queue out
+
+Found in the same pass, fixed in the same commit, and it never reached the
+server. `Close` stops the loop and fails what the loop is holding — but the loop
+returns on stop *without draining the queue*, so a request that had been accepted
+and not yet admitted never had its stream closed and never received a `Result`.
+A caller ranging over the token channel waited for ever. Measured: four of six.
+
+`cmd/braid` does not hit it, and the reason is worth keeping because it was an
+accident of ordering that happened to be right: `main` stops the listener first
+with a ten-second grace, so the queue drains while the handlers do, and the
+process exits straight after. The promise in `Close`'s own documentation was
+still false for anyone else.
+
+Draining is most of the fix and not all of it. `Submit` checks `stop` and then
+sends, which are two steps, and `Close` can run between them — the check passes,
+the loop exits, the drain finds an empty queue, and *then* the send lands in a
+channel nobody will ever read. So `Submit` now holds a read lock across both
+steps and `Close` takes it for writing before draining, which makes the drain the
+last word rather than a race with the next arrival. Read-held, so submissions do
+not serialise on each other, and the loop goroutine never touches it: the hot
+path still has no lock.
+
+```bash
+go test -run 'TestCloseAnswersRequestsStillInTheQueue|TestSubmitAcceptedAfterCloseIsAnswered' -count=1 ./internal/sched/
+```
+
+One note on the second test, because it is the kind of thing this file is for.
+The first version of the gauge test passed with the counter deliberately broken:
+every request in it was cancelled before admission, so the code path that *takes*
+a slot never ran. The token channel is buffered to `MaxTokens`, so a fast backend
+finishes a sequence whether or not anyone is reading it, and holding the reader
+holds nothing. It needed a slow backend to hold a slot at all. A test that passes
+without reaching the code it names is worse than no test, because it also reports
+that the area is covered.
+
 ---
 
 ## Against PyTorch, on the same card

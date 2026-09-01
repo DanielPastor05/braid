@@ -49,6 +49,21 @@ type Stats struct {
 	cached   atomic.Int64
 	uncached atomic.Int64
 
+	// freeSlots mirrors len(Scheduler.freeSlots), because the list itself is
+	// owned by the loop goroutine and reading it from Stats() would be a race.
+	//
+	// It exists because the two counters above watch the wrong direction. They
+	// notice a free list that *shrinks* -- sequences start recomputing, uncached
+	// moves. A list that *grows* is invisible to them: everyone still gets a
+	// slot, uncached stays at zero, and the same row is handed to several live
+	// sequences at once. That is not a slowdown, it is the two of them reading
+	// each other's keys, and it is exactly the bug that shipped here.
+	//
+	// So this is the one to alert on, and the condition is an equality rather
+	// than a threshold: free plus live must equal the number of slots that
+	// exist, always. Past that number there is nothing to tune, only a bug.
+	freeSlots atomic.Int64
+
 	// stepNanos is the total time spent in Step, for estimating how long a
 	// queued request would wait. It is a sum rather than an average because two
 	// atomics cannot be read together and a ratio of two counters can be.
@@ -81,6 +96,13 @@ type Snapshot struct {
 	// MaxBatch.
 	Cached   int64 `json:"cached_sequences"`
 	Uncached int64 `json:"uncached_sequences"`
+
+	// FreeSlots is how many cache slots are not held right now, and CacheSlots
+	// how many exist. The invariant is that free never exceeds the total, and
+	// the two are reported together so that it can be checked without knowing
+	// how the server was configured. See the note on the counter.
+	FreeSlots  int64 `json:"free_cache_slots"`
+	CacheSlots int64 `json:"cache_slots"`
 
 	// MeanStepMillis is how long a forward pass has been taking. It exists to
 	// predict queueing, and it is reported because a prediction whose inputs
@@ -115,6 +137,8 @@ func (s *Scheduler) Stats() Snapshot {
 		Completed:  s.stats.completed.Load(),
 		Failed:     s.stats.failed.Load(),
 		StepErrors: s.stats.stepErrors.Load(),
+		FreeSlots:  s.stats.freeSlots.Load(),
+		CacheSlots: int64(s.cacheSlots),
 	}
 	if snap.Steps > 0 {
 		snap.MeanStepMillis = float64(s.stats.stepNanos.Load()) / float64(snap.Steps) / 1e6

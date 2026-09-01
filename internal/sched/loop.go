@@ -235,6 +235,7 @@ func (s *Scheduler) takeSlot() int32 {
 	}
 	slot := s.freeSlots[len(s.freeSlots)-1]
 	s.freeSlots = s.freeSlots[:len(s.freeSlots)-1]
+	s.stats.freeSlots.Store(int64(len(s.freeSlots)))
 	return slot
 }
 
@@ -243,6 +244,7 @@ func (s *Scheduler) releaseSlot(seq *sequence) {
 		return
 	}
 	s.freeSlots = append(s.freeSlots, seq.slot)
+	s.stats.freeSlots.Store(int64(len(s.freeSlots)))
 	// Cleared so that a double release -- which would hand the same slot to two
 	// sequences and quietly give one of them the other's history -- is a bug
 	// that cannot happen rather than one that is unlikely.
