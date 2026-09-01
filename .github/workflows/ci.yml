@@ -154,7 +154,38 @@ jobs:
           # against internal/sched rather than the repository root and every
           # test that needs a worker reports "cannot find the path specified".
           export BRAID_WORKER=$(ls "$GITHUB_WORKSPACE"/build/braid_worker*)
-          go test -p 1 -count=1 -timeout 25m ./internal/...
+
+          # A worker left behind by a cancelled run would hold the card and make
+          # this one look like a memory problem. Nothing usually survives, and
+          # the cost of checking is nothing.
+          taskkill //F //IM braid_worker.exe //T > /dev/null 2>&1 || true
+
+          set +e
+          go test -p 1 -count=1 -timeout 25m ./internal/... 2>&1 | tee "$RUNNER_TEMP/gotest.log"
+          status=${PIPESTATUS[0]}
+          set -e
+
+          # Any FAIL is a failure, whatever the exit code says.
+          if grep -qE '^(FAIL|--- FAIL)' "$RUNNER_TEMP/gotest.log"; then
+            exit 1
+          fi
+
+          # And one specific non-failure that exits non-zero anyway. After the
+          # backend tests -- which start and kill real worker processes --
+          # Windows can hold the test binary's handle past the point go tries to
+          # delete it, and go reports `unlinkat ... Access is denied` and exits
+          # 1 with every package marked ok. It happens on this machine outside
+          # CI too, and it is a cleanup race rather than a result.
+          #
+          # Swallowed narrowly: this branch is only reached when no line began
+          # with FAIL, and only for that message. Anything else still fails.
+          if [ "$status" -ne 0 ]; then
+            if grep -q 'unlinkat.*Access is denied' "$RUNNER_TEMP/gotest.log"; then
+              echo "::warning::every package passed; go could not delete its own test binary"
+            else
+              exit "$status"
+            fi
+          fi
 
       - name: Cached decode agrees with recomputation
         run: |
