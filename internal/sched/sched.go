@@ -276,6 +276,23 @@ func (s *Scheduler) Submit(ctx context.Context, req Request) (<-chan Token, <-ch
 		out:       make(chan Token, req.MaxTokens),
 		done:      make(chan Result, 1),
 		submitted: time.Now(),
+		// -1, because zero is a slot.
+		//
+		// Nothing takes a slot until begin(), and begin() calls finish() before
+		// takeSlot() on both of its rejection paths -- a cancelled context and a
+		// missed MaxWait. finish() releases the slot, releaseSlot() ignores a
+		// negative one, and the zero value is not negative: every request that
+		// died in the queue pushed slot 0 onto the free list without ever having
+		// held it. A client that disconnects while queued is enough, and
+		// api.go passes r.Context(), so under load it happened constantly.
+		//
+		// The free list then held duplicates and handed the same row to several
+		// live sequences. The worker decides a slot is current by comparing
+		// filled[slot] against length-1 and has no notion of *whose* it is, so
+		// two rows at the same length both skipped the refill and read each
+		// other's keys. Silently, and only sometimes -- rows at different
+		// lengths merely thrash refilling instead.
+		slot: -1,
 	}
 
 	select {

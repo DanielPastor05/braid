@@ -1153,6 +1153,57 @@ decode is not exactly a forward at *S*=1, because its attention still reads the
 whole cache. That is about 0.4 ms at a batch of thirty-two against a 2.5 ms
 floor. The table is a ceiling, and a close one.
 
+### The fifth bug, which was not a performance bug
+
+The four above cost throughput. This one cost correctness, it was found by
+reading rather than by measuring, and it had been there since slots were added.
+
+**A request cancelled while it was still in the queue gave back a cache slot it
+had never taken.** `sequence.slot` began at the zero value, and zero is a slot.
+Nothing takes one until `begin()`, and `begin()` calls `finish()` *before*
+`takeSlot()` on both of its rejection paths — a cancelled context and a missed
+`MaxWait`. `finish()` releases, `releaseSlot()` only ignores a negative, and the
+zero value is not negative.
+
+The API layer passes `r.Context()`, which Go cancels when a client disconnects.
+So an ordinary abandoned request was enough, and the free list only ever grew.
+Five of them:
+
+```
+free slots: 4 before, 9 after
+free list now holds: [3 2 1 0 0 0 0 0 0]
+```
+
+`takeSlot` pops from the end, so the next six sequences admitted all got slot 0.
+
+**Sharing a slot is not a slowdown, it is wrong output.** The worker decides a
+slot is current by comparing `filled[slot]` against `length-1`, and it has no
+notion of *whose* row it is. Two sequences at the same length both skip the
+refill and read each other's keys. At different lengths they merely thrash,
+refilling the same row over and over — which is the same bug presenting as a
+performance problem instead of a correctness one, and is why it could have lived
+here indefinitely.
+
+It breaks the property this whole page is built on. Isolation is supposed to be
+structural, and the comment on `releaseSlot` says a double release "is a bug that
+cannot happen rather than one that is unlikely". The defence was written
+correctly and the initialiser walked around it.
+
+The fix is `slot: -1` at construction. The regression test asserts the invariant
+that actually matters — **no slot appears in the free list twice** — rather than
+the count, because a list of nine distinct slots would pass a length check and
+still be wrong. It covers both rejection paths, and it was confirmed to fail
+before the fix rather than only to pass after it.
+
+```bash
+go test -run TestTheFreeListNeverHoldsASlotTwice -count=2 ./internal/sched/
+```
+
+Worth stating plainly: **no existing test caught this.** The invariance test
+never cancels a queued request, and the slot-accounting test checks that slots
+come back, not that they are not invented. Both were right about what they
+measured.
+
 ---
 
 ## Against PyTorch, on the same card
