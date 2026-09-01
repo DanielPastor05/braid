@@ -1,3 +1,23 @@
+// Package kvmem sizes the key/value cache from a memory budget.
+//
+// The scheduler used to admit requests by counting them, which is a fiction the
+// queue can afford only while the cache does not exist: without one a sequence
+// occupies a slot and nothing else. With a cache it occupies memory, and memory
+// is the thing that runs out. At the model's 1024-id context, sixty-four
+// sequences of keys and values across six blocks of six heads is 1.2 GB on a
+// card with 8 -- so how many sequences may hold a cache at once is arithmetic
+// about geometry rather than a constant somebody tuned.
+//
+// That arithmetic is all this package does, and it is what `-kv-budget-mb`
+// asks. Sequences past the answer are served by recomputing.
+//
+// This package also held a block allocator, three eviction policies and a
+// two-mode admission test -- the design for a paged cache, tested and called by
+// nothing, because the worker's cache is slots x full context and nothing is
+// ever allocated per block. They live on the `design/paged-attention` branch
+// now. Using them means paged attention, which is a kernel this project does
+// not have; keeping them here meant a package whose larger half no caller could
+// reach.
 package kvmem
 
 import "fmt"
@@ -87,43 +107,3 @@ func (b Budget) Sequences() int {
 func (b Budget) blocksForContext() int {
 	return (b.Context + b.BlockSize - 1) / b.BlockSize
 }
-
-// Admit is the question the scheduler asks instead of counting requests.
-//
-// `reserved` is what the sequence has now; `most` is the most it could ever
-// need, which for a generation is its prompt plus the tokens it asked for,
-// capped at the context. The two differ because a request is admitted on what it
-// *might* use and grows into what it does.
-type Admission struct {
-	pool *Pool
-	// pessimistic reserves each sequence's whole possible length up front.
-	// Optimistic admission -- reserve what it has, grow as it goes -- fits more
-	// sequences and can strand one mid-generation with nowhere to grow, which
-	// costs it everything it has already computed.
-	pessimistic bool
-}
-
-func NewAdmission(pool *Pool, pessimistic bool) *Admission {
-	return &Admission{pool: pool, pessimistic: pessimistic}
-}
-
-// Wants is the positions a request should be charged for.
-func (a *Admission) Wants(promptLen, maxTokens, context int) int {
-	most := promptLen + maxTokens
-	if most > context {
-		most = context
-	}
-	if a.pessimistic {
-		return most
-	}
-	return promptLen
-}
-
-// Fits reports whether the request could be admitted now.
-func (a *Admission) Fits(promptLen, maxTokens, context int) bool {
-	return a.pool.Fits(a.Wants(promptLen, maxTokens, context))
-}
-
-// Pool is the allocator underneath, for the scheduler to reserve and release
-// against as sequences grow and finish.
-func (a *Admission) Pool() *Pool { return a.pool }

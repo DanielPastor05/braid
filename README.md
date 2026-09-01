@@ -981,8 +981,8 @@ Two things fall out of that, and both are design decisions rather than
 observations:
 
 **The capacity has to be rounded to a block, not to the context.** That is what
-`internal/kvmem` is for, and it was an assertion in this file until this table
-existed. Sixteen-position blocks put a 29-position row in 48 and a 453-position
+the block allocator on `design/paged-attention` is for, and it was an assertion
+in this file until this table existed. Sixteen-position blocks put a 29-position row in 48 and a 453-position
 row in 464.
 
 **At a batch of one the server should not use the cache at all.** 0.9x is not
@@ -1123,15 +1123,21 @@ created -- a smaller budget, or a longer context -- rather than found. The same
 arithmetic at a real model's width and a 32k context binds hard and needs no
 help.
 
-**The block allocator and the three eviction policies are not called by
-anything.** They are the design for a paged cache, tested and unused, and the
-honest reason they are still here rather than deleted is that the worker's cache
-is slots x full context: nothing is ever allocated per block, so nothing is ever
-evicted. Wiring them in means paged attention, which is a kernel this project
-does not have.
+**The block allocator and the three eviction policies have moved to a branch.**
+For a while this section said they were here, tested and called by nothing, and
+that saying so was better than deleting them. It was better than hiding them and
+it was not a resolution: the worker's cache is slots × full context, so nothing
+is ever allocated per block and nothing is ever evicted. Using them means paged
+attention, which is a kernel this project does not have.
+
+They live on
+[`design/paged-attention`](https://github.com/DanielPastor05/braid/tree/design/paged-attention),
+with their tests, and the tables above are what those tests measure. On `main`
+the package is the budget arithmetic and nothing else, which is the part with a
+caller.
 
 ```bash
-go test ./internal/kvmem/ -v
+git checkout design/paged-attention && go test ./internal/kvmem/ -v
 ```
 
 ```bash
@@ -1594,22 +1600,21 @@ server whose numbers end up pasted somewhere.
 
 Ordered by what a measurement says.
 
-1. **Per-row cache offsets — which is to say, paged attention.** The cache
-   itself is [built, merged and unusable here](#what-a-kv-cache-is-worth-here-and-why-this-server-cannot-use-one):
-   one write offset is shared by the whole batch, and only 2% of steps have every
-   row at the same position. Each sequence needs its cache growing at its own
-   rate, in blocks, with a table saying where each row's blocks are.
+1. **Per-row cache offsets — which is to say, paged attention.** The
+   slot-indexed cache is [wired in and worth 1.98x](#it-is-wired-in-and-it-is-worth-198x);
+   this is the next thing, not that one. What it still does not have is a cache
+   that grows at each sequence's own rate: a slot is allocated at the full
+   context whether the row holds twenty-nine positions or nine hundred, and
+   [that allocation is what the cached step costs](#the-cache-is-built-and-what-it-costs-is-the-room-you-gave-it).
+   Blocks, with a table saying where each row's blocks are, is what fixes it.
 
-   The Go half of that exists — `internal/kvmem` is a block allocator with
-   budgets, eviction policies and
-   [measured fragmentation](#what-the-context-is-for-and-what-it-costs) — and it
-   is **not wired into the serving path**. What it waits on is the worker-side
-   cache, which waits on three engine pull requests: [#7](https://github.com/DanielPastor05/cpp-ai-engine/pull/7),
-   [#8](https://github.com/DanielPastor05/cpp-ai-engine/pull/8),
-   [#9](https://github.com/DanielPastor05/cpp-ai-engine/pull/9), stacked in that
-   order, all green, none merged. The submodule here deliberately points at
-   merged `main` instead, so this repository builds from code that exists rather
-   than from a branch.
+   The Go half of that is written and is
+   [on a branch](https://github.com/DanielPastor05/braid/tree/design/paged-attention)
+   rather than in the serving path — a block allocator, three eviction policies
+   and [measured fragmentation](#what-the-context-is-for-and-what-it-costs) —
+   because the worker side needs a kernel that attends over a block table, and
+   this engine has none. Code that no caller can reach is a claim about the
+   future, and it reads better as a branch than as a package.
 
    The measurement that says to do it is now
    [the 900-token collapse](#ask-for-nine-hundred-tokens-and-the-server-falls-over)
