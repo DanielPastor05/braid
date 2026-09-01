@@ -676,10 +676,60 @@ sizes rather than execution paths:
 | 8 | 21.26 ms | 2.30 ms | 9.3x |
 | 32 | 83.83 ms | 2.52 ms | 33.3x |
 
-**The floor is the same ~2.4 ms at every batch size.** It is 177 kernel launches,
-and a launch does not care how much work it carries: 2.4 ms over 177 is 13 µs
-each. A cache makes the kernels smaller, not fewer. So the win is 33x to a full
-batch, 2.7x to a single client, and 256x to nobody.
+**The floor is the same ~2.4 ms at every batch size.** That much survived a
+profiler. The explanation this file gave for it did not.
+
+It said the floor was 177 kernel launches at 13 µs each. Nsight Systems on that
+exact point — batch 32, window 1 — puts **2.13 ms of the step inside the
+kernels**, and the median gap between one kernel finishing and the next starting
+at **1.95 µs**, the same at window 1 as at window 464. At 165 launches a step
+that is 0.32 ms of gap: **13% of the floor, not all of it.** The GPU is busy,
+not waiting to be asked.
+
+The 13 µs is in the trace, and it is the wrong quantity. It is the mean duration
+of the `cudaLaunchKernel` *call* — the CPU blocked behind a queue it cannot get
+ahead of — and it equals step-time-over-launches precisely *because* the GPU is
+the bottleneck. Dividing the floor by the launch count recovers it as an
+identity, which is why the arithmetic looked like a confirmation of the thing it
+cannot distinguish.
+
+What costs 2.13 ms is 49 matmuls at ~38 µs each. They are not badly dispatched:
+a decode step's rows are batch × window, `Auto` resolves `rows < 128` to the
+tiled kernel, and forcing either alternative at that shape is **twice as slow**
+— 4.6 ms register-tiled and 4.1 ms vectorized against 2.4 ms tiled. The floor is
+165 kernels too small to fill the card, not the cost of asking for them.
+
+The conclusion is unchanged: a cache makes the kernels smaller, not fewer, so
+the win is 33x to a full batch, 2.7x to a single client, and 256x to nobody.
+What changes is the remedy. Launch-bound would point at CUDA graphs, which can
+recover 0.32 ms and no more; kernel-bound at small shapes points at fusing them.
+
+Nsight counts 165 `cudaLaunchKernel` calls a step where the engine's own counter
+reports 177. The twelve are not memsets and not failed launches, and they are
+unexplained. The tables below still print the engine's number, because that is
+what the column has always meant.
+
+**Reproducing it.** The benchmark takes an optional batch and window so it runs
+one point instead of the sweep — a profiler attributes kernels to a process, and
+a trace of forty-four configurations cannot say what one step costs. A fifth
+argument forces the matmul kernel, which is what makes "the tiled kernel is the
+right choice here" a measurement rather than a reading of the dispatch rule.
+
+```bash
+nsys profile --trace=cuda -o floor ./build/braid_bench_decode models/charlm 100 32 1
+```
+
+```bash
+nsys stats --report cuda_gpu_kern_sum --report cuda_api_sum floor.nsys-rep
+```
+
+```bash
+./build/braid_bench_decode models/charlm 100 32 1 vectorized
+```
+
+Set `ENGINE_CUDA_MIN_FLOPS`, `ENGINE_CUDA_MIN_ELEMENTS` and
+`ENGINE_CUDA_MIN_LAYERNORM` to 1 first, or a window of one falls below the
+dispatch floors and the profile measures the CPU path instead.
 
 ### Then: that ceiling was measured against a baseline that no longer exists
 
@@ -936,9 +986,9 @@ existed. Sixteen-position blocks put a 29-position row in 48 and a 453-position
 row in 464.
 
 **At a batch of one the server should not use the cache at all.** 0.9x is not
-noise, it is the [~2.4 ms floor of 177 kernel
-launches](#first-what-it-could-win): a step that short is already launch-bound,
-and a cache makes the kernels smaller rather than fewer while adding a gather.
+noise, it is the [~2.4 ms floor](#first-what-it-could-win): a step that short is
+already spending 2.13 ms inside kernels too small to fill the card, and a cache
+makes those kernels smaller rather than fewer while adding a gather.
 The cache is an optimisation for loaded servers, which is the opposite of how it
 is usually introduced.
 

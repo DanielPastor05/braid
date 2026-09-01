@@ -24,10 +24,18 @@
 //       8 | 21.3 ms | 2.30 ms |    9.3x
 //      32 | 83.8 ms | 2.52 ms |   33.3x
 //
-// The floor is the same ~2.4 ms at every batch size, because it is 177 kernel
-// launches and a launch does not care how much work it carries: 2.4 ms / 177 is
-// 13 microseconds each. A cache makes the kernels smaller, not fewer, so the
-// naive 256x is not available at any batch size.
+// The floor is the same ~2.4 ms at every batch size, and this comment used to
+// say that was 177 kernel launches at 13 microseconds each. A profiler says
+// otherwise: 2.13 ms of the step is inside the kernels, and the median gap
+// between one and the next is 1.95 us -- 0.32 ms across a step, 13% of the
+// floor. What costs the 2.13 ms is 49 matmuls at ~38 us each, too small to fill
+// the card, and they are not badly dispatched: forcing either alternative at
+// that shape is twice as slow. A cache makes the kernels smaller, not fewer, so
+// the naive 256x is not available at any batch size -- which is the conclusion
+// the wrong mechanism happened to reach.
+//
+//   nsys profile --trace=cuda -o floor braid_bench_decode <prefix> 100 32 1
+//   nsys stats --report cuda_gpu_kern_sum floor.nsys-rep
 //
 // Run it with the engine's *own* dispatch defaults and the win is smaller still
 // -- 1.6x at a batch of one -- because a narrow window falls below the floors
@@ -40,7 +48,7 @@
 // 256 cached keys this does not. That read is about 0.4 ms at a batch of 32
 // against a 2.5 ms floor, so the numbers above are a ceiling and a close one.
 //
-//   braid_bench_decode <model-prefix> [repeats]
+//   braid_bench_decode <model-prefix> [repeats] [batch width] [matmul-kernel]
 //
 // ENGINE_CUDA_MIN_FLOPS, ENGINE_CUDA_MIN_ELEMENTS and ENGINE_CUDA_MIN_LAYERNORM
 // are read by the engine at start; set them to 1 for the path-consistent sweep.
@@ -124,7 +132,7 @@ struct Row {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "usage: braid_bench_decode <model-prefix> [repeats]\n";
+        std::cerr << "usage: braid_bench_decode <model-prefix> [repeats] [batch width] [matmul-kernel]\n";
         return 2;
     }
     const std::string prefix = argv[1];
@@ -133,6 +141,47 @@ int main(int argc, char** argv) {
         std::cerr << "repeats must be at least 1\n";
         return 2;
     }
+
+    // One point instead of the sweep, so a profiler has something to attribute.
+    //
+    // Nsight assigns kernels to a process, not to a row of a table: a trace of
+    // the whole sweep holds forty-four configurations mixed together and cannot
+    // say what one step costs. Given a batch and a width this runs that point
+    // and stops, which is what turns "177 launches" from a counter this program
+    // prints about itself into a claim something else can check.
+    const std::size_t only_batch = argc > 3 ? static_cast<std::size_t>(std::atoi(argv[3])) : 0;
+    const std::size_t only_width = argc > 4 ? static_cast<std::size_t>(std::atoi(argv[4])) : 0;
+    const bool one_point = only_batch > 0 && only_width > 0;
+
+    // Which matmul kernel, because the floor turned out to be one of them.
+    //
+    // `Auto` resolves on `rows < 128 || cols < 128`, and a decode step's rows
+    // are batch x window -- so at any window this server actually decodes at,
+    // all forty-nine matmuls take the tiled kernel. Naming the kernel is what
+    // turns "the floor is that choice" into something with a measurement under
+    // it. The tensor-core variants are deliberately not offered: they trade
+    // three digits of precision, which would make the comparison a different
+    // one.
+    engine::cuda::MatmulKernel forced = engine::cuda::MatmulKernel::Auto;
+    if (argc > 5) {
+        const std::string want = argv[5];
+        if (want == "auto") {
+            forced = engine::cuda::MatmulKernel::Auto;
+        } else if (want == "naive") {
+            forced = engine::cuda::MatmulKernel::Naive;
+        } else if (want == "tiled") {
+            forced = engine::cuda::MatmulKernel::Tiled;
+        } else if (want == "register") {
+            forced = engine::cuda::MatmulKernel::RegisterTiled;
+        } else if (want == "vectorized") {
+            forced = engine::cuda::MatmulKernel::Vectorized;
+        } else {
+            std::cerr << "unknown matmul kernel: " << want
+                      << " (auto, naive, tiled, register, vectorized)\n";
+            return 2;
+        }
+    }
+    engine::cuda::set_matmul_kernel(forced);
 
     const std::string alphabet = read_file(prefix + ".vocab");
     if (alphabet.empty()) {
@@ -152,22 +201,29 @@ int main(int argc, char** argv) {
     model.train(false);
 
     std::cerr << "braid_bench_decode: vocab " << vocab.size() << ", cuda "
-              << (engine::cuda::available() ? "yes" : "no") << ", " << repeats << " repeats\n";
+              << (engine::cuda::available() ? "yes" : "no") << ", " << repeats
+              << " repeats, matmul " << engine::cuda::matmul_kernel_name(forced) << "\n";
 
     engine::autograd::NoGradGuard no_grad;
 
     // Out to the full 1024-id context. The list stopped at 256 when the model
     // did, which made the last column a ratio against a width the server can now
     // exceed by four times.
-    const std::size_t widths[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
+    std::vector<std::size_t> widths = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
+    std::vector<std::size_t> batches = {1, 8, 16, 32};
+    if (one_point) {
+        widths = {only_width};
+        batches = {only_batch};
+    }
 
     // "vs full" rather than "vs 256": the ratio divides by the last width in the
     // sweep, so it followed the context out to 1024 on its own and the header
-    // did not.
+    // did not. With one point it divides by itself and reads 1.0x, which is the
+    // honest answer to a ratio nobody asked for.
     std::cout << "| batch | window | forward ms | kernels | to_device | to_host | vs full |\n";
     std::cout << "|---|---|---|---|---|---|---|\n";
 
-    for (std::size_t n : {std::size_t{1}, std::size_t{8}, std::size_t{16}, std::size_t{32}}) {
+    for (std::size_t n : batches) {
         std::vector<Row> rows;
         for (std::size_t seq : widths) {
             // The window's positional slice and its mask, built once. The worker
@@ -226,6 +282,11 @@ int main(int argc, char** argv) {
         std::cout << "|---|---|---|---|---|---|---|\n";
         std::cout.flush();
     }
+
+    // Under a profiler the second table would be forty-eight more
+    // configurations in the same trace, which is the thing the one-point mode
+    // exists to avoid.
+    if (one_point) return 0;
 
     // ---- what the cache actually wins -----------------------------------
     //
