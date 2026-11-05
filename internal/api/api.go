@@ -42,11 +42,31 @@ func (s *Server) Routes() *http.ServeMux {
 	return mux
 }
 
+// Handler is Routes behind a guard, which is what a listener should serve.
+//
+// /healthz stays in front of the guard. A liveness probe is sent by whatever
+// supervises the process, which holds no token, and every container here has a
+// token, because the server refuses to listen on 0.0.0.0 without one. Behind the
+// guard the probe could only ever see 401, and a server that a rate limit has
+// answered 429 is not a dead one. It costs nothing to leave open: the answer is a
+// constant, and it runs no model.
+func (s *Server) Handler(g *Guard) http.Handler {
+	routes := s.Routes()
+	root := http.NewServeMux()
+	root.Handle("GET /healthz", routes)
+	root.Handle("/", g.Wrap(routes))
+	return root
+}
+
 type generateRequest struct {
-	Prompt      string  `json:"prompt"`
-	MaxTokens   int     `json:"max_tokens"`
-	Temperature float32 `json:"temperature"`
-	Seed        uint64  `json:"seed"`
+	Prompt    string `json:"prompt"`
+	MaxTokens int    `json:"max_tokens"`
+	// A pointer so that leaving it out and asking for zero stay different things.
+	// The default applies to the first; the second is a request the sampler cannot
+	// honour, and answering it at 0.8 hands back random text to somebody who asked
+	// for none.
+	Temperature *float32 `json:"temperature"`
+	Seed        uint64   `json:"seed"`
 
 	// MaxWaitMS bounds queue time. Zero means the request waits as long as it
 	// takes; a client with a deadline of its own should say so here, because a
@@ -68,8 +88,9 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("malformed request body: %v", err))
 		return
 	}
-	if req.Temperature == 0 {
-		req.Temperature = 0.8
+	temperature := float32(0.8)
+	if req.Temperature != nil {
+		temperature = *req.Temperature
 	}
 	if req.MaxTokens == 0 {
 		req.MaxTokens = 200
@@ -78,7 +99,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 	tokens, done, err := s.sched.Submit(r.Context(), sched.Request{
 		Prompt:      req.Prompt,
 		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
+		Temperature: temperature,
 		Seed:        req.Seed,
 		MaxWait:     time.Duration(req.MaxWaitMS) * time.Millisecond,
 	})

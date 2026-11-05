@@ -172,6 +172,8 @@ func TestNonsenseIsRejectedBeforeTheStream(t *testing.T) {
 
 	for _, body := range []string{
 		`{"prompt":"x","max_tokens":10,"temperature":-1}`, // temperature must be positive
+		`{"prompt":"x","max_tokens":10,"temperature":0}`,  // asking for zero is not leaving it out
+		`{"prompt":"x","max_tokens":10,"max_wait_ms":-1}`, // a deadline already missed is not no deadline
 		`{"prompt":"x","max_tokens":9999}`,                // over MaxTokensLimit
 		`not json at all`,
 	} {
@@ -180,6 +182,65 @@ func TestNonsenseIsRejectedBeforeTheStream(t *testing.T) {
 			t.Errorf("%s got status %d, wanted 400", body, resp.StatusCode)
 		}
 		resp.Body.Close()
+	}
+}
+
+// TestLeavingTheTemperatureOutUsesTheDefault is the other half of refusing zero:
+// a request that does not mention it must still work.
+func TestLeavingTheTemperatureOutUsesTheDefault(t *testing.T) {
+	srv := serve(t, sched.Config{MaxBatch: 4, QueueDepth: 8, MaxTokensLimit: 32}, nil)
+
+	resp := post(t, srv, `{"prompt":"x","max_tokens":2}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("a request with no temperature got %d", resp.StatusCode)
+	}
+}
+
+// TestHealthIsOutsideTheGuardAndNothingElseIs covers what a listener serves, as
+// opposed to what Routes returns. The image cannot start without a token, so a
+// probe behind the guard could only ever report that it was unauthorised.
+func TestHealthIsOutsideTheGuardAndNothingElseIs(t *testing.T) {
+	mock := backend.NewMock()
+	mock.Base = 0
+	mock.PerSeq = 0
+	s, err := sched.New(mock, sched.Config{MaxBatch: 4, QueueDepth: 8, MaxTokensLimit: 32})
+	if err != nil {
+		t.Fatalf("scheduler: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	server := New(s, mock, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(server.Handler(NewGuard("s3cret", 1, 1)))
+	t.Cleanup(srv.Close)
+
+	// More than the rate limit's burst, because a busy server is not a dead one.
+	for i := range 5 {
+		resp, err := srv.Client().Get(srv.URL + "/healthz")
+		if err != nil {
+			t.Fatalf("healthz: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("probe %d got %d with no token", i, resp.StatusCode)
+		}
+	}
+
+	for _, path := range []string{"/stats", "/metrics"} {
+		resp, err := srv.Client().Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			t.Errorf("%s answered with no token", path)
+		}
+	}
+
+	resp := post(t, srv, `{"prompt":"x","max_tokens":2}`)
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Error("/v1/generate answered with no token")
 	}
 }
 

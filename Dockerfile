@@ -11,7 +11,7 @@
 # Container Toolkit on the host:
 #
 #   docker build -t braid .
-#   docker run --gpus all -p 8080:8080 braid
+#   docker run --gpus all -p 8080:8080 braid -auth-token "$TOKEN"
 #
 # Without --gpus the worker starts, reports "cuda no", and serves from the CPU
 # at a speed that is not worth measuring. That is a real fallback rather than a
@@ -22,7 +22,7 @@
 # shipping a build artifact with a copy of two repositories' source inside it.
 # Mount it:
 #
-#   docker run --gpus all -v "$PWD/models:/models:ro" -p 8080:8080 braid
+#   docker run --gpus all -v "$PWD/models:/models:ro" -p 8080:8080 braid -auth-token "$TOKEN"
 #
 # ---------------------------------------------------------------------------
 
@@ -93,12 +93,17 @@ EXPOSE 8080
 # behaviour this project chose over a README sentence asking people to be
 # careful. In a container that refusal is the useful default: an image that
 # listens on every interface unauthenticated because it was convenient is how
-# this goes wrong. Pass -auth-token, or override the command with -addr
-# 127.0.0.1:8080 and reach it another way.
-ENTRYPOINT ["braid"]
-CMD ["-addr", "0.0.0.0:8080", "-model", "/models/charlm", "-worker", "/usr/local/bin/braid_worker"]
+# this goes wrong. Pass -auth-token, or pass -addr 127.0.0.1:8080 and reach it
+# another way.
+#
+# All of it in ENTRYPOINT and none in CMD, because anything after the image name
+# in `docker run` replaces CMD whole. With these flags in CMD, passing -auth-token
+# dropped -worker along with the rest, and the server started on its mock backend.
+# Arguments add to this list now, and a later flag wins over an earlier one.
+ENTRYPOINT ["braid", "-addr", "0.0.0.0:8080", "-model", "/models/charlm", "-worker", "/usr/local/bin/braid_worker"]
 
 # healthz is the liveness answer and it is deliberately not a generation: a
-# check that ran the model would report a busy server as a dead one.
+# check that ran the model would report a busy server as a dead one. It is also
+# outside the guard, since this image never runs without a token.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
-    CMD ["/usr/local/bin/braidload", "-addr", "http://127.0.0.1:8080", "-requests", "0"]
+    CMD ["/usr/local/bin/braidload", "-health", "-addr", "http://127.0.0.1:8080"]

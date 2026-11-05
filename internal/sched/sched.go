@@ -266,6 +266,11 @@ func (s *Scheduler) Submit(ctx context.Context, req Request) (<-chan Token, <-ch
 	if req.Temperature <= 0 {
 		return nil, nil, fmt.Errorf("sched: Temperature must be above zero, got %v", req.Temperature)
 	}
+	// Zero means no deadline, and begin() only looks at a positive one, so a
+	// negative value would otherwise quietly turn into waiting for ever.
+	if req.MaxWait < 0 {
+		return nil, nil, fmt.Errorf("sched: MaxWait must not be negative, got %v", req.MaxWait)
+	}
 
 	// Only the last SeqLen ids of a prompt can ever be read -- window() takes
 	// the tail and the model has no other context -- so keeping the rest is a

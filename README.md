@@ -1689,6 +1689,21 @@ says which one you got. Without `-auth-token` the server refuses to listen on
 listens on every interface unauthenticated because it was convenient is how this
 goes wrong.
 
+**That command used to run the mock.** Anything after the image name replaces
+`CMD`, and `-worker` lived in `CMD`, so passing `-auth-token` dropped it: the
+server started on its mock backend and answered with invented text at excellent
+latencies, with one warning in the log. The flags are in `ENTRYPOINT` now and
+arguments add to them. The `HEALTHCHECK` had a bug of its own, running the load
+harness with `-requests 0`, which exits 1 before asking anything, so every
+container reported `unhealthy`. It runs `braidload -health` now, and `/healthz` is
+the one route outside the guard, because a probe holds no token and the answer is
+a constant.
+
+A wrong token also costs something now. The rate limit used to sit behind the token
+check and is off by default, so guesses were free; there is a separate budget of
+ten failed attempts per address, refilling one every five seconds, that exists
+whenever there is a token. `braidload -auth-token` measures a server that has one.
+
 **CI builds the Go stage on every push and not the CUDA one**, because that stage
 pulls a five-gigabyte base and compiles kernels for four architectures. The GPU
 job would build it, and does not: the machine that runs it has the CUDA toolkit
