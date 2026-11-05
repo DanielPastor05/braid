@@ -68,7 +68,7 @@ func main() {
 		// two are the control: without a token the server refuses to listen
 		// anywhere but loopback, so exposing it is now a thing you have to mean.
 		authToken = flag.String("auth-token", "",
-			"bearer token required on every request; without one the server binds loopback only")
+			"bearer token required on every request but /healthz; without one the server binds loopback only")
 		rate = flag.Float64("rate", 0,
 			"requests per second allowed per client address, 0 for no limit")
 		burst = flag.Int("burst", 16, "how many requests a client may make back to back")
@@ -223,7 +223,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: guard.Wrap(api.New(scheduler, be, log).Routes()),
+		Handler: api.New(scheduler, be, log).Handler(guard),
 		// No WriteTimeout: a generation is a long-lived stream and a deadline
 		// on the whole response would cut it off mid-sentence. The request
 		// context, MaxTokens and MaxWait are what bound a request here.
@@ -255,8 +255,9 @@ func main() {
 	// The guard's bucket map is keyed by client address, so on a reachable
 	// interface it grows with every address that has ever connected -- memory
 	// exhaustion at one packet per key. A full bucket is indistinguishable from
-	// one that does not exist, so the sweep is free to forget them.
-	if *rate > 0 {
+	// one that does not exist, so the sweep is free to forget them. A token brings
+	// the failed-attempt buckets with it, whatever -rate says.
+	if *rate > 0 || *authToken != "" {
 		go func() {
 			tick := time.NewTicker(time.Minute)
 			defer tick.Stop()

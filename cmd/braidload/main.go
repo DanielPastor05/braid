@@ -121,11 +121,27 @@ func main() {
 			"time to first token a request must beat to count towards goodput")
 		repeat = flag.Int("repeat", 1,
 			"how many times to measure each level; above one the table reports a median and a range")
+		authToken = flag.String("auth-token", "", "bearer token, for a server started with -auth-token")
+		// For the image's HEALTHCHECK, which has no shell and no curl to do this
+		// with. It used to run this harness with -requests 0, and -requests below
+		// the first concurrency level is an error, so the check could never pass.
+		health = flag.Bool("health", false, "ask /healthz once and exit 0 if the server answered")
 	)
 	flag.Parse()
 	maxWaitMS = *waitFlag
 
+	if *health {
+		if err := checkHealth(&http.Client{Timeout: 2 * time.Second}, *addr); err != nil {
+			fmt.Fprintf(os.Stderr, "unhealthy: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	client := &http.Client{Timeout: 10 * time.Minute}
+	if *authToken != "" {
+		client.Transport = bearer{token: *authToken, next: http.DefaultTransport}
+	}
 
 	// Asked once, before anything is measured: a table is worth less to whoever
 	// reads it later if it does not say what produced it.
@@ -490,7 +506,42 @@ func readStats(client *http.Client, addr string) (stats, error) {
 	}
 	defer resp.Body.Close()
 
+	// Before decoding. An error body is valid JSON that fills in nothing, so a 401
+	// used to read as a server with all its counters at zero.
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return stats{}, fmt.Errorf("http %d from /stats: pass -auth-token", resp.StatusCode)
+		}
+		return stats{}, fmt.Errorf("http %d from /stats", resp.StatusCode)
+	}
+
 	var s stats
 	err = json.NewDecoder(resp.Body).Decode(&s)
 	return s, err
+}
+
+// checkHealth asks the liveness endpoint once.
+func checkHealth(client *http.Client, addr string) error {
+	resp, err := client.Get(addr + "/healthz")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("http %d from /healthz", resp.StatusCode)
+	}
+	return nil
+}
+
+// bearer adds the token to every request the harness makes, so that the sweep,
+// the open loop and the stats reads cannot disagree about whether they have one.
+type bearer struct {
+	token string
+	next  http.RoundTripper
+}
+
+func (b bearer) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Set("Authorization", "Bearer "+b.token)
+	return b.next.RoundTrip(r)
 }

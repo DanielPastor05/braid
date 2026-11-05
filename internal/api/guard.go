@@ -28,7 +28,28 @@ type Guard struct {
 
 	mu      sync.Mutex
 	buckets map[string]*bucket
+
+	// failures is charged only by requests without a valid token, and it exists
+	// whatever -rate says. See authFailureRate.
+	failures map[string]*bucket
 }
+
+// How many wrong guesses at the token one client address gets.
+//
+// The general limit cannot do this job. It is off by default, and it was also
+// behind the token check, so a wrong token was answered before anything had been
+// spent: a guesser could try tokens as fast as the network allowed, at any -rate.
+// This budget is separate and always on when there is a token, because guessing
+// is not traffic a server should ever be tolerating, and tight, because nobody
+// holding the right token ever spends from it.
+//
+// Ten, then one every five seconds. A client configured with an old token sees a
+// few 401s and then 429s, which is the same message and costs it nothing it had.
+const (
+	authFailureBurst      = 10
+	authFailureRate       = 0.2
+	authFailureRetryAfter = "5"
+)
 
 // bucket is one client's allowance, as a token bucket rather than a window.
 //
@@ -45,26 +66,44 @@ func NewGuard(token string, rate float64, burst int) *Guard {
 		burst = 1
 	}
 	return &Guard{
-		token:   token,
-		rate:    rate,
-		burst:   float64(burst),
-		buckets: make(map[string]*bucket),
+		token:    token,
+		rate:     rate,
+		burst:    float64(burst),
+		buckets:  make(map[string]*bucket),
+		failures: make(map[string]*bucket),
 	}
 }
 
 // Wrap puts the guard in front of a handler.
 func (g *Guard) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key, now := clientKey(r), time.Now()
+
+		// Before the token is looked at, so that a request carrying the wrong one
+		// costs what any other request costs. The other order answered every wrong
+		// guess for free.
+		if !g.allow(key, now) {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusTooManyRequests, "too many requests from this client")
+			return
+		}
+
+		// Also before the comparison, and for the right token too. If the right
+		// token still got through, an exhausted budget would answer 429 to every
+		// wrong guess and 200 to the correct one, which is not a limit on guessing
+		// at all.
+		if !g.mayGuess(key, now) {
+			w.Header().Set("Retry-After", authFailureRetryAfter)
+			writeError(w, http.StatusTooManyRequests, "too many failed attempts from this client")
+			return
+		}
+
 		if !g.authorised(r) {
+			g.chargeGuess(key, now)
 			// No detail about why. A 401 that distinguishes "no token" from
 			// "wrong token" tells somebody probing which half to work on.
 			w.Header().Set("WWW-Authenticate", `Bearer realm="braid"`)
 			writeError(w, http.StatusUnauthorized, "unauthorised")
-			return
-		}
-		if !g.allow(clientKey(r), time.Now()) {
-			w.Header().Set("Retry-After", "1")
-			writeError(w, http.StatusTooManyRequests, "too many requests from this client")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -102,11 +141,7 @@ func (g *Guard) allow(key string, now time.Time) bool {
 		b = &bucket{tokens: g.burst, last: now}
 		g.buckets[key] = b
 	} else {
-		elapsed := now.Sub(b.last).Seconds()
-		if elapsed > 0 {
-			b.tokens = min(g.burst, b.tokens+elapsed*g.rate)
-			b.last = now
-		}
+		b.refill(now, g.rate, g.burst)
 	}
 
 	if b.tokens < 1 {
@@ -114,6 +149,49 @@ func (g *Guard) allow(key string, now time.Time) bool {
 	}
 	b.tokens--
 	return true
+}
+
+func (b *bucket) refill(now time.Time, rate, burst float64) {
+	elapsed := now.Sub(b.last).Seconds()
+	if elapsed > 0 {
+		b.tokens = min(burst, b.tokens+elapsed*rate)
+		b.last = now
+	}
+}
+
+// mayGuess reports whether a client still has failed attempts to spend. It does
+// not spend one, because whether this attempt fails is not known yet, and it
+// creates nothing: a client that has never failed has no entry and should not
+// get one for presenting the right token.
+func (g *Guard) mayGuess(key string, now time.Time) bool {
+	if g.token == "" {
+		return true
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	b, seen := g.failures[key]
+	if !seen {
+		return true
+	}
+	b.refill(now, authFailureRate, authFailureBurst)
+	return b.tokens >= 1
+}
+
+// chargeGuess records one failed attempt.
+func (g *Guard) chargeGuess(key string, now time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	b, seen := g.failures[key]
+	if !seen {
+		b = &bucket{tokens: authFailureBurst, last: now}
+		g.failures[key] = b
+	} else {
+		b.refill(now, authFailureRate, authFailureBurst)
+	}
+	b.tokens--
 }
 
 // Sweep drops buckets nobody has used for a while.
@@ -126,8 +204,13 @@ func (g *Guard) Sweep(now time.Time, idle time.Duration) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	return forget(g.buckets, now, idle, g.rate, g.burst) +
+		forget(g.failures, now, idle, authFailureRate, authFailureBurst)
+}
+
+func forget(buckets map[string]*bucket, now time.Time, idle time.Duration, rate, burst float64) int {
 	dropped := 0
-	for key, b := range g.buckets {
+	for key, b := range buckets {
 		elapsed := now.Sub(b.last)
 		if elapsed <= idle {
 			continue
@@ -137,8 +220,8 @@ func (g *Guard) Sweep(now time.Time, idle time.Duration) int {
 		// and then went quiet for an hour is never forgotten -- which is the
 		// leak this exists to close, kept alive by the clients most likely to
 		// have caused it.
-		if b.tokens+elapsed.Seconds()*g.rate >= g.burst {
-			delete(g.buckets, key)
+		if b.tokens+elapsed.Seconds()*rate >= burst {
+			delete(buckets, key)
 			dropped++
 		}
 	}

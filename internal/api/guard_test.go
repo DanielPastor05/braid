@@ -195,6 +195,80 @@ func TestTheRateLimitSurfacesAsFourTwentyNine(t *testing.T) {
 	}
 }
 
+// TestGuessingTheTokenRunsOutEvenWithNoRateSet is the property the failure budget
+// exists for. -rate is off by default, so this is the configuration a guesser
+// actually meets.
+func TestGuessingTheTokenRunsOutEvenWithNoRateSet(t *testing.T) {
+	h := NewGuard("s3cret", 0, 0).Wrap(okHandler())
+
+	for i := range authFailureBurst {
+		if code := request(t, h, "wrong", "10.0.0.1:1234"); code != http.StatusUnauthorized {
+			t.Fatalf("guess %d got %d, wanted 401", i, code)
+		}
+	}
+	if code := request(t, h, "wrong", "10.0.0.1:1234"); code != http.StatusTooManyRequests {
+		t.Errorf("a guess past the budget got %d, wanted 429", code)
+	}
+
+	// The correct token gets the same answer now. If it did not, the 429 would
+	// only be telling a guesser which of its guesses were wrong.
+	if code := request(t, h, "s3cret", "10.0.0.1:1234"); code != http.StatusTooManyRequests {
+		t.Errorf("the right token got %d from an exhausted address: a guesser can still tell", code)
+	}
+
+	if code := request(t, h, "s3cret", "10.0.0.2:1234"); code != http.StatusOK {
+		t.Errorf("another address was charged for this one's guesses: %d", code)
+	}
+}
+
+// TestTheRightTokenCostsNothing: nobody who holds the token should ever spend
+// from the failure budget, however many requests they make.
+func TestTheRightTokenCostsNothing(t *testing.T) {
+	h := NewGuard("s3cret", 0, 0).Wrap(okHandler())
+	for i := range authFailureBurst * 3 {
+		if code := request(t, h, "s3cret", "10.0.0.1:1234"); code != http.StatusOK {
+			t.Fatalf("request %d with the right token got %d", i, code)
+		}
+	}
+}
+
+// TestAWrongTokenSpendsTheRateLimitToo: the order used to be token first, so a
+// wrong guess was answered before the general limit had charged anything.
+func TestAWrongTokenSpendsTheRateLimitToo(t *testing.T) {
+	h := NewGuard("s3cret", 1, 1).Wrap(okHandler())
+
+	if code := request(t, h, "wrong", "10.0.0.1:1234"); code != http.StatusUnauthorized {
+		t.Fatalf("the first guess got %d", code)
+	}
+	if code := request(t, h, "wrong", "10.0.0.1:1234"); code != http.StatusTooManyRequests {
+		t.Errorf("the second guess within the same second got %d, wanted 429", code)
+	}
+}
+
+// TestTheFailureBudgetRefillsAndIsSwept: a client that fixed its token gets back
+// in on its own, and a guesser who left does not stay in memory.
+func TestTheFailureBudgetRefillsAndIsSwept(t *testing.T) {
+	g := NewGuard("s3cret", 0, 0)
+	start := time.Now()
+
+	for range authFailureBurst {
+		g.chargeGuess("client", start)
+	}
+	if g.mayGuess("client", start) {
+		t.Fatal("the budget was spent and the client can still try")
+	}
+	if !g.mayGuess("client", start.Add(5*time.Second)) {
+		t.Error("five seconds did not buy one more attempt")
+	}
+
+	if dropped := g.Sweep(start.Add(5*time.Second), time.Minute); dropped != 0 {
+		t.Errorf("swept %d failure buckets still in use", dropped)
+	}
+	if dropped := g.Sweep(start.Add(time.Hour), time.Minute); dropped != 1 {
+		t.Errorf("swept %d failure buckets idle for an hour, wanted 1", dropped)
+	}
+}
+
 // TestTheSamePortIsNotADifferentClient: RemoteAddr carries an ephemeral port
 // that changes per connection, so keying on it would give every new connection
 // a fresh allowance and no limit at all.

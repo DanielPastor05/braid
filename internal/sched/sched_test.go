@@ -529,7 +529,13 @@ func TestCacheSlotsAreABudgetAndRunningOutIsASlowdown(t *testing.T) {
 
 	run8 := func(t *testing.T, cfg Config) Snapshot {
 		t.Helper()
-		s, err := New(fastMock(), cfg)
+		// A step that takes real time, because "somebody must go without" needs the
+		// clients to overlap. At zero a sequence could finish and hand its slot back
+		// before the next goroutine was scheduled, and the one-slot case below failed
+		// about one run in ten on Windows.
+		mock := fastMock()
+		mock.Base = 2 * time.Millisecond
+		s, err := New(mock, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
